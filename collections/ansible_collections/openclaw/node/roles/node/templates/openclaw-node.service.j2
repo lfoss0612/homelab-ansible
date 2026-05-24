@@ -1,0 +1,36 @@
+# Managed by Ansible — openclaw.node.node role
+[Unit]
+Description=OpenClaw Node (versioned)
+Documentation=https://docs.openclaw.ai/cli/node
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User={{ openclaw_user }}
+Group={{ openclaw_group }}
+WorkingDirectory={{ openclaw_install_dir }}/current
+
+EnvironmentFile=/etc/default/openclaw-node
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node {{ openclaw_install_dir }}/current/openclaw.mjs node run \
+  --host {{ openclaw_gateway_host }} \
+  --port {{ openclaw_gateway_port }} \
+  --display-name {{ inventory_hostname }}
+
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

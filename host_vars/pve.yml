@@ -1,0 +1,17 @@
+---
+# host_vars/pve.yml
+# Extra exec allowlist entries for Proxmox hosts.
+# The playbook writes exec-approvals.json with force: false, so it won't
+# overwrite a file you've already customised. To push this automatically,
+# you can add a separate task or use a merge approach.
+ 
+# Proxmox management binaries you want the agent to call without approval prompts:
+openclaw_exec_allowlist_extra:
+  - /usr/bin/qm          # VM management
+  - /usr/sbin/pvesh      # Proxmox REST API CLI
+  - /usr/bin/pct         # LXC container management
+  - /usr/sbin/pvesm      # Storage management
+  - /usr/bin/pvecm       # Cluster management
+  - /usr/bin/qmrestore   # VM restore
+  - /usr/bin/vzdump      # Backups
+ 

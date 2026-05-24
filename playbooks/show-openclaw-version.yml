@@ -1,0 +1,7 @@
+- name: Show OpenClaw resolved version
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - debug:
+        msg: "OpenClaw version = {{ openclaw_version }}"

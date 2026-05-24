@@ -1,0 +1,12 @@
+---
+openclaw_user: openclaw
+openclaw_group: openclaw
+openclaw_install_dir: /opt/openclaw
+openclaw_version: "latest"
+openclaw_gateway_host: "10.0.5.7"
+openclaw_gateway_port: 18789
+openclaw_allow_insecure_ws: true
+openclaw_keep_releases: 3
+openclaw_artifact_filename: "openclaw-runtime-{{ openclaw_version }}.tar.gz"
+openclaw_artifact_url: "http://{{ openclaw_gateway_host }}/openclaw/{{ openclaw_artifact_filename }}"
+openclaw_gateway_token: "REQUIRED_SET_IN_GROUP_VARS"

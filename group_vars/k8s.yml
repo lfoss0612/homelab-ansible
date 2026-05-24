@@ -1,0 +1,6 @@
+# group_vars/k8s.yml
+# K8s nodes are exec nodes for general infra only.
+# kubectl/helm/argocd commands run inside the gateway pod, not here.
+openclaw_exec_allowlist_extra: 
+  - /usr/bin/crictl      # container runtime inspection
+  - /usr/bin/journalctl

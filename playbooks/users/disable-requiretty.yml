@@ -1,0 +1,13 @@
+---
+- name: Disable requiretty for ansible compatibility
+  hosts: all
+  become: yes
+
+  tasks:
+    - name: Remove requiretty restriction if present
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers
+        regexp: '^Defaults\s+requiretty'
+        line: '# Defaults requiretty'
+        state: present
+        validate: /usr/sbin/visudo -cf %s

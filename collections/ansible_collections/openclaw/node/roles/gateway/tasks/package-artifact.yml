@@ -1,0 +1,94 @@
+---
+# Produce a runtime artifact from the current build and place it under
+# /srv/openclaw/<artifact-filename> for nginx to serve.
+
+- name: Ensure artifact directory exists
+  file:
+    path: /srv/openclaw
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check if artifact for this version already exists
+  stat:
+    path: "/srv/openclaw/{{ openclaw_artifact_filename }}"
+  register: artifact_present
+
+- name: Prune dev dependencies in build tree
+  shell: |
+    set -euo pipefail
+    cd {{ openclaw_install_dir }}/current
+    pnpm prune --prod 2>&1 | tee -a /var/log/openclaw/prune.log
+  when: not artifact_present.stat.exists
+
+- name: Package runtime artifact
+  shell: |
+    set -euo pipefail
+    cd {{ openclaw_install_dir }}/current
+    tar czf /srv/openclaw/{{ openclaw_artifact_filename }}.tmp \
+      openclaw.mjs package.json pnpm-workspace.yaml \
+      dist/ dist-runtime/ scripts/ patches/ skills/ \
+      node_modules/
+    mv /srv/openclaw/{{ openclaw_artifact_filename }}.tmp \
+       /srv/openclaw/{{ openclaw_artifact_filename }}
+  args:
+    creates: "/srv/openclaw/{{ openclaw_artifact_filename }}"
+
+- name: Show artifact info
+  shell: ls -lh /srv/openclaw/{{ openclaw_artifact_filename }}
+  register: artifact_info
+  changed_when: false
+
+- name: Report artifact
+  debug:
+    msg: "Runtime artifact: {{ artifact_info.stdout }}"
+
+# -----------------------------------------------------------------------------
+# Serve artifacts via nginx
+# -----------------------------------------------------------------------------
+
+- name: Install nginx
+  apt:
+    name: nginx
+    state: present
+
+- name: Configure nginx to serve /srv/openclaw at /openclaw/
+  copy:
+    dest: /etc/nginx/sites-available/openclaw-artifacts
+    mode: "0644"
+    content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+
+          location /openclaw/ {
+              alias /srv/openclaw/;
+              autoindex on;
+          }
+
+          location / {
+              return 404;
+          }
+      }
+  notify: reload nginx
+
+- name: Enable nginx site
+  file:
+    src: /etc/nginx/sites-available/openclaw-artifacts
+    dest: /etc/nginx/sites-enabled/openclaw-artifacts
+    state: link
+  notify: reload nginx
+
+- name: Disable default nginx site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+
+- name: Enable and start nginx
+  systemd:
+    name: nginx
+    enabled: yes
+    state: started

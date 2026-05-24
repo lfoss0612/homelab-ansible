@@ -1,0 +1,15 @@
+*.retry
+*.log
+.env
+.env.*
+.vault_pass
+vault_pass.txt
+*.pem
+*.key
+*.crt
+*.p12
+*.kubeconfig
+inventory/*/hosts.ini
+inventory/*/group_vars/all/secrets.yml
+node_modules/
+.tmp/

@@ -1,0 +1,9 @@
+openclaw_exec_allowlist_base:
+ - /usr/bin/uname
+ - /usr/bin/uptime
+ - /usr/bin/df
+ - /usr/bin/free
+ - /usr/bin/systemctl
+ - /usr/bin/journalctl
+
+openclaw_exec_allowlist_extra: []  # override in group/host vars

@@ -1,0 +1,13 @@
+---
+- name: Ensure release directory exists
+  file:
+    path: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    state: directory
+
+- name: Set current release symlink (atomic update)
+  file:
+    src: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    dest: "{{ openclaw_install_dir }}/current"
+    state: link
+    force: true
+    follow: false

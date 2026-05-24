@@ -1,0 +1,15 @@
+openclaw_node_name: "{{ inventory_hostname }}"
+
+openclaw_user: openclaw
+openclaw_group: openclaw
+
+openclaw_install_dir: /opt/openclaw
+openclaw_force_reinstall: false
+
+openclaw_gateway_url: "http://openclaw.home.lan:18789"
+
+openclaw_node_role: "worker"
+openclaw_node_enabled: true
+
+openclaw_node_build: true
+openclaw_node_symlink: true

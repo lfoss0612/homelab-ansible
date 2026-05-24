@@ -1,0 +1,26 @@
+---
+- name: Ensure OpenClaw base directories exist
+  ansible.builtin.file:
+    path: /opt/openclaw/releases
+    state: directory
+    owner: openclaw
+    group: openclaw
+    mode: "0755"
+
+- name: Set release version
+  ansible.builtin.set_fact:
+    openclaw_release_file: "/tmp/openclaw-{{ openclaw_version }}.tar.gz"
+
+- name: Download OpenClaw source release
+  ansible.builtin.get_url:
+    url: "{{ openclaw_tar_url }}"
+    dest: "{{ openclaw_release_file }}"
+    mode: "0644"
+
+- name: Extract OpenClaw release
+  ansible.builtin.unarchive:
+    src: "{{ openclaw_release_file }}"
+    dest: /opt/openclaw/releases/
+    remote_src: yes
+    owner: openclaw
+    group: openclaw

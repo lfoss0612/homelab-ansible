@@ -1,0 +1,33 @@
+---
+- name: Install dependencies (pnpm verbose)
+  shell: |
+    set -euo pipefail
+    echo "[gateway] $(date -Is) pnpm install start"
+    pnpm install --frozen-lockfile --reporter=ndjson 2>&1 | tee /tmp/openclaw-pnpm-install.log
+    echo "[gateway] $(date -Is) pnpm install done"
+  args:
+    chdir: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    executable: /bin/bash
+
+- name: Build OpenClaw (pnpm debug build)
+  shell: |
+    set -euo pipefail
+    echo "[gateway] $(date -Is) build start"
+
+    export NODE_ENV=production
+    export DEBUG=*
+    export PNPM_DEBUG=1
+
+    pnpm run build --reporter=ndjson 2>&1 | tee /tmp/openclaw-build.log
+
+    echo "[gateway] $(date -Is) build done"
+  args:
+    chdir: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    executable: /bin/bash
+
+- name: Verify build output
+  shell: |
+    ls -lah dist || true
+    test -f dist/index.js
+  args:
+    chdir: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"

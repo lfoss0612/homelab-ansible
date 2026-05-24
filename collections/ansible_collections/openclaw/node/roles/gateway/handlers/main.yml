@@ -1,0 +1,13 @@
+- name: systemd daemon reload
+  systemd:
+    daemon_reload: yes
+
+- name: restart openclaw gateway
+  systemd:
+    name: openclaw-gateway
+    state: restarted
+
+- name: reload nginx
+  systemd:
+    name: nginx
+    state: reloaded

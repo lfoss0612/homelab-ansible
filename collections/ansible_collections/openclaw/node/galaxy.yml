@@ -1,0 +1,17 @@
+namespace: openclaw
+name: node
+version: 1.0.0
+readme: README.md
+authors:
+  - OpenClaw Team
+
+description: OpenClaw gateway and node deployment roles
+
+license:
+  - MIT
+
+repository: https://example.com/openclaw/node
+
+tags:
+  - infrastructure
+  - system

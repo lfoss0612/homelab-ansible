@@ -1,0 +1,44 @@
+- name: Bootstrap OpenClaw nodes (auto-sync version from gateway)
+  hosts: all
+  become: yes
+  remote_user: lfoss
+
+  vars:
+    ansible_user_name: ansible
+
+  tasks:
+    - name: Ensure ansible user exists
+      ansible.builtin.user:
+        name: "{{ ansible_user_name }}"
+        shell: /bin/bash
+        create_home: yes
+        home: "/home/{{ ansible_user_name }}"
+        password_lock: yes
+
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user_name }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_user_name }}"
+        mode: "0700"
+
+    - name: Install authorized key
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user_name }}"
+        state: present
+        key: "{{ lookup('file', '/opt/ansible/keys/id_ansible.pub') }}"
+
+    - name: Ensure sudo access
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/ansible
+        content: "{{ ansible_user_name }} ALL=(ALL) NOPASSWD:ALL\n"
+        mode: "0440"
+        validate: "visudo -cf %s"
+        owner: root
+        group: root
+
+    - name: Lock password
+      ansible.builtin.user:
+        name: "{{ ansible_user_name }}"
+        password_lock: yes

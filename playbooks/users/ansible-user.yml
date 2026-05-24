@@ -1,0 +1,59 @@
+- name: Bootstrap ansible user on all nodes
+  hosts: all
+  become: yes
+  remote_user: lfoss
+
+  vars:
+    ansible_user_name: ansible
+    ansible_pubkey: "{{ lookup('file', '/opt/ansible/keys/ansible.pub') }}"
+
+  tasks:
+
+    - name: Ensure ansible user exists
+      ansible.builtin.user:
+        name: "{{ ansible_user_name }}"
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Ensure ansible home exists
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user_name }}"
+        state: directory
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_user_name }}"
+        mode: "0755"
+
+    - name: Ensure ansible .ssh directory exists
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user_name }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_user_name }}"
+        mode: "0700"
+
+    - name: Install authorized key for ansible user
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user_name }}"
+        state: present
+        key: "{{ ansible_pubkey }}"
+
+    - name: Ensure ansible temp directory exists
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user_name }}/.ansible/tmp"
+        state: directory
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_user_name }}"
+        mode: "0700"
+
+    - name: Allow passwordless sudo for ansible user
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/ansible
+        content: |
+          ansible ALL=(ALL) NOPASSWD:ALL
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Lock password
+      ansible.builtin.user:
+        name: "{{ ansible_user_name }}"
+        password_lock: yes

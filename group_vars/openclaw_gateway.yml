@@ -1,0 +1,7 @@
+openclaw_user: openclaw
+openclaw_group: openclaw
+
+openclaw_install_dir: /opt/openclaw
+
+
+openclaw_force_reinstall: false

@@ -1,0 +1,40 @@
+- name: Bootstrap lfoss user across cluster
+  hosts: all
+  become: yes
+  remote_user: ansible
+
+  vars:
+    ssh_public_key: "{{ lookup('file', 'keys/lfoss_ed25519.pub') }}"
+
+  tasks:
+
+    - name: Ensure lfoss user exists
+      ansible.builtin.user:
+        name: lfoss
+        shell: /bin/bash
+        groups: "{{ 'sudo' if ansible_os_family == 'Debian' else 'wheel' }}"
+        append: yes
+        create_home: yes
+
+    - name: Install authorized SSH key for lfoss
+      ansible.posix.authorized_key:
+        user: lfoss
+        key: "{{ ssh_public_key }}"
+        state: present
+
+    - name: Ensure sudoers file for lfoss
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/lfoss
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          lfoss ALL=(ALL) NOPASSWD:ALL
+          Defaults:lfoss !requiretty
+        validate: "visudo -cf %s"
+
+    - name: Validate sudo access
+      ansible.builtin.command: whoami
+      become: true
+      become_user: lfoss
+      changed_when: false

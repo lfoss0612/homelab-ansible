@@ -1,0 +1,15 @@
+- name: Deploy OpenClaw Gateway
+  hosts: openclaw_gateway
+  serial: 1
+  become: true
+  roles:
+    - role: openclaw.node.gateway
+      tags: gateway
+
+- name: Deploy OpenClaw Nodes
+  hosts: openclaw_nodes:!openclaw_gateway # <-- subtract gateway from nodes
+  serial: 1
+  become: true
+  roles:
+    - role: openclaw.node.node
+      tags: node

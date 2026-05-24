@@ -1,0 +1,37 @@
+---
+# OpenClaw deployment-wide settings
+openclaw_user: openclaw
+openclaw_group: openclaw
+openclaw_install_dir: /opt/openclaw
+
+# Version to build/deploy. Must match a github release tag if downloading.
+openclaw_version: "2026.5.12"
+
+# Gateway endpoint (used by node role)
+openclaw_gateway_host: "10.0.5.7"
+openclaw_gateway_port: 18789
+
+# Plain WS over LAN (no TLS via HAProxy for node traffic). Set false if you
+# switch nodes to wss:// through HAProxy later.
+openclaw_allow_insecure_ws: true
+
+# Number of release directories to keep on each node (for rollback)
+openclaw_keep_releases: 3
+
+# Artifact distribution: nodes fetch from this URL.
+openclaw_artifact_filename: "openclaw-runtime-{{ openclaw_version }}.tar.gz"
+openclaw_artifact_url: "http://{{ openclaw_gateway_host }}/openclaw/{{ openclaw_artifact_filename }}"
+
+# Shared gateway auth token (matches pbs's node.json token). Vault this.
+# Replace the placeholder below with the value pulled from
+# `sudo cat /home/openclaw/.openclaw/node.json` on pbs, then encrypt:
+#   ansible-vault encrypt_string '<token>' --name openclaw_gateway_token
+openclaw_gateway_token: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          31643132666432396666323631363066303931353561643535373864663130326431366238343664
+          3631326666313131613431356165613430346566333030610a363033646131353735303133333533
+          66386638623232663239333938346366316465363565353434663231343435363661346565383566
+          3931313536383734380a383566303261633764313964666265303963303437316138613331633265
+          64323337373737303737663736666230336432363364636133623063316666623062356165626564
+          64383535653839356461373334363162383366613837396364336136663631663032326662313138
+          303361623561333537396663626331343833

@@ -1,0 +1,149 @@
+---
+# OpenClaw Node deployment — fetches a pre-built runtime artifact.
+# No Node.js build tooling required on the node.
+
+- name: Assert required vars are set
+  assert:
+    that:
+      - openclaw_gateway_token is defined
+      - openclaw_gateway_token != "REPLACE_WITH_VAULTED_TOKEN"
+      - openclaw_gateway_token != "REQUIRED_SET_IN_GROUP_VARS"
+      - openclaw_version != "latest"
+    fail_msg: "Set openclaw_gateway_token and openclaw_version in group_vars/openclaw.yml"
+
+- name: Install Node.js from NodeSource (runtime only — no pnpm)
+  shell: |
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y nodejs
+  args:
+    creates: /usr/bin/node
+
+- name: Create openclaw group
+  group:
+    name: "{{ openclaw_group }}"
+    system: yes
+
+- name: Create openclaw user
+  user:
+    name: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    system: yes
+    home: "/home/{{ openclaw_user }}"
+    shell: /bin/bash
+    create_home: yes
+
+- name: Ensure install directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0755"
+  loop:
+    - "{{ openclaw_install_dir }}"
+    - "{{ openclaw_install_dir }}/releases"
+    - "{{ openclaw_install_dir }}/shared"
+
+- name: Ensure log directory exists
+  file:
+    path: /var/log/openclaw
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0755"
+
+- name: Check if this version is already installed
+  stat:
+    path: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}/openclaw.mjs"
+  register: release_present
+
+- name: Fetch runtime artifact from gateway
+  get_url:
+    url: "{{ openclaw_artifact_url }}"
+    dest: "/tmp/{{ openclaw_artifact_filename }}"
+    mode: "0644"
+    force: no
+  when: not release_present.stat.exists
+
+- name: Create release directory for this version
+  file:
+    path: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0755"
+  when: not release_present.stat.exists
+
+- name: Extract runtime artifact
+  unarchive:
+    src: "/tmp/{{ openclaw_artifact_filename }}"
+    dest: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    remote_src: yes
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+  when: not release_present.stat.exists
+
+- name: Flip current symlink (atomic)
+  file:
+    src: "{{ openclaw_install_dir }}/releases/{{ openclaw_version }}"
+    dest: "{{ openclaw_install_dir }}/current"
+    state: link
+    force: yes
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    follow: no
+  notify: restart openclaw-node
+
+- name: Ensure openclaw home state directory exists
+  file:
+    path: "/home/{{ openclaw_user }}/.openclaw"
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0700"
+
+- name: Write environment file (token, insecure-ws flag)
+  template:
+    src: openclaw-node-env.j2
+    dest: /etc/default/openclaw-node
+    owner: root
+    group: "{{ openclaw_group }}"
+    mode: "0640"
+  notify: restart openclaw-node
+
+- name: Install systemd unit
+  template:
+    src: openclaw-node.service.j2
+    dest: /etc/systemd/system/openclaw-node.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - daemon-reload
+    - restart openclaw-node
+
+- name: Enable and start openclaw-node service
+  systemd:
+    name: openclaw-node
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Prune old releases (keep last N)
+  shell: |
+    set -uo pipefail
+    cd {{ openclaw_install_dir }}/releases
+    current=$(readlink {{ openclaw_install_dir }}/current | xargs basename)
+    # List all releases except the current one, sort by mtime, drop the N-1 newest, delete the rest
+    to_delete=$(ls -1t | grep -v "^${current}$" | tail -n +{{ openclaw_keep_releases }} || true)
+    if [ -n "$to_delete" ]; then
+      echo "$to_delete" | xargs -r rm -rf
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Clean up downloaded artifact
+  file:
+    path: "/tmp/{{ openclaw_artifact_filename }}"
+    state: absent

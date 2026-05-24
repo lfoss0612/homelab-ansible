@@ -1,0 +1,9 @@
+- name: Validate OpenClaw topology
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Ensure gateway is not in nodes
+      assert:
+        that:
+          - "'openclaw.home.lan' not in groups['openclaw_nodes']"
+        fail_msg: "Gateway is incorrectly included in openclaw_nodes!"
