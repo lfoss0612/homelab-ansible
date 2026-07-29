@@ -1,0 +1,127 @@
+---
+# Bootstrap the `claude` automation identity used by Claude Code.
+#
+# Scope: cockpit only. cockpit is the Ansible control node, so every other host is
+# reachable from here through reviewed playbooks. There is deliberately no `claude`
+# account on the rest of the fleet.
+#
+# Runbook: docs/claude-access.md. Revoke with:
+#   sudo userdel -r claude && sudo rm -f /etc/sudoers.d/claude
+
+- name: Bootstrap claude user (Claude Code automation identity)
+  hosts: "{{ claude_hosts | default('cockpit.home.lan') }}"
+  become: true
+  remote_user: ansible
+  gather_facts: true
+
+  vars:
+    claude_user: claude
+    claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
+    # Pin the key to the workstation it is used from. Set to "" to allow any source.
+    claude_key_from: "10.10.5.198"
+    # Read access to /opt/ansible. Grants NO sudo — claude is not in sudo/wheel.
+    claude_extra_groups:
+      - ansible
+    # Commands claude may run as the `ansible` user. Absolute paths are resolved on the
+    # target below, because sudoers will not accept bare command names.
+    claude_sudo_commands:
+      - ansible
+      - ansible-playbook
+      - ansible-inventory
+
+  tasks:
+
+    - name: Assert the public key exists on the control machine
+      ansible.builtin.assert:
+        that:
+          - claude_pubkey_path is exists
+        fail_msg: >-
+          {{ claude_pubkey_path }} not found. Generate the keypair first —
+          see docs/claude-access.md.
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Ensure claude user exists (no sudo/wheel membership)
+      ansible.builtin.user:
+        name: "{{ claude_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: "{{ claude_extra_groups }}"
+        append: true
+        comment: "Claude Code automation identity"
+
+    - name: Lock the password (key-only login)
+      ansible.builtin.user:
+        name: "{{ claude_user }}"
+        password_lock: true
+
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "/home/{{ claude_user }}/.ssh"
+        state: directory
+        owner: "{{ claude_user }}"
+        group: "{{ claude_user }}"
+        mode: "0700"
+
+    - name: Install authorized key for claude
+      ansible.posix.authorized_key:
+        user: "{{ claude_user }}"
+        state: present
+        key: "{{ lookup('file', claude_pubkey_path) }}"
+        key_options: "{{ ('from=\"' ~ claude_key_from ~ '\"') if claude_key_from else omit }}"
+        exclusive: true
+
+    - name: Resolve absolute paths of the permitted ansible commands
+      ansible.builtin.shell: "command -v {{ item }}"
+      register: claude_cmd_paths
+      loop: "{{ claude_sudo_commands }}"
+      changed_when: false
+      check_mode: false          # must run in --check, or sudoers renders empty
+
+    - name: Install scoped sudoers rule (Ansible as the ansible user, nothing else)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/claude
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          # Managed by playbooks/users/claude-user.yml — do not edit by hand.
+          {{ claude_user }} ALL=(ansible) NOPASSWD: {{ claude_cmd_paths.results | map(attribute='stdout') | join(', ') }}
+          Defaults:{{ claude_user }} !requiretty
+
+    - name: Check whether /opt/ansible is readable by the ansible group
+      ansible.builtin.stat:
+        path: /opt/ansible
+      register: opt_ansible
+
+    - name: Report /opt/ansible readability
+      # Reported, never mutated — permissions on the control directory are yours.
+      ansible.builtin.debug:
+        msg: >-
+          /opt/ansible mode={{ opt_ansible.stat.mode }}
+          group={{ opt_ansible.stat.gr_name }} —
+          {{ 'group-readable, claude can inspect it'
+             if opt_ansible.stat.rgrp
+             else 'NOT group-readable; claude will read the repo over NFS instead' }}
+      when: opt_ansible.stat.exists
+
+    # Uses runuser rather than `become_user: claude`, because becoming an unprivileged
+    # user needs setfacl on the temp files — see playbooks/bootstrap/install-acl.yml.
+    # Absolute paths throughout: runuser gives a minimal PATH, and the sudoers rule
+    # matches on the resolved binary path.
+    - name: Verify claude can escalate to the ansible user
+      ansible.builtin.command: >-
+        runuser -u {{ claude_user }} --
+        /usr/bin/sudo -n -H -u ansible
+        {{ claude_cmd_paths.results
+           | selectattr('item', 'equalto', 'ansible')
+           | map(attribute='stdout') | first }} --version
+      changed_when: false
+      register: claude_sudo_check
+      failed_when: claude_sudo_check.rc != 0
+
+    - name: Report escalation check
+      ansible.builtin.debug:
+        msg: "claude -> ansible OK: {{ claude_sudo_check.stdout_lines[0] }}"
