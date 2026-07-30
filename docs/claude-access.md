@@ -84,18 +84,29 @@ Host cockpit
     HostName 10.0.5.10
     User claude
     IdentityFile ~/.ssh/id_claude
+    IdentitiesOnly yes
     ControlMaster auto
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlPersist 10m
 ```
 
 `ControlPersist` matters: a discovery sweep is ~20 commands over one connection instead
-of 20 handshakes.
+of 20 handshakes. `IdentitiesOnly yes` stops SSH from offering other keys in the agent,
+so the `from=`-pinned key is the only one tried.
+
+Trust the host key explicitly rather than accepting it blind on first connect. On cockpit:
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Compare against `ssh-keyscan -t ed25519 10.0.5.10 | ssh-keygen -lf -` from the
+workstation before appending it to `~/.ssh/known_hosts`.
 
 Verify end to end:
 
 ```bash
-ssh cockpit 'id; sudo -n -H -u ansible ansible --version | head -1'
+ssh cockpit 'id; cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible --version | head -1'
 ```
 
 `id` must show **no** `sudo` or `wheel` group, and the second command must print a
@@ -104,16 +115,35 @@ something else granted it.
 
 ### 5. Reduce permission prompts
 
-Add `Bash(ssh cockpit:*)` to `.claude/settings.json` in this repo so routine calls do not
-prompt.
+Add `Bash(ssh cockpit *)` to `.claude/settings.json` in this repo so routine calls do not
+prompt. Note the **space** before `*`, not a colon — that is the prefix-wildcard form
+Claude Code generates and honors.
 
 ## Operating
 
 Claude works through this pattern, never as root directly:
 
 ```bash
-ssh cockpit 'sudo -H -u ansible ansible-playbook /opt/ansible/playbooks/<play>.yml --check --diff'
+ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook playbooks/<play>.yml --check --diff'
 ```
+
+### Two details that are easy to get wrong
+
+**Always `cd /opt/ansible` first.** The sudoers rule permits the root-owned binaries in
+`/usr/bin`, which find `ansible.cfg` only by cwd auto-discovery. An `ssh` one-liner starts
+in `claude`'s home directory, so without the `cd` Ansible silently falls back to the wrong
+inventory and `collections_paths`. It does not error — it just does the wrong thing.
+`sudo` preserves the working directory, so the `cd` carries through.
+
+**Why the sudoers rule does not point at `/home/ansible/bin/`.** The `ansible` user has
+wrapper scripts there that export `ANSIBLE_CONFIG` and exec the real binary, which would
+make the `cd` unnecessary. They are deliberately excluded: they are mode `775` owned
+`ansible:ansible`, and this playbook puts `claude` in the `ansible` group — so permitting
+them would let `claude` rewrite the very thing `sudo` executes. Pointing the rule at
+root-owned `/usr/bin` binaries keeps its resolved-path guarantee meaningful.
+
+Note also that `Defaults secure_path` in Debian's sudoers means a bare `ansible-playbook`
+under `sudo` always resolves to `/usr/bin`, regardless of anyone's `PATH`.
 
 Audit what it did:
 
