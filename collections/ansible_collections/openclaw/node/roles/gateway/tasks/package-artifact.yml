@@ -15,17 +15,11 @@
     path: "/srv/openclaw/{{ openclaw_artifact_filename }}"
   register: artifact_present
 
-- name: Prune dev dependencies in build tree
-  shell: |
-    set -euo pipefail
-    cd {{ openclaw_install_dir }}/current
-    pnpm prune --prod 2>&1 | tee -a /var/log/openclaw/prune.log
-  when: not artifact_present.stat.exists
 
 - name: Package runtime artifact
   shell: |
     set -euo pipefail
-    cd {{ openclaw_install_dir }}/current
+    cd {{ openclaw_install_dir }}
     tar czf /srv/openclaw/{{ openclaw_artifact_filename }}.tmp \
       openclaw.mjs package.json pnpm-workspace.yaml \
       dist/ dist-runtime/ scripts/ patches/ skills/ \
@@ -66,6 +60,13 @@
           location /openclaw/ {
               alias /srv/openclaw/;
               autoindex on;
+          }
+
+          # Expose the gateway's running version for fleet sync
+          location = /openclaw-version {
+              alias /opt/openclaw/package.json;
+              default_type application/json;
+              add_header Cache-Control "no-cache, no-store, must-revalidate";
           }
 
           location / {

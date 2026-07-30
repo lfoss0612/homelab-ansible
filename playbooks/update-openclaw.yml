@@ -1,0 +1,178 @@
+---
+# ============================================================
+# PHASE 1 — Detect current gateway version
+# ============================================================
+- name: Detect gateway version
+  hosts: openclaw_gateway
+  gather_facts: false
+
+  tasks:
+    - name: Read package.json
+      slurp:
+        src: /opt/openclaw/package.json
+      register: gateway_pkg
+
+    - name: Extract version
+      set_fact:
+        openclaw_version: "{{ (gateway_pkg.content | b64decode | from_json).version }}"
+
+    - name: Define release paths
+      set_fact:
+        release_dir: "/opt/openclaw/releases/{{ openclaw_version }}"
+        release_hash_file: "/opt/openclaw/releases/{{ openclaw_version }}/.build_hash"
+
+# ============================================================
+# PHASE 2 — Build ON GATEWAY ONLY
+# ============================================================
+- name: Build gateway release
+  hosts: openclaw_gateway
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Ensure release directory exists
+      file:
+        path: "{{ release_dir }}"
+        state: directory
+        owner: openclaw
+        group: openclaw
+        mode: "0755"
+
+    - name: Run gateway build
+      shell: |
+        set -euo pipefail
+
+        export NODE_ENV=production
+
+        LOG=/var/log/openclaw/build-{{ openclaw_version }}.log
+        mkdir -p /var/log/openclaw
+
+        echo "[build] START $(date -Is)" | tee -a "$LOG"
+
+        cd "{{ release_dir }}"
+
+        rm -rf dist node_modules/.cache || true
+
+        pnpm install --frozen-lockfile 2>&1 | tee -a "$LOG"
+        pnpm run build 2>&1 | tee -a "$LOG"
+        pnpm run ui:build 2>&1 | tee -a "$LOG"
+
+        echo "[build] END $(date -Is)" | tee -a "$LOG"
+      args:
+        executable: /bin/bash
+
+    - name: Verify dist exists
+      stat:
+        path: "{{ release_dir }}/dist/index.js"
+      register: dist_check
+
+    - name: Fail if build missing
+      fail:
+        msg: "Build failed: dist/index.js missing in {{ release_dir }}"
+      when: not dist_check.stat.exists
+
+# ============================================================
+# PHASE 3 — Compute build hash
+# ============================================================
+- name: Compute release fingerprint
+  hosts: openclaw_gateway
+  gather_facts: false
+
+  tasks:
+    - name: Compute SHA256 of dist
+      shell: |
+        sha256sum "{{ release_dir }}/dist/index.js" | awk '{print $1}'
+      register: build_hash
+
+    - name: Store hash
+      copy:
+        dest: "{{ release_hash_file }}"
+        content: "{{ build_hash.stdout }}\n"
+        owner: openclaw
+        group: openclaw
+        mode: "0644"
+
+# ============================================================
+# PHASE 4 — Compare with deployed version
+# ============================================================
+- name: Determine rollout requirement
+  hosts: openclaw_gateway
+  gather_facts: false
+
+  tasks:
+    - name: Read deployed hash
+      slurp:
+        src: /opt/openclaw/current/.deployed_hash
+      register: previous_hash
+      ignore_errors: true
+
+    - name: Normalize previous hash
+      set_fact:
+        previous_release_hash: >-
+          {{
+            (previous_hash.content | b64decode | trim)
+            if previous_hash is defined and previous_hash.content is defined
+            else ''
+          }}
+
+    - name: Read new hash
+      slurp:
+        src: "{{ release_hash_file }}"
+      register: new_hash
+
+    - name: Set facts
+      set_fact:
+        new_release_hash: "{{ new_hash.content | b64decode | trim }}"
+        rollout_required: "{{ previous_release_hash != (new_hash.content | b64decode | trim) }}"
+
+    - name: Debug decision
+      debug:
+        msg:
+          - "Previous: {{ previous_release_hash }}"
+          - "New: {{ new_release_hash }}"
+          - "Rollout required: {{ rollout_required }}"
+
+# ============================================================
+# PHASE 5 — Promote release
+# ============================================================
+- name: Activate release
+  hosts: openclaw_gateway
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Update current symlink
+      file:
+        src: "{{ release_dir }}"
+        dest: /opt/openclaw/current
+        state: link
+        force: true
+      when: rollout_required | bool
+
+    - name: Persist deployed hash
+      copy:
+        dest: /opt/openclaw/current/.deployed_hash
+        content: "{{ new_release_hash }}\n"
+        owner: openclaw
+        group: openclaw
+        mode: "0644"
+      when: rollout_required | bool
+
+# ============================================================
+# PHASE 6 — Rollout nodes (only if changed)
+# ============================================================
+- name: Roll out nodes
+  hosts: openclaw_nodes:!openclaw_gateway
+  serial: 1
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Skip if no rollout
+      meta: end_host
+      when: not hostvars[groups['openclaw_gateway'][0]].rollout_required | bool
+
+    - name: Restart node service
+      systemd:
+        name: openclaw-node
+        state: restarted

@@ -1,87 +1,16 @@
-- name: Ensure OpenClaw log directory exists
-  file:
-    path: /var/log/openclaw
-    state: directory
-    mode: "0755"
+---
+# -----------------------------------------------------------------------------
+# Gateway deployment orchestration (FIXED ORDER)
+# -----------------------------------------------------------------------------
 
-- name: Build OpenClaw (deterministic build)
-  shell: |
-    set -euo pipefail
+# 1. Install/update release contents
+- import_tasks: install.yml
 
-    export NODE_ENV=production
+# 2. Build inside the release directory
+- import_tasks: build.yml
 
-    LOG=/var/log/openclaw/build.log
-    mkdir -p /var/log/openclaw
-    touch "$LOG"
+# 3. Package runtime artifact for nodes
+- import_tasks: package-artifact.yml
 
-    echo "===============================" | tee -a "$LOG"
-    echo "[build] START $(date -Is)" | tee -a "$LOG"
-
-    rm -rf dist node_modules/.cache || true
-
-    stdbuf -oL -eL pnpm run build 2>&1 | tee -a "$LOG"
-    stdbuf -oL -eL pnpm run ui:build 2>&1 | tee -a "$LOG"
-
-    echo "[build] END $(date -Is)" | tee -a "$LOG"
-  args:
-    chdir: /opt/openclaw/current
-    executable: /bin/bash
-  register: build_result
-
-- name: Verify core build artifacts exist
-  shell: |
-    set -euo pipefail
-
-    test -f /opt/openclaw/current/dist/index.js
-    test -f /opt/openclaw/current/dist/cli.runtime.js
-
-    echo "OK: CLI artifacts present"
-  changed_when: false
-
-- name: Wait for Control UI build
-  wait_for:
-    path: /opt/openclaw/current/dist/control-ui/index.html
-    state: present
-    timeout: 120
-
-- name: Fail if build failed
-  fail:
-    msg: "OpenClaw build failed"
-  when: build_result.rc != 0
-
-# ---------------------------------------------------
-# FIXED CLI VALIDATION (NO --version RELIANCE)
-# ---------------------------------------------------
-
-- name: Verify OpenClaw CLI works
-  shell: |
-    set -euo pipefail
-    /usr/local/bin/openclaw --help | head -n 20
-  register: cli_check
-  changed_when: false
-
-- name: Assert CLI is functional
-  assert:
-    that:
-      - cli_check.rc == 0
-      - cli_check.stdout is search("OpenClaw|Commands|Usage")
-
-# ---------------------------------------------------
-# FIXED CLI WRAPPER INSTALL
-# ---------------------------------------------------
-
-- name: Install OpenClaw CLI wrapper
-  copy:
-    dest: /usr/local/bin/openclaw
-    mode: "0755"
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-
-      export NODE_ENV=production
-      cd /opt/openclaw/current
-
-      exec node /opt/openclaw/current/dist/index.js "$@"
-
-# Package the runtime artifact and serve it via nginx (added by node-deploy refactor) 
-- import_tasks: package-artifact.yml 
+# 4. Flip current -> release symlink LAST (atomic deploy)
+- import_tasks: symlink.yml
