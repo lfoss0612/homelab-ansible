@@ -1,9 +1,4 @@
 ---
-openclaw_version: "latest"
-
-openclaw_base_dir: /opt/openclaw
-openclaw_releases_dir: "{{ openclaw_base_dir }}/releases"
-openclaw_current: "{{ openclaw_base_dir }}/current"
-
-openclaw_tar_url: >-
-  https://github.com/openclaw/openclaw/archive/refs/heads/main.tar.gz
+openclaw_user: openclaw
+openclaw_group: openclaw
+openclaw_gateway_port: 18789

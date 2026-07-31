@@ -1,0 +1,5 @@
+---
+openclaw_user: openclaw
+openclaw_group: openclaw
+openclaw_version: "latest"
+openclaw_node_min_version: "22.22.3"

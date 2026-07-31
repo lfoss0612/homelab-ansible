@@ -1,0 +1,41 @@
+---
+# SSH-verified device pairing: the gateway proves its identity to each node
+# over SSH so new device registrations auto-approve instead of needing a
+# manual `openclaw devices approve` on every node. Runs against the gateway
+# host; reaches every node via delegate_to. Not included by main.yml —
+# invoke explicitly (e.g. from a pairing/deploy playbook) once nodes exist.
+#
+# Manual fallback if pairing trust isn't set up for a given node:
+#   openclaw devices list
+#   openclaw devices approve <device-id>
+
+- name: Generate the gateway's openclaw pairing keypair
+  ansible.builtin.user:
+    name: "{{ openclaw_user }}"
+    generate_ssh_key: true
+    ssh_key_type: ed25519
+    ssh_key_file: ".ssh/id_ed25519"
+    ssh_key_comment: "openclaw@gateway"
+
+- name: Read the gateway's pairing public key
+  ansible.builtin.slurp:
+    src: "/home/{{ openclaw_user }}/.ssh/id_ed25519.pub"
+  register: openclaw_pairing_pubkey
+
+- name: Distribute the pairing public key to every node's openclaw user
+  ansible.posix.authorized_key:
+    user: "{{ openclaw_user }}"
+    state: present
+    key: "{{ openclaw_pairing_pubkey.content | b64decode }}"
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['openclaw_nodes'] }}"
+
+- name: Pre-seed the gateway's known_hosts with every node's host key
+  ansible.builtin.known_hosts:
+    name: "{{ hostvars[item].ansible_host | default(item) }}"
+    key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' ~ (hostvars[item].ansible_host | default(item))) }}"
+    path: "/home/{{ openclaw_user }}/.ssh/known_hosts"
+  become: true
+  become_user: "{{ openclaw_user }}"
+  loop: "{{ groups['openclaw_nodes'] }}"
+  when: hostvars[item].ansible_host is defined

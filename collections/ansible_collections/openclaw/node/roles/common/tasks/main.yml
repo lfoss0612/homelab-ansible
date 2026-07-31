@@ -1,0 +1,112 @@
+---
+# Shared install surface for both the gateway and node roles. The openclaw
+# CLI is installed once via npm; there is no more per-host build or a
+# releases/current/shared directory tree — npm owns the install.
+
+- name: Get installed Node.js version
+  ansible.builtin.command: node -v
+  register: openclaw_node_installed_version
+  changed_when: false
+  failed_when: false
+
+- name: Determine whether Node.js needs upgrading
+  ansible.builtin.set_fact:
+    openclaw_node_needs_upgrade: >-
+      {{ openclaw_node_installed_version.rc != 0 or
+         (openclaw_node_installed_version.stdout | trim | regex_replace('^v', ''))
+           is version(openclaw_node_min_version, '<') }}
+
+# Guard on the installed version, not `creates:` — this must also catch a
+# host that already has an older Node.js from a previous NodeSource install.
+# The NodeSource repo itself is assumed already configured (Phase 3); this
+# does not rewrite nodesource.sources.
+- name: Upgrade Node.js to the {{ openclaw_node_min_version }} floor
+  ansible.builtin.apt:
+    name: nodejs
+    state: latest
+    update_cache: true
+  when: openclaw_node_needs_upgrade
+
+- name: Create openclaw group
+  ansible.builtin.group:
+    name: "{{ openclaw_group }}"
+    system: true
+
+- name: Create openclaw user
+  ansible.builtin.user:
+    name: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    system: true
+    home: "/home/{{ openclaw_user }}"
+    shell: /bin/bash
+    create_home: true
+
+- name: Ensure log directory exists
+  ansible.builtin.file:
+    path: /var/log/openclaw
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0755"
+
+- name: Ensure openclaw home state directory exists
+  ansible.builtin.file:
+    path: "/home/{{ openclaw_user }}/.openclaw"
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0700"
+
+- name: Resolve global npm prefix
+  ansible.builtin.command: npm prefix -g
+  register: openclaw_npm_prefix
+  changed_when: false
+
+- name: Stat the openclaw CLI path in the npm prefix
+  ansible.builtin.stat:
+    path: "{{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw"
+  register: openclaw_cli_in_prefix
+
+# A plain file here (not an npm-managed symlink) makes `npm install -g` fail
+# EEXIST. Move it aside rather than removing it — see Phase 2d/4 of the
+# fleet migration plan for the per-host collision matrix.
+- name: Move aside a pre-existing openclaw CLI that would collide with npm install
+  ansible.builtin.command: >-
+    mv {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
+    {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw.pre-npm.disabled
+  when:
+    - openclaw_cli_in_prefix.stat.exists
+    - not openclaw_cli_in_prefix.stat.islnk
+
+# Separately: a hand-written wrapper at /usr/local/bin/openclaw shadows the
+# npm-installed binary on any host whose npm prefix is /usr, because
+# /usr/local/bin precedes /usr/bin on PATH. Only relevant when the prefix
+# itself isn't /usr/local (else the two checks above and below are the same
+# file).
+- name: Stat a hand-written wrapper shadowing the npm-installed CLI
+  ansible.builtin.stat:
+    path: /usr/local/bin/openclaw
+  register: openclaw_cli_shadow
+  when: (openclaw_npm_prefix.stdout | trim) != '/usr/local'
+
+- name: Move aside a shadowing wrapper on a higher-priority PATH entry
+  ansible.builtin.command: mv /usr/local/bin/openclaw /usr/local/bin/openclaw.pre-npm.disabled
+  when:
+    - (openclaw_npm_prefix.stdout | trim) != '/usr/local'
+    - openclaw_cli_shadow.stat is defined
+    - openclaw_cli_shadow.stat.exists
+    - not openclaw_cli_shadow.stat.islnk
+
+- name: Check installed openclaw CLI version
+  ansible.builtin.command: openclaw --version
+  register: openclaw_cli_version
+  changed_when: false
+  failed_when: false
+
+# Postinstall (postinstall-bundled-plugins.mjs) is allowed to run — no
+# --ignore-scripts — it installs the bundled plugins the CLI expects.
+- name: Install/upgrade the openclaw CLI via npm
+  ansible.builtin.command: "npm install -g openclaw@{{ openclaw_version }}"
+  when: >-
+    openclaw_cli_version.rc != 0 or
+    openclaw_version not in openclaw_cli_version.stdout

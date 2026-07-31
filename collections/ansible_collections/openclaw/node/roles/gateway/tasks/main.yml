@@ -1,16 +1,56 @@
 ---
-# -----------------------------------------------------------------------------
-# Gateway deployment orchestration (FIXED ORDER)
-# -----------------------------------------------------------------------------
+# Gateway deployment: npm-installed CLI, no source build. Order matters —
+# back up state, install the shared runtime, template the unit, then
+# health-gate before declaring success.
 
-# 1. Install/update release contents
-- import_tasks: install.yml
+- name: Check whether OpenClaw state directory exists yet
+  ansible.builtin.stat:
+    path: "/home/{{ openclaw_user }}/.openclaw"
+  register: openclaw_state_dir
 
-# 2. Build inside the release directory
-- import_tasks: build.yml
+- name: Ensure backup directory exists
+  ansible.builtin.file:
+    path: /var/backups
+    state: directory
+    mode: "0755"
 
-# 3. Package runtime artifact for nodes
-- import_tasks: package-artifact.yml
+- name: Back up existing OpenClaw state before any changes
+  ansible.builtin.command: >-
+    tar czf /var/backups/openclaw-state-{{ ansible_date_time.iso8601_basic_short }}.tar.gz
+    -C /home/{{ openclaw_user }} .openclaw
+  args:
+    creates: "/var/backups/openclaw-state-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+  when: openclaw_state_dir.stat.exists
 
-# 4. Flip current -> release symlink LAST (atomic deploy)
-- import_tasks: symlink.yml
+- name: Install shared OpenClaw runtime
+  ansible.builtin.include_role:
+    name: openclaw.node.common
+
+- name: Install gateway systemd unit
+  ansible.builtin.template:
+    src: openclaw-gateway.service.j2
+    dest: /etc/systemd/system/openclaw-gateway.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart openclaw gateway
+
+- name: Ensure the gateway service is enabled and running
+  ansible.builtin.systemd:
+    name: openclaw-gateway
+    enabled: true
+    state: started
+
+- name: Flush handlers so the health check reflects the current unit
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the gateway health endpoint
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ openclaw_gateway_port }}/health"
+    return_content: true
+  register: openclaw_gateway_health
+  until: openclaw_gateway_health.status == 200 and (openclaw_gateway_health.json.ok | default(false))
+  retries: 12
+  delay: 5

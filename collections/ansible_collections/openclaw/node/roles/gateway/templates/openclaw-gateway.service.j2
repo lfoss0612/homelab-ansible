@@ -6,20 +6,15 @@ After=network.target
 Type=simple
 User={{ openclaw_user }}
 Group={{ openclaw_group }}
-
-# MUST always point to a stable symlink, not versioned or "active"
-WorkingDirectory={{ openclaw_install_dir }}/current
+WorkingDirectory=/home/{{ openclaw_user }}
 
 Environment=NODE_ENV=production
 
-ExecStart=/usr/bin/node {{ openclaw_install_dir }}/current/dist/index.js gateway --bind lan --port 18789 --allow-unconfigured
+ExecStart=/usr/bin/openclaw gateway run --bind lan --port {{ openclaw_gateway_port }} --allow-unconfigured
 
-Restart=always
-RestartSec=3
-
-# Prevent crash loops hiding real errors
+Restart=on-failure
 RestartPreventExitStatus=78
-TimeoutStartSec=120
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target

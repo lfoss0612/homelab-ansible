@@ -1,13 +1,9 @@
-- name: systemd daemon reload
-  systemd:
-    daemon_reload: yes
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
 
 - name: restart openclaw gateway
-  systemd:
+  ansible.builtin.systemd:
     name: openclaw-gateway
     state: restarted
-
-- name: reload nginx
-  systemd:
-    name: nginx
-    state: reloaded
