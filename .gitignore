@@ -13,3 +13,4 @@ inventory/*/hosts.ini
 inventory/*/group_vars/all/secrets.yml
 node_modules/
 .tmp/
+dist/

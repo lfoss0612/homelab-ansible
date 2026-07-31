@@ -4,8 +4,12 @@ openclaw_user: openclaw
 openclaw_group: openclaw
 openclaw_install_dir: /opt/openclaw
 
-# Version to build/deploy. Must match a github release tag if downloading.
-openclaw_version: "2026.5.12"
+# npm package version to install (`npm install -g openclaw@{{ openclaw_version }}`).
+# Note the GitHub release tag for this same version is v2026.7.1.
+openclaw_version: "2026.7.1-2"
+
+# Node.js floor required by openclaw_version. common role upgrades below this.
+openclaw_node_min_version: "22.22.3"
 
 # Gateway endpoint (used by node role)
 openclaw_gateway_host: "10.0.5.7"
@@ -15,17 +19,9 @@ openclaw_gateway_port: 18789
 # switch nodes to wss:// through HAProxy later.
 openclaw_allow_insecure_ws: true
 
-# Number of release directories to keep on each node (for rollback)
-openclaw_keep_releases: 3
-
-# Artifact distribution: nodes fetch from this URL.
-openclaw_artifact_filename: "openclaw-runtime-{{ openclaw_version }}.tar.gz"
-openclaw_artifact_url: "http://{{ openclaw_gateway_host }}/openclaw/{{ openclaw_artifact_filename }}"
-
-# Shared gateway auth token (matches pbs's node.json token). Vault this.
-# Replace the placeholder below with the value pulled from
-# `sudo cat /home/openclaw/.openclaw/node.json` on pbs, then encrypt:
-#   ansible-vault encrypt_string '<token>' --name openclaw_gateway_token
+# Shared gateway auth token. This is the real token gateway.auth.token uses
+# for token-mode auth (verified by digest comparison 2026-07-29) — required
+# on every remote node, not a placeholder.
 openclaw_gateway_token: !vault |
           $ANSIBLE_VAULT;1.1;AES256
           31643132666432396666323631363066303931353561643535373864663130326431366238343664

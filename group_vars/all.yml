@@ -2,9 +2,6 @@
 # OpenClaw global config
 # -----------------------
 
-# Pull latest git tag from local repo on control node
-
-openclaw_repo: "https://github.com/openclaw/openclaw-node.git"
 openclaw_install_dir: "/opt/openclaw"
 
 # Safety: deterministic installs unless tag changes
