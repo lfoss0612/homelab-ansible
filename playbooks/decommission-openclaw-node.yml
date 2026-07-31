@@ -1,0 +1,110 @@
+---
+# Decommissions a single OpenClaw node: stops and removes the node service
+# and its npm-installed CLI, and reclaims disk. Parameterised by host —
+# nothing in this repo calls it automatically and no group targets it, so it
+# can only ever hit the host you name explicitly.
+#
+# This is the tool for the separately-scheduled pve-router decommission
+# mentioned in the fleet migration plan (Phase 2a) — not run against it here.
+#
+# The gateway host is refused outright: /opt/openclaw there is the gateway's
+# own source tree / pre-npm fallback, not a node install, and this playbook
+# must never delete it.
+#
+# Usage:
+#   ansible-playbook playbooks/decommission-openclaw-node.yml -e target_host=vscode.home.lan
+#   ansible-playbook playbooks/decommission-openclaw-node.yml -e target_host=vscode.home.lan -e openclaw_decommission_purge_user=true
+
+- name: Guard target host
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Require target_host
+      ansible.builtin.assert:
+        that:
+          - target_host is defined
+          - target_host | length > 0
+        fail_msg: "Pass -e target_host=<inventory_hostname> — this playbook has no default target."
+
+    - name: Require target_host to exist in inventory
+      ansible.builtin.assert:
+        that:
+          - target_host in hostvars
+        fail_msg: "'{{ target_host }}' is not a known inventory host."
+
+    - name: Refuse to decommission the gateway host
+      ansible.builtin.assert:
+        that:
+          - target_host not in groups['openclaw_gateway']
+        fail_msg: >-
+          '{{ target_host }}' is the gateway host. /opt/openclaw there is the
+          gateway's source tree, not a node install — this playbook does not
+          support decommissioning it.
+
+- name: Decommission OpenClaw node
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    openclaw_decommission_purge_user: false
+
+  tasks:
+    - name: Stop and disable the node service
+      ansible.builtin.systemd:
+        name: openclaw-node
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Remove the node systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/openclaw-node.service
+        state: absent
+
+    - name: Remove the node environment file
+      ansible.builtin.file:
+        path: /etc/default/openclaw-node
+        state: absent
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Uninstall the openclaw npm package
+      ansible.builtin.command: npm uninstall -g openclaw
+      register: openclaw_npm_uninstall
+      changed_when: "'removed' in openclaw_npm_uninstall.stdout"
+      failed_when: false
+
+    - name: Reclaim the legacy release tree, if present
+      ansible.builtin.file:
+        path: /opt/openclaw
+        state: absent
+
+    - name: Reclaim the log directory
+      ansible.builtin.file:
+        path: /var/log/openclaw
+        state: absent
+
+    - name: Remove openclaw user and home directory
+      ansible.builtin.user:
+        name: "{{ openclaw_user }}"
+        state: absent
+        remove: true
+      when: openclaw_decommission_purge_user | bool
+
+    - name: Remove openclaw group
+      ansible.builtin.group:
+        name: "{{ openclaw_group }}"
+        state: absent
+      when: openclaw_decommission_purge_user | bool
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} decommissioned. User/group
+          {{ 'purged' if openclaw_decommission_purge_user | bool
+             else 'left in place (pass -e openclaw_decommission_purge_user=true to remove)' }}.

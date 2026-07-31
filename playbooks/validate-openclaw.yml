@@ -1,9 +1,138 @@
-- name: Validate OpenClaw topology
-  hosts: localhost
-  gather_facts: no
+---
+# Post-migration validation for the OpenClaw fleet.
+#
+# The old "gateway is not a node" assertion is gone by decision, not by
+# accident — the gateway is deliberately a node now (it manages its own VM),
+# so this file instead asserts it runs BOTH services.
+#
+# pve-router is report-only: it is deliberately unmanaged, so it is never a
+# member of openclaw/openclaw_nodes and this playbook never asserts against
+# it or targets it for change — the last play below only reads and prints
+# its state, for visibility that it hasn't silently dropped off.
+#
+# NOTE: `nodes status --json`'s exact field names (status/paired/displayName)
+# are inferred from the fleet migration plan's prose ("all 13 fleet nodes
+# remain connected and paired"), not from a captured sample of real output.
+# If the connected+paired assertion below errors out on first run, read the
+# actual JSON shape (openclaw_nodes_status_raw.stdout is printed on failure)
+# and adjust the selectattr filters accordingly.
+
+- name: Validate OpenClaw version pin fleet-wide
+  hosts: openclaw
+  gather_facts: false
+  become: true
+
   tasks:
-    - name: Ensure gateway is not in nodes
-      assert:
+    - name: Check installed openclaw CLI version
+      ansible.builtin.command: openclaw --version
+      register: openclaw_validate_version
+      changed_when: false
+
+    - name: Assert installed version matches the pin
+      ansible.builtin.assert:
         that:
-          - "'openclaw.home.lan' not in groups['openclaw_nodes']"
-        fail_msg: "Gateway is incorrectly included in openclaw_nodes!"
+          - openclaw_version in openclaw_validate_version.stdout
+        fail_msg: >-
+          {{ inventory_hostname }} is at '{{ openclaw_validate_version.stdout }}',
+          expected '{{ openclaw_version }}'.
+        success_msg: "{{ inventory_hostname }} is at the pinned version."
+
+- name: Validate the gateway service, its own node, and fleet-wide pairing
+  hosts: openclaw_gateway
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Check gateway health endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ openclaw_gateway_port }}/health"
+        return_content: true
+      register: openclaw_health
+
+    - name: Assert gateway reports healthy
+      ansible.builtin.assert:
+        that:
+          - openclaw_health.status == 200
+          - openclaw_health.json.ok | default(false)
+        fail_msg: "Gateway /health did not report {ok: true}: {{ openclaw_health.content | default('') }}"
+
+    - name: Check gateway-host service states
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop:
+        - openclaw-gateway
+        - openclaw-node
+      register: openclaw_gateway_services
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the gateway host runs BOTH services
+      ansible.builtin.assert:
+        that:
+          - item.stdout == "active"
+        fail_msg: "{{ item.item }} is not active on the gateway host (state: {{ item.stdout }})"
+        success_msg: "{{ item.item }} is active on the gateway host."
+      loop: "{{ openclaw_gateway_services.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Query node status from the gateway
+      ansible.builtin.command: openclaw nodes status --json
+      become_user: "{{ openclaw_user }}"
+      register: openclaw_nodes_status_raw
+      changed_when: false
+
+    - name: Parse node status
+      ansible.builtin.set_fact:
+        openclaw_nodes_status: "{{ openclaw_nodes_status_raw.stdout | from_json }}"
+
+    - name: Count connected and paired nodes
+      ansible.builtin.set_fact:
+        openclaw_nodes_connected_paired: "{{ openclaw_nodes_status | selectattr('status', 'equalto', 'connected') | selectattr('paired', 'equalto', true) | list }}"
+
+    - name: Assert all managed nodes are connected and paired
+      ansible.builtin.assert:
+        that:
+          - openclaw_nodes_connected_paired | length == groups['openclaw_nodes'] | length
+        fail_msg: >-
+          Expected {{ groups['openclaw_nodes'] | length }} connected+paired nodes,
+          got {{ openclaw_nodes_connected_paired | length }}; raw status was: {{ openclaw_nodes_status_raw.stdout }}
+        success_msg: "All {{ groups['openclaw_nodes'] | length }} managed nodes are connected and paired."
+
+    - name: Run openclaw doctor
+      ansible.builtin.command: openclaw doctor
+      become_user: "{{ openclaw_user }}"
+      register: openclaw_doctor
+      changed_when: false
+      failed_when: false
+
+    - name: Assert doctor reports clean
+      ansible.builtin.assert:
+        that:
+          - openclaw_doctor.rc == 0
+        fail_msg: "openclaw doctor exited {{ openclaw_doctor.rc }}: {{ openclaw_doctor.stdout }}"
+        success_msg: "openclaw doctor is clean."
+
+- name: Report pve-router state (report-only — deliberately unmanaged, never asserted, never targeted for change)
+  hosts: pve-router.home.lan
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Check openclaw-node service state
+      ansible.builtin.command: systemctl is-active openclaw-node
+      register: openclaw_pve_router_service
+      changed_when: false
+      failed_when: false
+
+    - name: Check installed openclaw version
+      ansible.builtin.command: openclaw --version
+      register: openclaw_pve_router_version
+      changed_when: false
+      failed_when: false
+
+    - name: Report pve-router state
+      ansible.builtin.debug:
+        msg: >-
+          pve-router openclaw-node service: {{ openclaw_pve_router_service.stdout | default('unknown') }};
+          version: {{ openclaw_pve_router_version.stdout | default('unknown') }}
+          — report-only, not managed by this migration, not asserted against.

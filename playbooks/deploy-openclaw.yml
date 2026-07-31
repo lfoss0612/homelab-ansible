@@ -7,7 +7,9 @@
       tags: gateway
 
 - name: Deploy OpenClaw Nodes
-  hosts: openclaw_nodes:!openclaw_gateway # <-- subtract gateway from nodes
+  # No gateway subtraction: the gateway host is deliberately a node too, and
+  # the gateway play above already converged its gateway service first.
+  hosts: openclaw_nodes
   serial: 1
   become: true
   roles:

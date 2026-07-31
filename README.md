@@ -42,12 +42,19 @@ The CLI is npm-installed fleet-wide; there is no more per-host source build or
 
 | File | Purpose |
 |---|---|
-| `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then nodes. |
-| `playbooks/update-openclaw.yml` | Fleet convergence/rollout. Predates the npm-based roles above (still source-build-shaped) — treat as pending a rewrite to match `common`/`gateway`/`node` before relying on it. |
-| `playbooks/validate-openclaw.yml` | Topology assertions (currently just "gateway not in nodes" — inverted now that the gateway is deliberately a node; also pending a rewrite). |
+| `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then all of `openclaw_nodes` in full — no gateway subtraction, since the gateway is deliberately a node too. |
+| `playbooks/update-openclaw.yml` | Fleet convergence: verify-before-mutate (compares `openclaw --version` against the `openclaw_version` pin, not a build hash — there's no build any more), gateway first, nodes serialized with a per-host health gate, `end_host` wherever a host is already converged. |
+| `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean. `pve-router` is report-only — printed, never asserted against, never targeted. |
+| `playbooks/approve-openclaw-nodes.yml` | Explicit-invocation-only: auto-approves pending node pairing requests whose display name matches an inventory host; dry-run unless `-e openclaw_approve_confirm=true`. |
+| `playbooks/decommission-openclaw-node.yml` | Tears down a single node (`-e target_host=<host>`), parameterised, no group target. Refuses the gateway host outright — its `/opt/openclaw` is the source-tree fallback, not a node install. |
 | `playbooks/show-openclaw-version.yml` | Prints the resolved `openclaw_version`. |
 | `playbooks/users/*.yml` | Per-account provisioning: `ansible-user.yml`, `claude-user.yml` (see `docs/claude-access.md`), `lfoss-user.yml`, `disable-requiretty.yml`. |
 | `playbooks/bootstrap/install-acl.yml` | ACL package bootstrap. |
+
+`nodes status --json` / `devices list --json` field names used in `validate-openclaw.yml`
+and `approve-openclaw-nodes.yml` (`status`, `paired`, `role`, `displayName`, `id`) are
+inferred from prose in the fleet migration plan, not a captured sample of real output —
+verify against a live run before trusting them unattended.
 
 ## Bumping the OpenClaw version
 
