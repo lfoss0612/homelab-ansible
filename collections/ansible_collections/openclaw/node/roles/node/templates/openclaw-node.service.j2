@@ -16,7 +16,7 @@ WorkingDirectory=/home/{{ openclaw_user }}
 EnvironmentFile=/etc/default/openclaw-node
 Environment=NODE_ENV=production
 
-ExecStart=/usr/bin/openclaw node run \
+ExecStart={{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw node run \
   --host {{ openclaw_gateway_host }} \
   --port {{ openclaw_gateway_port }} \
   --display-name {{ inventory_hostname }}

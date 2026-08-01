@@ -10,7 +10,7 @@ WorkingDirectory=/home/{{ openclaw_user }}
 
 Environment=NODE_ENV=production
 
-ExecStart=/usr/bin/openclaw gateway run --bind lan --port {{ openclaw_gateway_port }} --allow-unconfigured
+ExecStart={{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw gateway run --bind lan --port {{ openclaw_gateway_port }} --allow-unconfigured
 
 Restart=on-failure
 RestartPreventExitStatus=78
