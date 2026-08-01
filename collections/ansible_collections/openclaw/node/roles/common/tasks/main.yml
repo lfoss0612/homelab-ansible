@@ -90,7 +90,7 @@
   ansible.builtin.file:
     path: /etc/sudoers.d/openclaw
     state: absent
-  when: not openclaw_sudo_commands
+  when: openclaw_sudo_commands | length == 0
   tags: privileges
 
 - name: Install a scoped openclaw sudo grant
@@ -106,7 +106,7 @@
       {% for command in openclaw_sudo_commands %}
       {{ openclaw_user }} ALL=(root) NOPASSWD: {{ command }}
       {% endfor %}
-  when: openclaw_sudo_commands
+  when: openclaw_sudo_commands | length > 0
   tags: privileges
 
 - name: Ensure log directory exists
