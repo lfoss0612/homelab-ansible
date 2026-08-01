@@ -1,15 +1,22 @@
 ---
-# Approves pending OpenClaw node pairing requests. Explicit invocation only —
-# never included from deploy-openclaw.yml or update-openclaw.yml. Auto-approves
-# only devices with role "node" whose displayName matches an openclaw_nodes
-# inventory hostname (nodes are started with --display-name {{ inventory_hostname }},
-# so the two should always agree); anything else is reported but left pending
-# for a human to look at.
+# Approves pending OpenClaw node capability-reapproval requests. Explicit
+# invocation only — never included from deploy-openclaw.yml or
+# update-openclaw.yml. Auto-approves only entries whose displayName matches
+# an openclaw_nodes inventory hostname (nodes are started with
+# --display-name {{ inventory_hostname }}, so the two should always agree);
+# anything else — including pve-router (deliberately not in openclaw_nodes)
+# and non-infrastructure devices like phone clients — is reported but left
+# untouched for a human to look at.
 #
-# NOTE: `devices list --json`'s exact field names (role/status/displayName/id)
-# are inferred from the fleet migration plan's prose, not from a captured
-# sample of real output. If the assertions below error out on first run,
-# read the actual JSON shape and adjust the selectattr filters accordingly.
+# Verified against real output from `openclaw nodes status --json` on
+# 2026-08-01 (gateway 2026.7.1-2): re-approval requests live here, not in
+# `devices list --json` (which only shows already-paired devices with empty
+# "pending": []). The field names are approvalState ("pending-approval" /
+# "pending-reapproval" / "unapproved" / "approved"), displayName, and
+# pendingRequestId — approved via `openclaw devices approve <pendingRequestId>`.
+# An earlier version of this playbook guessed a different, wrong schema
+# (devices list --json's role/status/id) that was never exercised for real;
+# this one replaces it.
 #
 # Dry-run by default — prints what it would approve. Pass
 # -e openclaw_approve_confirm=true to actually approve.
@@ -18,7 +25,7 @@
 #   ansible-playbook playbooks/approve-openclaw-nodes.yml
 #   ansible-playbook playbooks/approve-openclaw-nodes.yml -e openclaw_approve_confirm=true
 
-- name: Approve pending OpenClaw node pairing requests
+- name: Approve pending OpenClaw node capability-reapproval requests
   hosts: openclaw_gateway
   gather_facts: false
   become: true
@@ -27,52 +34,58 @@
     openclaw_approve_confirm: false
 
   tasks:
-    - name: List devices known to the gateway
-      ansible.builtin.command: openclaw devices list --json
+    - name: Query node status from the gateway
+      ansible.builtin.command: openclaw nodes status --json
       become_user: "{{ openclaw_user }}"
-      register: openclaw_devices_raw
+      register: openclaw_nodes_status_raw
       changed_when: false
 
-    - name: Parse device list
+    - name: Parse node status
       ansible.builtin.set_fact:
-        openclaw_devices: "{{ openclaw_devices_raw.stdout | from_json }}"
+        openclaw_nodes_status: "{{ (openclaw_nodes_status_raw.stdout | from_json).nodes }}"
 
-    - name: Identify pending node requests that match an inventory host
+    - name: Collect all pending re-approval requests
+      ansible.builtin.set_fact:
+        openclaw_pending_all: >-
+          {{ openclaw_nodes_status
+             | selectattr('approvalState', 'defined')
+             | selectattr('approvalState', 'in', ['pending-approval', 'pending-reapproval'])
+             | list }}
+
+    - name: Identify pending re-approval requests that match an inventory host
       ansible.builtin.set_fact:
         openclaw_pending_matched: >-
-          {{ openclaw_devices
-             | selectattr('role', 'equalto', 'node')
-             | selectattr('status', 'equalto', 'pending')
+          {{ openclaw_pending_all
+             | selectattr('displayName', 'defined')
              | selectattr('displayName', 'in', groups['openclaw_nodes'])
              | list }}
         openclaw_pending_unmatched: >-
-          {{ openclaw_devices
-             | selectattr('role', 'equalto', 'node')
-             | selectattr('status', 'equalto', 'pending')
-             | rejectattr('displayName', 'in', groups['openclaw_nodes'])
-             | list }}
+          {{ (openclaw_pending_all | rejectattr('displayName', 'defined') | list)
+             +
+             (openclaw_pending_all | selectattr('displayName', 'defined')
+              | rejectattr('displayName', 'in', groups['openclaw_nodes']) | list) }}
 
     - name: Report pending requests with no inventory match — left pending
       ansible.builtin.debug:
         msg: >-
-          '{{ item.displayName }}' (id={{ item.id }}) has no matching host in
-          openclaw_nodes — not auto-approved; approve manually via
-          `openclaw devices approve {{ item.id }}` if expected.
+          '{{ item.displayName | default('(no displayName)') }}' (requestId={{ item.pendingRequestId }})
+          has no matching host in openclaw_nodes — not auto-approved; approve manually via
+          `openclaw devices approve {{ item.pendingRequestId }}` if expected.
       loop: "{{ openclaw_pending_unmatched }}"
       loop_control:
-        label: "{{ item.displayName }}"
+        label: "{{ item.displayName | default(item.pendingRequestId) }}"
 
     - name: Report matched pending requests
       ansible.builtin.debug:
         msg: >-
           {{ 'Approving' if openclaw_approve_confirm | bool else 'Would approve (dry-run)' }}
-          '{{ item.displayName }}' (id={{ item.id }})
+          '{{ item.displayName }}' (requestId={{ item.pendingRequestId }})
       loop: "{{ openclaw_pending_matched }}"
       loop_control:
         label: "{{ item.displayName }}"
 
     - name: Approve matched pending node requests
-      ansible.builtin.command: "openclaw devices approve {{ item.id }}"
+      ansible.builtin.command: "openclaw devices approve {{ item.pendingRequestId }}"
       become_user: "{{ openclaw_user }}"
       loop: "{{ openclaw_pending_matched }}"
       loop_control:
