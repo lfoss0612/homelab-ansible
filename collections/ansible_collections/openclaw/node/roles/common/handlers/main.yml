@@ -6,6 +6,10 @@
 # Only units that already exist are touched. On a first deploy neither is
 # present yet, and the node/gateway roles start them afterwards with the right
 # groups already in place.
+#
+# Tagged to match the tasks that notify it: handlers are tag-filtered too, so an
+# untagged handler is silently dropped from a `--tags privileges` run even when
+# notified. An untagged full run still executes it, since no filter applies.
 - name: restart openclaw units for group membership
   ansible.builtin.systemd:
     name: "{{ item }}"
@@ -14,3 +18,4 @@
     - openclaw-gateway.service
     - openclaw-node.service
   when: item in (ansible_facts.services | default({}))
+  tags: privileges

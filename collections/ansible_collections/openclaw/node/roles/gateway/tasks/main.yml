@@ -30,9 +30,11 @@
     mode: "0600"
   when: openclaw_state_dir.stat.exists
 
+# Tagged for the same reason as in the node role — see the note there.
 - name: Install shared OpenClaw runtime
   ansible.builtin.include_role:
     name: openclaw.node.common
+  tags: privileges
 
 - name: Install gateway systemd unit
   ansible.builtin.template:
