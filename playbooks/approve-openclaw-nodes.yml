@@ -13,10 +13,20 @@
 # `devices list --json` (which only shows already-paired devices with empty
 # "pending": []). The field names are approvalState ("pending-approval" /
 # "pending-reapproval" / "unapproved" / "approved"), displayName, and
-# pendingRequestId — approved via `openclaw devices approve <pendingRequestId>`.
-# An earlier version of this playbook guessed a different, wrong schema
-# (devices list --json's role/status/id) that was never exercised for real;
-# this one replaces it.
+# pendingRequestId — approved via `openclaw nodes approve <pendingRequestId>`
+# (a different subcommand from `openclaw devices approve`, which the CLI
+# itself rejects for this kind of request with "No pending device request
+# matches ... Run openclaw nodes approve <id>"). An earlier version of this
+# playbook guessed a different, wrong schema (devices list --json's
+# role/status/id) that was never exercised for real; this one replaces it.
+#
+# Also observed live: most already-paired devices auto-resolve a
+# "pending-reapproval" state (new capability declaration on an existing
+# device) within a couple of minutes with no action needed — likely the
+# gateway's own channel-connect-grace window. A "pending-approval" state
+# (this device's first pairing-like request since the upgrade) did not
+# auto-resolve and expired back to "unapproved"; restarting openclaw-node on
+# that host generated a fresh pendingRequestId for this playbook to approve.
 #
 # Dry-run by default — prints what it would approve. Pass
 # -e openclaw_approve_confirm=true to actually approve.
@@ -70,7 +80,7 @@
         msg: >-
           '{{ item.displayName | default('(no displayName)') }}' (requestId={{ item.pendingRequestId }})
           has no matching host in openclaw_nodes — not auto-approved; approve manually via
-          `openclaw devices approve {{ item.pendingRequestId }}` if expected.
+          `openclaw nodes approve {{ item.pendingRequestId }}` if expected.
       loop: "{{ openclaw_pending_unmatched }}"
       loop_control:
         label: "{{ item.displayName | default(item.pendingRequestId) }}"
@@ -85,7 +95,7 @@
         label: "{{ item.displayName }}"
 
     - name: Approve matched pending node requests
-      ansible.builtin.command: "openclaw devices approve {{ item.pendingRequestId }}"
+      ansible.builtin.command: "openclaw nodes approve {{ item.pendingRequestId }}"
       become_user: "{{ openclaw_user }}"
       loop: "{{ openclaw_pending_matched }}"
       loop_control:
