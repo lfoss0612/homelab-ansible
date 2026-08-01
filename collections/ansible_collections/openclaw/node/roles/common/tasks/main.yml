@@ -41,6 +41,74 @@
     shell: /bin/bash
     create_home: true
 
+# The read half of the read plane. Group membership, not sudo: it confers log
+# visibility and no ability to change anything. Intersected with the real group
+# database so a host missing one of them is skipped, never has it created.
+- name: Read the group database
+  ansible.builtin.getent:
+    database: group
+  tags: privileges
+
+- name: Collect service facts
+  ansible.builtin.service_facts:
+  tags: privileges
+
+- name: Grant the openclaw user read-only log access
+  ansible.builtin.user:
+    name: "{{ openclaw_user }}"
+    groups: "{{ openclaw_read_groups | intersect(ansible_facts.getent_group.keys() | list) }}"
+    append: true
+  notify: restart openclaw units for group membership
+  tags: privileges
+
+# --- Read-plane enforcement -------------------------------------------------
+# The agent observes; Ansible makes changes. Root capability here is a
+# write-plane grant and defeats that split. An unrestricted
+# `NOPASSWD: /usr/bin/systemctl` is not a service-restart grant but full root:
+# the user owns its home, so `systemctl link ~/unit.service && systemctl start`
+# runs arbitrary code as root. The fleet had such grants in both locations
+# before this was managed — /etc/sudoers.d/openclaw on the 11 nodes, an inline
+# /etc/sudoers line on the gateway — so both are reconciled here.
+#
+# `validate: visudo -cf %s` on both tasks is load-bearing: a malformed sudoers
+# file locks every user out of sudo, and validation happens on the temp file
+# before it is moved into place.
+#
+# All six tasks above and below carry `tags: privileges` so the privilege
+# change can be applied on its own, without the npm install task dragging the
+# fleet from 2026.5.26 to the pinned version as a side effect.
+
+- name: Remove inline openclaw grants from /etc/sudoers
+  ansible.builtin.lineinfile:
+    path: /etc/sudoers
+    regexp: '^\s*{{ openclaw_user }}\s+ALL\s*='
+    state: absent
+    validate: visudo -cf %s
+  tags: privileges
+
+- name: Remove the openclaw sudo grant
+  ansible.builtin.file:
+    path: /etc/sudoers.d/openclaw
+    state: absent
+  when: not openclaw_sudo_commands
+  tags: privileges
+
+- name: Install a scoped openclaw sudo grant
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/openclaw
+    owner: root
+    group: root
+    mode: "0440"
+    validate: visudo -cf %s
+    content: |
+      # Managed by Ansible — openclaw.node.common role. Do not edit on the host;
+      # set openclaw_sudo_commands instead. See docs/execution-model.md.
+      {% for command in openclaw_sudo_commands %}
+      {{ openclaw_user }} ALL=(root) NOPASSWD: {{ command }}
+      {% endfor %}
+  when: openclaw_sudo_commands
+  tags: privileges
+
 - name: Ensure log directory exists
   ansible.builtin.file:
     path: /var/log/openclaw

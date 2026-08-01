@@ -38,6 +38,14 @@ Roles live in `collections/ansible_collections/openclaw/node/roles/`:
 The CLI is npm-installed fleet-wide; there is no more per-host source build or
 `releases/current/shared` directory tree.
 
+## Execution model
+
+OpenClaw nodes are the **read plane** (observe, tail, debug); Ansible is the **write
+plane** for hosts; Argo CD is the write plane for anything in-cluster. Changes found by
+debugging on a host are fixed by a playbook here, never by hand on the host. See
+[`docs/execution-model.md`](docs/execution-model.md) — including the audit showing this is
+not yet enforced, and the TODO to close it.
+
 ## Playbooks
 
 | File | Purpose |

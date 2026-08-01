@@ -3,3 +3,22 @@ openclaw_user: openclaw
 openclaw_group: openclaw
 openclaw_version: "latest"
 openclaw_node_min_version: "22.22.3"
+
+# Root capabilities granted to the openclaw runtime user, as sudoers command
+# specs. Empty is the read-plane default: the agent observes, Ansible changes
+# things (docs/execution-model.md), so it needs no root at all. Any entry added
+# here is a write-plane grant — scope it to an exact command with arguments,
+# never a bare binary path.
+openclaw_sudo_commands: []
+
+# Supplementary groups giving the agent the read half of the read plane. These
+# replace what the sudo grant was really being used for — reading logs — with
+# capability that cannot mutate anything:
+#   systemd-journal  full journal, every unit (without it the agent sees only
+#                    its own uid's entries, and not even those on the gateway)
+#   adm              the root:adm / syslog:adm files under /var/log, e.g.
+#                    syslog, auth.log, and the Proxmox task logs
+# Groups absent on a host are skipped rather than created.
+openclaw_read_groups:
+  - systemd-journal
+  - adm

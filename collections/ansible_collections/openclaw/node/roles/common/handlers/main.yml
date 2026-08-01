@@ -1,0 +1,16 @@
+---
+# Supplementary groups are resolved at process start, so a running agent keeps
+# its old set until restarted — without this the journal/adm access silently
+# does not take effect until the next unrelated restart.
+#
+# Only units that already exist are touched. On a first deploy neither is
+# present yet, and the node/gateway roles start them afterwards with the right
+# groups already in place.
+- name: restart openclaw units for group membership
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - openclaw-gateway.service
+    - openclaw-node.service
+  when: item in (ansible_facts.services | default({}))
