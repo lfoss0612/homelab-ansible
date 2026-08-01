@@ -22,6 +22,14 @@
     creates: "/var/backups/openclaw-state-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
   when: openclaw_state_dir.stat.exists
 
+- name: Tighten OpenClaw state file permissions
+  ansible.builtin.file:
+    path: "/home/{{ openclaw_user }}/.openclaw/openclaw.json"
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0600"
+  when: openclaw_state_dir.stat.exists
+
 - name: Install shared OpenClaw runtime
   ansible.builtin.include_role:
     name: openclaw.node.common
