@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Managed by Ansible — openclaw.node.control role. Do not edit on the host;
+# change the role and re-run playbooks/openclaw-automation.yml.
+#
+# Replaces scripts/openclaw-sync.sh. That script's ordering bug is the whole
+# reason this one exists: it rewrote openclaw_version in group_vars *before*
+# running the rollout, so when the rollout died (2026-06-04, an interactive
+# corepack prompt with no stdin, killed after 7m30s) the recorded version
+# already matched the gateway. Five minutes later the next poll compared the
+# two, saw them agree, and logged "Versions match. Nothing to do." The failure
+# erased its own evidence and the fleet sat un-upgraded for two months.
+#
+# So, two rules here:
+#   * The pin is only ever READ. It is set by a human commit. Nothing on this
+#     host writes a tracked file — no sed, no version discovery from the
+#     gateway.
+#   * Recorded state is written only after every playbook has exited 0.
+#     `set -e` plus the ordering below is what enforces that; there is no
+#     success path that skips a failure.
+#
+# Failure surfaces as a failed systemd unit and a journal trace. Check with
+#   systemctl status {{ openclaw_control_unit }}.service
+#   journalctl -u {{ openclaw_control_unit }}.service -n 200
+
+set -euo pipefail
+
+ANSIBLE_DIR={{ openclaw_control_dir }}
+STATE_DIR={{ openclaw_control_state_dir }}
+LOCK_FILE="$STATE_DIR/.lock"
+SUCCESS_FILE="$STATE_DIR/last-success"
+
+# Belt and braces against the documented gotcha: ansible.cfg is only picked up
+# from the current directory, and a run that misses it silently uses the wrong
+# inventory and the wrong collections path rather than erroring.
+export ANSIBLE_CONFIG="$ANSIBLE_DIR/ansible.cfg"
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*"; }
+
+mkdir -p "$STATE_DIR"
+
+# A manual run and a timer firing must never overlap: update-openclaw.yml is
+# serialized with health gates, and two of them interleaved would gate on each
+# other's restarts.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log "another {{ openclaw_control_unit }} run holds the lock — exiting without doing anything"
+  exit 0
+fi
+
+cd "$ANSIBLE_DIR"
+
+before=$(git rev-parse HEAD)
+log "pulling $ANSIBLE_DIR (currently ${before:0:7})"
+git pull --ff-only
+after=$(git rev-parse HEAD)
+
+if [ "$before" = "$after" ]; then
+  log "checkout unchanged at ${after:0:7}"
+else
+  log "checkout advanced ${before:0:7} -> ${after:0:7}"
+fi
+
+# Read-only, for the log line and the state file. See the header: this value
+# is never written back.
+pin=$(sed -n 's/^openclaw_version:[[:space:]]*"\?\([^"]*\)"\?.*/\1/p' \
+  group_vars/openclaw.yml | head -1)
+log "pinned openclaw_version: ${pin:-unknown}"
+
+{% for playbook in openclaw_control_playbooks %}
+log "running {{ playbook }}"
+ansible-playbook {{ playbook }}
+
+{% endfor %}
+printf 'timestamp=%s\ncommit=%s\nopenclaw_version=%s\n' \
+  "$(date -Iseconds)" "$after" "${pin:-unknown}" > "$SUCCESS_FILE"
+
+log "fleet converged and validated at ${after:0:7}; recorded $SUCCESS_FILE"

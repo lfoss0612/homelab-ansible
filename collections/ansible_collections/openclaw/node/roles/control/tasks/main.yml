@@ -1,0 +1,132 @@
+---
+# Installs the unattended fleet-convergence timer on the control node.
+#
+# Three things happen here, in this order, and the order matters:
+#   1. the legacy 5-minute sync units are removed before the new ones land, so
+#      the two can never both be armed;
+#   2. the checkout is made writable by the ansible user, because the timer
+#      runs as that user and cannot pull otherwise;
+#   3. the script/service/timer are templated and the timer armed.
+
+- name: Assert the control-node checkout exists
+  ansible.builtin.stat:
+    path: "{{ openclaw_control_dir }}/ansible.cfg"
+  register: openclaw_control_cfg
+
+- name: Fail early if this host is not the Ansible control node
+  ansible.builtin.assert:
+    that:
+      - openclaw_control_cfg.stat.exists
+    fail_msg: >-
+      {{ inventory_hostname }} has no {{ openclaw_control_dir }}/ansible.cfg —
+      this role installs the convergence timer and only belongs on the control
+      node (group openclaw_control).
+
+# --- 1. Retire the legacy poller ------------------------------------------
+# openclaw-sync.timer ran every 5 minutes, compared the gateway's reported
+# version against group_vars, and on a mismatch `sed`-ed the tracked file
+# before rolling out. Its ExecStart is scripts/openclaw-sync.sh, deleted from
+# git in the same commit as this role — so these units must go first or they
+# are left pointing at a path that no longer exists.
+
+- name: Stop and disable the legacy openclaw-sync units
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop: "{{ openclaw_control_legacy_units }}"
+  failed_when: false
+
+- name: Remove the legacy openclaw-sync unit files
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop: "{{ openclaw_control_legacy_units }}"
+  notify: daemon-reload
+
+# --- 2. Make the checkout usable by the unattended runner ------------------
+# The timer runs as `ansible`, not root, deliberately: ansible.cfg points
+# local_tmp/remote_tmp at /home/ansible/.ansible/tmp, and a root-run playbook
+# leaves root-owned files there that break every later run as `ansible`. Past
+# root-run `ansible localhost -m git` syncs are exactly why the fix below is
+# needed at all — they left 163 root-owned paths under .git with 2755 object
+# fanout dirs, so `git pull` as `ansible` fails with "insufficient permission
+# for adding an object to repository database".
+#
+# core.sharedRepository=group makes git itself create future objects and
+# fanout dirs group-writable, so this cannot silently re-accumulate.
+
+- name: Read git's core.sharedRepository setting
+  ansible.builtin.command: git -C {{ openclaw_control_dir }} config --get core.sharedRepository
+  register: openclaw_control_shared
+  changed_when: false
+  failed_when: false
+
+- name: Configure the checkout as a group-shared repository
+  ansible.builtin.command: git -C {{ openclaw_control_dir }} config core.sharedRepository group
+  when: (openclaw_control_shared.stdout | trim) != 'group'
+
+- name: Find checkout paths not owned by the ansible group
+  ansible.builtin.command: find {{ openclaw_control_dir }} ! -group {{ openclaw_control_group }}
+  register: openclaw_control_wrong_group
+  changed_when: false
+
+- name: Give the whole checkout to the ansible group
+  ansible.builtin.command: chgrp -R {{ openclaw_control_group }} {{ openclaw_control_dir }}
+  when: openclaw_control_wrong_group.stdout | length > 0
+
+- name: Find checkout paths that are not group-writable
+  ansible.builtin.command: find {{ openclaw_control_dir }} ! -perm -g+w
+  register: openclaw_control_not_writable
+  changed_when: false
+
+- name: Make the checkout group-writable
+  ansible.builtin.command: chmod -R g+w {{ openclaw_control_dir }}
+  when: openclaw_control_not_writable.stdout | length > 0
+
+# --- 3. Install the convergence job ----------------------------------------
+
+- name: Create the convergence state directory
+  ansible.builtin.file:
+    path: "{{ openclaw_control_state_dir }}"
+    state: directory
+    owner: "{{ openclaw_control_user }}"
+    group: "{{ openclaw_control_group }}"
+    mode: "0755"
+
+- name: Install the fleet-update script
+  ansible.builtin.template:
+    src: openclaw-fleet-update.sh.j2
+    dest: "{{ openclaw_control_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the fleet-update service unit
+  ansible.builtin.template:
+    src: openclaw-fleet-update.service.j2
+    dest: "/etc/systemd/system/{{ openclaw_control_unit }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload
+
+- name: Install the fleet-update timer unit
+  ansible.builtin.template:
+    src: openclaw-fleet-update.timer.j2
+    dest: "/etc/systemd/system/{{ openclaw_control_unit }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - daemon-reload
+    - restart openclaw-fleet-update timer
+
+- name: Apply pending unit changes before arming the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the fleet-update timer
+  ansible.builtin.systemd:
+    name: "{{ openclaw_control_unit }}.timer"
+    enabled: true
+    state: started

@@ -47,7 +47,11 @@ ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook 
 - **`pve-router` is deliberately excluded** from `openclaw_nodes`. It runs an
   independently-managed node this repo must not touch. Omission from the group is the only
   thing protecting it — no play should ever target it by name.
-- **Fleet is on `2026.5.26`, the gateway on `2026.7.1-2`.** `update-openclaw.yml` has not
-  been run for real yet. A host still holding a legacy `~openclaw/.openclaw/memory/main.sqlite`
-  will fail its startup migration when it crosses 2026.5.x — move the file aside, don't
-  delete it.
+- **The whole fleet is on `2026.7.1-2`** as of 2026-08-01, npm layout everywhere. A host
+  still holding a legacy `~openclaw/.openclaw/memory/main.sqlite` fails its startup
+  migration when it crosses 2026.5.x — move the file aside, don't delete it. None of the
+  12 had one, but a rebuilt-from-backup host could.
+- **`/opt/ansible` is a group-shared checkout** (`core.sharedRepository=group`) because
+  the weekly timer pulls it as the `ansible` user. Never run a playbook there as root —
+  it leaves root-owned files in `.git` and `/home/ansible/.ansible/tmp` that break every
+  later run as `ansible`. `openclaw.node.control` repairs this, but don't recreate it.

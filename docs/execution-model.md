@@ -141,6 +141,49 @@ real log line from a unit the agent does **not** own. All 12 hosts satisfied thi
 `pve-router` is not in `openclaw_nodes`, so its own `openclaw` user keeps whatever grant it
 has. That host is independently managed and deliberately out of scope.
 
+## The unattended arm of the write plane
+
+Since 2026-08-01 the write plane has an automated arm: `openclaw-fleet-update.timer`
+on cockpit, installed by `playbooks/openclaw-automation.yml` (role
+`openclaw.node.control`). Weekly, as the `ansible` user, it runs
+
+```
+git -C /opt/ansible pull --ff-only
+ansible-playbook playbooks/update-openclaw.yml
+ansible-playbook playbooks/validate-openclaw.yml
+```
+
+and only then records `/var/lib/openclaw-fleet-update/last-success`
+(timestamp, commit, pinned version). This does not weaken the rule above — it
+strengthens it. The timer runs *playbooks from git and nothing else*; it has no
+way to make a change that isn't already committed, and it never writes a
+tracked file. Bumping the version is still a human commit to
+`group_vars/openclaw.yml`; the timer's only job is drift correction.
+
+Four properties are deliberate:
+
+- **It reads the pin, never writes it.** Its predecessor, `openclaw-sync.timer`,
+  `sed`-ed the new version into `group_vars` *before* running the rollout. When the
+  rollout died on 2026-06-04 the recorded version already matched, so the next poll
+  logged "Versions match. Nothing to do." The failure erased its own evidence and the
+  fleet sat un-upgraded for two months.
+- **State is recorded only after every playbook exits 0**, and validation is one of
+  them — a fleet that installed the pin but fails its health checks leaves the unit
+  failed rather than recording a green run.
+- **It runs as `ansible`, not root.** `ansible.cfg` points `local_tmp`/`remote_tmp` at
+  `/home/ansible/.ansible/tmp`, so a root-run playbook leaves root-owned files that
+  break every later run as that user. Past root-run syncs are why the role has to
+  repair `/opt/ansible`'s permissions at all: they left 163 root-owned paths under
+  `.git` with `2755` object fanout dirs, and `git pull` as `ansible` failed with
+  "insufficient permission for adding an object to repository database". The role
+  fixes ownership and sets `core.sharedRepository=group` so it cannot re-accumulate.
+- **Weekly, not every five minutes**, and `flock`-guarded so a manual run and a timer
+  firing can never interleave two serialized rollouts.
+
+Failure surfaces as a failed unit — `systemctl status openclaw-fleet-update.service`,
+`journalctl -u openclaw-fleet-update.service`. There is no notification path beyond
+that yet; see the TODO below.
+
 ## What this does not cover
 
 The OS boundary is enforced here; the **capability** boundary is not, and Ansible does not
@@ -191,6 +234,10 @@ the exact failure this whole document exists to prevent.
    `(ALL) NOPASSWD: ALL` by design, but the sweep above only asked about `openclaw`.
 3. **Decide whether the read plane extends to the capability layer** — see "What this does
    not cover" above.
+4. **Give `openclaw-fleet-update` a failure notification path.** Today a failed weekly
+   run is visible only in the unit state and the journal, so a fleet that stops
+   converging is silent until someone looks. An `OnFailure=` unit pointing at Zabbix or
+   any existing alert path would close it.
 
 These are write-plane changes: they belong in the roles, applied by playbook, never
 hand-edited on the hosts.

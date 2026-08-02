@@ -1,0 +1,74 @@
+---
+# Phase 8 — unattended fleet convergence on the control node.
+#
+# Installs openclaw-fleet-update.{service,timer} on cockpit and retires every
+# legacy self-updater the fleet used to carry. After this, the write plane has
+# an automated arm: a weekly `git pull --ff-only` followed by
+# update-openclaw.yml and validate-openclaw.yml, both from git, neither of them
+# writing a tracked file.
+#
+# This playbook does not change any OpenClaw install itself. The timer it
+# installs does that, on its own schedule — so run validate-openclaw.yml first
+# if you want to know the fleet is healthy before arming it.
+
+- name: Install fleet convergence automation on the control node
+  hosts: openclaw_control
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Install the openclaw-fleet-update timer
+      ansible.builtin.include_role:
+        name: openclaw.node.control
+
+# The gateway carried its own updater before the fleet was centralised on
+# cockpit. Phase 2 renamed the units aside rather than deleting them, as the
+# rollback path for the gateway migration; that migration is done and verified,
+# so they go now rather than sitting inert forever. Archived, not deleted —
+# /usr/local/bin/openclaw-update.sh is not in git and nothing else records it.
+- name: Retire the gateway's legacy self-updater
+  hosts: openclaw_gateway
+  gather_facts: false
+  become: true
+
+  vars:
+    openclaw_legacy_updater_files:
+      - /etc/systemd/system/openclaw-update.service.disabled
+      - /etc/systemd/system/openclaw-update.timer.disabled
+      - /usr/local/bin/openclaw-update.sh
+    openclaw_legacy_updater_archive: /var/backups/openclaw-legacy-updater
+
+  tasks:
+    - name: Look for the retired updater files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ openclaw_legacy_updater_files }}"
+      register: openclaw_legacy_updater_stat
+
+    - name: Select the ones still present
+      ansible.builtin.set_fact:
+        openclaw_legacy_updater_present: >-
+          {{ openclaw_legacy_updater_stat.results
+             | selectattr('stat.exists')
+             | map(attribute='stat.path') | list }}
+
+    - name: Create the archive directory
+      ansible.builtin.file:
+        path: "{{ openclaw_legacy_updater_archive }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: openclaw_legacy_updater_present | length > 0
+
+    - name: Archive the legacy updater out of the unit and PATH directories
+      ansible.builtin.command: mv {{ item }} {{ openclaw_legacy_updater_archive }}/
+      loop: "{{ openclaw_legacy_updater_present }}"
+
+    - name: Report what was retired
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Archived to ' ~ openclaw_legacy_updater_archive ~ ': '
+             ~ (openclaw_legacy_updater_present | join(', '))
+             if openclaw_legacy_updater_present | length > 0
+             else 'No legacy updater files left on the gateway.' }}

@@ -34,6 +34,9 @@ Roles live in `collections/ansible_collections/openclaw/node/roles/`:
   `openclaw-gateway.service`, health-gates on `/health` returning `{"ok":true}`.
 - **`node`** — installs `common`, templates `/etc/default/openclaw-node` (gateway token +
   `OPENCLAW_ALLOW_INSECURE_PRIVATE_WS`) and `openclaw-node.service`.
+- **`control`** — control-node only (group `openclaw_control` = cockpit): installs the
+  weekly `openclaw-fleet-update` script/service/timer, repairs `/opt/ansible` so the
+  `ansible` user can `git pull` unattended, and removes the legacy `openclaw-sync` units.
 
 The CLI is npm-installed fleet-wide; there is no more per-host source build or
 `releases/current/shared` directory tree.
@@ -43,8 +46,9 @@ The CLI is npm-installed fleet-wide; there is no more per-host source build or
 OpenClaw nodes are the **read plane** (observe, tail, debug); Ansible is the **write
 plane** for hosts; Argo CD is the write plane for anything in-cluster. Changes found by
 debugging on a host are fixed by a playbook here, never by hand on the host. See
-[`docs/execution-model.md`](docs/execution-model.md) — including the audit showing this is
-not yet enforced, and the TODO to close it.
+[`docs/execution-model.md`](docs/execution-model.md) — including the audit that found
+root-equivalent sudo on all 12 hosts, how the roles revoke it, and the unattended arm
+(`openclaw-fleet-update.timer`) that runs playbooks from git on a weekly schedule.
 
 ## Playbooks
 
@@ -55,14 +59,32 @@ not yet enforced, and the TODO to close it.
 | `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean. `pve-router` is report-only — printed, never asserted against, never targeted. |
 | `playbooks/approve-openclaw-nodes.yml` | Explicit-invocation-only: auto-approves pending node pairing requests whose display name matches an inventory host; dry-run unless `-e openclaw_approve_confirm=true`. |
 | `playbooks/decommission-openclaw-node.yml` | Tears down a single node (`-e target_host=<host>`), parameterised, no group target. Refuses the gateway host outright — its `/opt/openclaw` is the source-tree fallback, not a node install. |
+| `playbooks/openclaw-automation.yml` | Installs the weekly `openclaw-fleet-update` timer on the control node and retires the legacy self-updaters (cockpit's `openclaw-sync` units, the gateway's archived `openclaw-update` files). Installs automation only — it changes no OpenClaw install itself. |
 | `playbooks/show-openclaw-version.yml` | Prints the resolved `openclaw_version`. |
 | `playbooks/users/*.yml` | Per-account provisioning: `ansible-user.yml`, `claude-user.yml` (see `docs/claude-access.md`), `lfoss-user.yml`, `disable-requiretty.yml`. |
 | `playbooks/bootstrap/install-acl.yml` | ACL package bootstrap. |
 
-`nodes status --json` / `devices list --json` field names used in `validate-openclaw.yml`
-and `approve-openclaw-nodes.yml` (`status`, `paired`, `role`, `displayName`, `id`) are
-inferred from prose in the fleet migration plan, not a captured sample of real output —
-verify against a live run before trusting them unattended.
+The `nodes status --json` and `doctor --lint --json` schemas used by
+`validate-openclaw.yml` are captured from live `2026.7.1-2` output (2026-08-01) and
+documented in that file's header — they were previously inferred from prose, which is
+exactly what made the first real run fail. `approve-openclaw-nodes.yml` was likewise
+rewritten twice against real output.
+
+## Fleet convergence automation
+
+`openclaw-fleet-update.timer` on cockpit runs weekly as the `ansible` user:
+`git pull --ff-only`, then `update-openclaw.yml`, then `validate-openclaw.yml`, and
+records `/var/lib/openclaw-fleet-update/last-success` only if all of them exit 0. It
+reads the version pin and never writes it — see
+[`docs/execution-model.md`](docs/execution-model.md) for why that ordering is the whole
+point of the rewrite.
+
+```bash
+systemctl list-timers openclaw-fleet-update.timer
+systemctl start openclaw-fleet-update.service     # run it now, out of schedule
+journalctl -u openclaw-fleet-update.service -n 200
+cat /var/lib/openclaw-fleet-update/last-success
+```
 
 ## Bumping the OpenClaw version
 
@@ -71,8 +93,9 @@ The version is pinned by a human commit, not derived at runtime:
 1. Edit `openclaw_version` in `group_vars/openclaw.yml` (npm version string — note the
    GitHub release tag is `v`-prefixed, e.g. package `2026.7.1-2` ↔ tag `v2026.7.1`).
 2. Commit and push.
-3. Run `playbooks/deploy-openclaw.yml` (or the fleet-update automation on cockpit, once
-   wired up) — `common`'s install task no-ops on any host already at that version.
+3. Run `playbooks/update-openclaw.yml`, or just wait for the weekly
+   `openclaw-fleet-update` timer to pick the commit up — `common`'s install task no-ops
+   on any host already at that version.
 
 ## Rebuilding a host
 

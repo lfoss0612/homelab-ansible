@@ -1,0 +1,37 @@
+# Managed by Ansible — openclaw.node.control role
+[Unit]
+Description=OpenClaw fleet convergence (Ansible)
+Documentation=file://{{ openclaw_control_dir }}/docs/execution-model.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# Runs as the ansible user, not root, and that is load-bearing rather than
+# tidiness: ansible.cfg points local_tmp and remote_tmp at
+# /home/{{ openclaw_control_user }}/.ansible/tmp, so a root-run playbook leaves
+# root-owned files there that break every subsequent run as this user. The vault
+# password file is root:{{ openclaw_control_group }} 0640 and ansible.cfg's
+# vault_password_file picks it up, so no secret has to be passed on the command
+# line.
+User={{ openclaw_control_user }}
+Group={{ openclaw_control_group }}
+WorkingDirectory={{ openclaw_control_dir }}
+
+Environment=ANSIBLE_CONFIG={{ openclaw_control_dir }}/ansible.cfg
+Environment=ANSIBLE_FORCE_COLOR=0
+
+ExecStart={{ openclaw_control_script }}
+
+# A health gate that can hang forever is not a health gate.
+TimeoutStartSec={{ openclaw_control_timeout_sec }}
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ openclaw_control_unit }}
+
+NoNewPrivileges=true
+PrivateTmp=true
+LockPersonality=true
+RestrictSUIDSGID=true

@@ -1,0 +1,17 @@
+# Managed by Ansible — openclaw.node.control role
+[Unit]
+Description=Weekly OpenClaw fleet convergence
+Documentation=file://{{ openclaw_control_dir }}/docs/execution-model.md
+
+[Timer]
+# Weekly, because the version pin lives in a human commit — this timer corrects
+# drift (a rebuilt host, a rolled-back package), it does not chase releases.
+# The predecessor polled every 5 minutes and that frequency is what made a
+# self-masking failure invisible for two months.
+OnCalendar={{ openclaw_control_on_calendar }}
+RandomizedDelaySec={{ openclaw_control_randomized_delay }}
+Persistent=true
+Unit={{ openclaw_control_unit }}.service
+
+[Install]
+WantedBy=timers.target

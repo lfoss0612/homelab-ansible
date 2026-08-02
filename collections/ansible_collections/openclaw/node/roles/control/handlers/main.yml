@@ -1,0 +1,9 @@
+---
+- name: daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart openclaw-fleet-update timer
+  ansible.builtin.systemd:
+    name: "{{ openclaw_control_unit }}.timer"
+    state: restarted

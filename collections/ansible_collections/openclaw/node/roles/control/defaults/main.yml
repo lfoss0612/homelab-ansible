@@ -1,0 +1,39 @@
+---
+# Control-node automation: the unattended half of the write plane.
+# See docs/execution-model.md — this is the only thing in the homelab that
+# changes hosts without a human at the keyboard, so everything it runs is a
+# playbook from git and nothing it does writes a tracked file.
+
+openclaw_control_dir: /opt/ansible
+openclaw_control_user: ansible
+openclaw_control_group: ansible
+
+openclaw_control_unit: openclaw-fleet-update
+openclaw_control_script: /usr/local/sbin/openclaw-fleet-update
+openclaw_control_state_dir: /var/lib/openclaw-fleet-update
+
+# Weekly, not near-daily. The pin lives in a human commit, so the timer's job
+# is drift correction — a host rebuilt from an old image, a package that got
+# rolled back — not chasing upstream releases. Sunday 03:00 plus a randomized
+# hour so a fleet-wide serialized rollout does not start at the same instant
+# as every other timer on the box.
+openclaw_control_on_calendar: "Sun *-*-* 03:00:00"
+openclaw_control_randomized_delay: 1h
+
+# update-openclaw.yml is serialized across 12 hosts with per-host health gates,
+# and validate-openclaw.yml adds the gateway checks. An hour is generous; the
+# point is that the unit can never hang forever.
+openclaw_control_timeout_sec: 3600
+
+# Run in order, each gating the next. Convergence alone is not success — a
+# fleet that installed the pin but fails its health checks must leave the unit
+# failed, not record a green run.
+openclaw_control_playbooks:
+  - playbooks/update-openclaw.yml
+  - playbooks/validate-openclaw.yml
+
+# Replaced by this role. openclaw-sync.timer polled the gateway every 5 minutes
+# and rewrote group_vars before verifying the rollout; see the script header.
+openclaw_control_legacy_units:
+  - openclaw-sync.timer
+  - openclaw-sync.service
