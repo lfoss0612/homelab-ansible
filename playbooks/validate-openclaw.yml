@@ -152,22 +152,29 @@
           — run approve-openclaw-nodes.yml -e openclaw_approve_confirm=true
       when: openclaw_nodes_unapproved | length > 0
 
+    # `openclaw doctor` renders an interactive TUI: it prints every section and
+    # then blocks on a prompt. It was never slow — it was waiting for input that
+    # Ansible does not supply. Closing stdin immediately (empty, no trailing
+    # newline) lets it finish. The timeout stays as the backstop.
     - name: Run openclaw doctor
       ansible.builtin.command: timeout -s KILL {{ openclaw_validate_timeout }} openclaw doctor
       become_user: "{{ openclaw_user }}"
       register: openclaw_doctor
       changed_when: false
       failed_when: false
+      stdin: ""
+      stdin_add_newline: false
 
     - name: Assert doctor reports clean
       ansible.builtin.assert:
         that:
           - openclaw_doctor.rc == 0
         fail_msg: >-
-          {% if openclaw_doctor.rc == 137 %}openclaw doctor did not finish within
-          {{ openclaw_validate_timeout }}s and was killed — this is the post-2026.7.1-2
-          hang, not a doctor finding.{% else %}openclaw doctor exited
-          {{ openclaw_doctor.rc }}: {{ openclaw_doctor.stdout }}{% endif %}
+          {% if openclaw_doctor.rc in [137, -9] %}openclaw doctor did not finish within
+          {{ openclaw_validate_timeout }}s and was killed (rc {{ openclaw_doctor.rc }}) —
+          it blocks on an interactive prompt, so this is a stdin problem, not a doctor
+          finding.{% else %}openclaw doctor exited {{ openclaw_doctor.rc }}:
+          {{ openclaw_doctor.stdout }}{% endif %}
         success_msg: "openclaw doctor is clean."
 
 - name: Report pve-router state (report-only — deliberately unmanaged, never asserted, never targeted for change)
