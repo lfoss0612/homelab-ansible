@@ -10,12 +10,22 @@
 # it or targets it for change — the last play below only reads and prints
 # its state, for visibility that it hasn't silently dropped off.
 #
-# NOTE: `nodes status --json`'s exact field names (status/paired/displayName)
-# are inferred from the fleet migration plan's prose ("all 13 fleet nodes
-# remain connected and paired"), not from a captured sample of real output.
-# If the connected+paired assertion below errors out on first run, read the
-# actual JSON shape (openclaw_nodes_status_raw.stdout is printed on failure)
-# and adjust the selectattr filters accordingly.
+# `nodes status --json` schema, captured from a real 2026.7.1-2 gateway on
+# 2026-08-01 (it was previously inferred from prose, which is what made the
+# connected+paired check fail with "object of type 'str' has no attribute
+# 'status'"):
+#
+#   {"ts": <epoch_ms>, "nodes": [ {...}, ... ]}
+#
+# The top level is an OBJECT, not a list — iterating it yields key strings.
+# Each node has "displayName", "version", "connected" (bool), "paired" (bool)
+# and "approvalState" (e.g. "approved", "pending-reapproval", "unapproved").
+# There is no "status" field.
+#
+# The gateway reports every node it knows about, not just inventory hosts —
+# pve-router and personal devices show up here too. So the assertion below
+# checks that each *inventory* host is present and connected+paired, rather
+# than comparing raw counts, which would never match.
 
 - name: Validate OpenClaw version pin fleet-wide
   hosts: openclaw
@@ -85,18 +95,51 @@
       ansible.builtin.set_fact:
         openclaw_nodes_status: "{{ openclaw_nodes_status_raw.stdout | from_json }}"
 
-    - name: Count connected and paired nodes
+    - name: Identify connected+paired nodes and any managed host missing from them
       ansible.builtin.set_fact:
-        openclaw_nodes_connected_paired: "{{ openclaw_nodes_status | selectattr('status', 'equalto', 'connected') | selectattr('paired', 'equalto', true) | list }}"
+        openclaw_nodes_connected_paired: >-
+          {{ openclaw_nodes_status.nodes
+             | selectattr('connected', 'equalto', true)
+             | selectattr('paired', 'equalto', true)
+             | map(attribute='displayName') | list }}
+        openclaw_nodes_missing: >-
+          {{ groups['openclaw_nodes'] | difference(
+               openclaw_nodes_status.nodes
+               | selectattr('connected', 'equalto', true)
+               | selectattr('paired', 'equalto', true)
+               | map(attribute='displayName') | list) }}
 
-    - name: Assert all managed nodes are connected and paired
+    - name: Assert every managed node is connected and paired
       ansible.builtin.assert:
         that:
-          - openclaw_nodes_connected_paired | length == groups['openclaw_nodes'] | length
+          - openclaw_nodes_missing | length == 0
         fail_msg: >-
-          Expected {{ groups['openclaw_nodes'] | length }} connected+paired nodes,
-          got {{ openclaw_nodes_connected_paired | length }}; raw status was: {{ openclaw_nodes_status_raw.stdout }}
-        success_msg: "All {{ groups['openclaw_nodes'] | length }} managed nodes are connected and paired."
+          Not connected+paired: {{ openclaw_nodes_missing | join(', ') }}.
+          Gateway reported {{ openclaw_nodes_status.nodes | length }} nodes total
+          ({{ openclaw_nodes_connected_paired | length }} connected+paired, including
+          any non-inventory device).
+        success_msg: >-
+          All {{ groups['openclaw_nodes'] | length }} managed nodes are connected and paired.
+
+    # Reported, not asserted: re-approval is a human decision (it grants newly
+    # declared capabilities), so a node awaiting it is not a failure this play
+    # should gate on. Clear it with approve-openclaw-nodes.yml. Promote to an
+    # assert if you would rather the fleet never sit in this state unnoticed.
+    - name: Identify managed nodes not in the approved state
+      ansible.builtin.set_fact:
+        openclaw_nodes_unapproved: >-
+          {{ openclaw_nodes_status.nodes
+             | selectattr('displayName', 'in', groups['openclaw_nodes'])
+             | rejectattr('approvalState', 'equalto', 'approved')
+             | map(attribute='displayName') | list }}
+
+    - name: Report managed nodes awaiting approval
+      ansible.builtin.debug:
+        msg: >-
+          Awaiting approval ({{ openclaw_nodes_unapproved | length }}):
+          {{ openclaw_nodes_unapproved | join(', ') }}
+          — run approve-openclaw-nodes.yml -e openclaw_approve_confirm=true
+      when: openclaw_nodes_unapproved | length > 0
 
     - name: Run openclaw doctor
       ansible.builtin.command: openclaw doctor
