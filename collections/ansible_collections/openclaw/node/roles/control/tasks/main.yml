@@ -56,11 +56,15 @@
 # core.sharedRepository=group makes git itself create future objects and
 # fanout dirs group-writable, so this cannot silently re-accumulate.
 
+# check_mode: false on the three probes below. They only read, and without it
+# a --check run skips them, leaves .stdout undefined, and the tasks they gate
+# fail on an undefined attribute rather than reporting what would change.
 - name: Read git's core.sharedRepository setting
   ansible.builtin.command: git -C {{ openclaw_control_dir }} config --get core.sharedRepository
   register: openclaw_control_shared
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: Configure the checkout as a group-shared repository
   ansible.builtin.command: git -C {{ openclaw_control_dir }} config core.sharedRepository group
@@ -70,6 +74,7 @@
   ansible.builtin.command: find {{ openclaw_control_dir }} ! -group {{ openclaw_control_group }}
   register: openclaw_control_wrong_group
   changed_when: false
+  check_mode: false
 
 - name: Give the whole checkout to the ansible group
   ansible.builtin.command: chgrp -R {{ openclaw_control_group }} {{ openclaw_control_dir }}
@@ -79,6 +84,7 @@
   ansible.builtin.command: find {{ openclaw_control_dir }} ! -perm -g+w
   register: openclaw_control_not_writable
   changed_when: false
+  check_mode: false
 
 - name: Make the checkout group-writable
   ansible.builtin.command: chmod -R g+w {{ openclaw_control_dir }}
