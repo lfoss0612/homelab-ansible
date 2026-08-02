@@ -29,9 +29,20 @@ ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook 
 - **Always `cd /opt/ansible` first.** Without it `ansible.cfg` is never discovered and
   Ansible silently uses the wrong inventory and collections path. It does not error.
 - **Dry-run first.** `--check --diff` before any real apply.
-- cockpit has no push credentials. To sync its checkout:
-  `sudo -u ansible ansible localhost -m git -a 'repo=... dest=/opt/ansible version=main'`
-  (a bare `git pull` as `claude` fails on `.git/FETCH_HEAD`).
+- cockpit has no push credentials. To sync its checkout (a bare `git pull` as `claude`
+  fails on `.git/FETCH_HEAD`):
+
+  ```bash
+  sudo -n -H -u ansible ansible localhost -e ansible_become=false \
+    -m git -a 'repo=https://github.com/lfoss0612/homelab-ansible.git dest=/opt/ansible version=main'
+  ```
+
+  **`-e ansible_become=false` is not optional.** `ansible.cfg` sets
+  `[privilege_escalation] become = True`, so without it the git module runs as *root*
+  and every object it writes is root-owned — which is exactly what breaks the next
+  unattended `git pull` as the `ansible` user. Verified 2026-08-02: the plain command
+  left 335 root-owned paths and 52 non-group-writable ones in one run. If you hit it,
+  `playbooks/openclaw-automation.yml` repairs it.
 
 ## Gotchas that have already cost time
 
