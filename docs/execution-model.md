@@ -143,9 +143,11 @@ has. That host is independently managed and deliberately out of scope.
 
 ## The unattended arm of the write plane
 
-Since 2026-08-01 the write plane has an automated arm: `openclaw-fleet-update.timer`
-on cockpit, installed by `playbooks/openclaw-automation.yml` (role
-`openclaw.node.control`). Weekly, as the `ansible` user, it runs
+Since 2026-08-01 the write plane has an automated arm: `openclaw-fleet-update.timer` on
+cockpit, installed by `playbooks/openclaw-automation.yml` (role
+`openclaw.node.control`). First end-to-end run 2026-08-02 01:29 UTC — 13 hosts,
+`failed=0`, `last-success` recorded at commit `486afcf`. Weekly, as the `ansible` user,
+it runs
 
 ```
 git -C /opt/ansible pull --ff-only
@@ -197,11 +199,17 @@ Related, from `openclaw doctor --lint`: `gateway.auth.token` is stored **in plai
 that can read config files may see these API keys/tokens". The `openclaw` identity is
 exactly such a reader, and that token is the fleet-wide node credential.
 
-## TODO — gateway security, scheduled after Phase 8
+## TODO — gateway security, next up
 
-Deferred by decision on 2026-08-01: Phase 8 (the cockpit convergence timer) goes first,
-these follow. All three surfaced from `openclaw doctor --lint` on the gateway, which only
-started running once `validate-openclaw.yml` was fixed — nothing had been checking.
+Deferred by decision on 2026-08-01 behind the cockpit convergence timer, which is now
+installed and verified end to end — so these are next. All three surfaced from
+`openclaw doctor --lint` on the gateway, which only started running once
+`validate-openclaw.yml` was fixed — nothing had been checking.
+
+They now also fail *weekly and unattended*: `validate-openclaw.yml` runs from the timer
+and reports these as warnings on every pass. They do not fail the run (warnings are
+reported, only errors gate) but they are no longer findable solely by someone
+remembering to look.
 
 **None of them are Ansible fixes.** They are `openclaw config` / `openclaw secrets`
 changes on the gateway, so keeping them in git means either a new role that templates
