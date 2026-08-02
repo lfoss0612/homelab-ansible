@@ -26,11 +26,21 @@ When something is found via an OpenClaw node, **do not fix it on the host.** Wri
 extend the playbook here and run it. If the fix feels too small to justify a playbook,
 that is exactly the change that will be invisible at rebuild time.
 
-## Current state — the split is NOT yet enforced
+## Current state — enforced and verified
+
+**Applied fleet-wide on 2026-08-01.** All 12 hosts now report `openclaw adm
+systemd-journal`, `User openclaw is not allowed to run sudo`, and a readable journal line
+from a unit the agent does not own. Verified by direct observation on every host, not by a
+playbook recap — see [Verifying](#verifying) below.
+
+The history of what was found and removed is kept below, because it explains why the role
+manages sudoers at all and what will silently come back if that is ever dropped.
+
+### What the audit found
 
 An audit on 2026-08-01 (`ansible openclaw -m shell -a 'id openclaw; sudo -l -U openclaw'`)
-found that **every node grants the `openclaw` user passwordless sudo, and none of it is
-managed by this repo.** These sudoers files predate the npm rewrite and are not in git.
+found that **every node granted the `openclaw` user passwordless sudo, and none of it was
+managed by this repo.** Those sudoers files predated the npm rewrite and were not in git.
 
 | Hosts | Grant |
 |---|---|
@@ -39,13 +49,13 @@ managed by this repo.** These sudoers files predate the npm rewrite and are not 
 
 Unrestricted `systemctl` as root is **a full root escalation**, not a service-restart
 grant: `openclaw` owns its home directory, so `systemctl link ~/unit.service && systemctl
-start unit` runs arbitrary code as root. Eleven of twelve nodes are therefore root-capable
-today. Only the gateway's grant is correctly scoped.
+start unit` runs arbitrary code as root. Eleven of twelve nodes were therefore
+root-capable. Only the gateway's grant was correctly scoped.
 
-The `openclaw` user is otherwise clean — a system account, no supplementary groups
-(except `_ssh` on `omv`), and `openclaw-node.service` already sets `NoNewPrivileges=true`.
+The `openclaw` user was otherwise clean — a system account, no supplementary groups
+(except `_ssh` on `omv`), and `openclaw-node.service` already set `NoNewPrivileges=true`.
 
-## Revoking the grant — implemented, not yet applied
+## How the grant is revoked
 
 The `common` role now owns the `openclaw` user's sudo posture, driven by
 `openclaw_sudo_commands` (default `[]` — no root capability at all):
@@ -89,20 +99,33 @@ until the next unrelated restart.
 
 Every `systemctl` call in `update-openclaw.yml`
 and `validate-openclaw.yml` runs under Ansible's own `become: true` as the `ansible`
-identity, not as `openclaw`. What may depend on it is the **agent's own runtime ability to
-restart its service** — that is precisely the write-plane capability being withdrawn, but
-it means any existing OpenClaw workflow that restarts a unit will begin to fail, by design.
+identity, not as `openclaw`. What did depend on it is the **agent's own runtime ability to
+restart its service** — precisely the write-plane capability being withdrawn. Any OpenClaw
+workflow that restarts a unit now fails, by design.
 
-Apply with a dry run first, gateway included. **Use `--tags privileges`** — an untagged
-run would also fire `common`'s npm install task, dragging all 11 nodes from `2026.5.26` to
-the pinned `openclaw_version` as a side effect of a security fix, with none of
-`update-openclaw.yml`'s health gates:
+## Applying it
+
+Use `--tags privileges`, and dry-run first. The tag matters twice over:
+
+- An **untagged** run also fires `common`'s npm install task. When this was written the
+  fleet was on `2026.5.26` against a pin of `2026.7.1-2`, so an untagged run would have
+  upgraded every node as a side effect of a security fix.
+- The tag is on the `include_role` in both the `node` and `gateway` roles as well as on
+  `common`'s own tasks. With a dynamic include, `--tags` is matched against the include
+  first, so an untagged include is filtered out and the inner tags never get a chance —
+  which shows up as `ok=1, changed=0` per host and reads exactly like a clean pass.
 
 ```bash
 ansible-playbook playbooks/deploy-openclaw.yml --tags privileges --check --diff
 ```
 
-Then re-audit to confirm both halves — no root, but logs readable:
+Expect `changed=3` per node (group grant, `sudoers.d` removal, handler restart) and
+`skipped=1`. `changed=0` means the tag filter selected nothing — do not read it as
+idempotence.
+
+## Verifying
+
+Recaps are not evidence. Confirm both halves directly — no root, but logs readable:
 
 ```bash
 ansible openclaw -m shell -a '
@@ -111,11 +134,25 @@ ansible openclaw -m shell -a '
   runuser -u openclaw -- journalctl -u ssh -n 1 --no-pager 2>&1 | tail -1'
 ```
 
-Expect `openclaw systemd-journal adm`, a "may run" list that is empty or absent, and a
-real log line from a unit the agent does **not** own.
+Expect `openclaw adm systemd-journal`, `User openclaw is not allowed to run sudo`, and a
+real log line from a unit the agent does **not** own. All 12 hosts satisfied this on
+2026-08-01.
 
 `pve-router` is not in `openclaw_nodes`, so its own `openclaw` user keeps whatever grant it
 has. That host is independently managed and deliberately out of scope.
+
+## What this does not cover
+
+The OS boundary is enforced here; the **capability** boundary is not, and Ansible does not
+manage it. Every node has `system.run` approved at the gateway, so the gateway can execute
+arbitrary commands on all 12 — now as the unprivileged `openclaw` user rather than root,
+which is the substance of what this change bought, but not literally read-only. Tightening
+that means changing what the gateway approves, a separate mechanism from this repo.
+
+Related, from `openclaw doctor --lint`: `gateway.auth.token` is stored **in plaintext** in
+`openclaw.json` on the gateway, and doctor's own warning is that "agents or workspace tools
+that can read config files may see these API keys/tokens". The `openclaw` identity is
+exactly such a reader, and that token is the fleet-wide node credential.
 
 ## TODO — remaining
 
@@ -126,6 +163,11 @@ has. That host is independently managed and deliberately out of scope.
    it before going fleet-wide; the paths the node actually writes are not fully enumerated.
 2. **Audit the other identities** the same way. `lfoss` and `ansible` hold
    `(ALL) NOPASSWD: ALL` by design, but the sweep above only asked about `openclaw`.
+3. **Decide whether the read plane extends to the capability layer** — see "What this does
+   not cover" above.
+4. **Move `gateway.auth.token` out of plaintext** on the gateway (`openclaw secrets
+   configure`). It is Ansible-Vault-encrypted in `group_vars/openclaw.yml`, so this is
+   about at-rest exposure on the host, not in git.
 
 These are themselves write-plane changes: they belong in the roles, applied by playbook,
 never hand-edited on the hosts.
