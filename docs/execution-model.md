@@ -183,8 +183,11 @@ Four properties are deliberate:
   firing can never interleave two serialized rollouts.
 
 Failure surfaces as a failed unit — `systemctl status openclaw-fleet-update.service`,
-`journalctl -u openclaw-fleet-update.service`. There is no notification path beyond
-that yet; see the TODO below.
+`journalctl -u openclaw-fleet-update.service` — and, since 2026-08-02, as an active
+notification: the unit carries `OnFailure=`/`OnSuccess=` into
+`openclaw-fleet-update-notify@.service`, which records a `last-failure` file, pushes
+1/0 to a Zabbix trapper and optionally POSTs to a webhook. See the README for the
+mechanism and the one-time Zabbix item that still has to be created server-side.
 
 ## What this does not cover
 
@@ -233,11 +236,19 @@ the exact failure this whole document exists to prevent.
 
 ## TODO — read plane, unscheduled
 
-1. **Give `openclaw-fleet-update` a failure notification path.** First of these four,
-   because the timer is live: a failed weekly run is visible only in the unit state and
-   the journal, so a fleet that quietly stops converging stays quiet. That is the same
-   shape as the self-masking failure Phase 8 was built to kill — just moved one level up.
-   An `OnFailure=` unit pointing at Zabbix or any existing alert path closes it.
+1. ~~**Give `openclaw-fleet-update` a failure notification path.**~~ **Done 2026-08-02**,
+   and not a moment early: the concern was hypothetical when it was written, and the very
+   first scheduled run (2026-08-02 03:46) then died in `git pull` and told nobody. It was
+   found only by reading the journal by hand, days later, by which point systemd had
+   dropped even the failed state. Cause: the sync command documented in `CLAUDE.md` ran
+   the git module as root — `ansible.cfg` sets `become = True` — leaving root-owned
+   objects the `ansible` user could not write. Both are fixed; see the convergence
+   section above and `CLAUDE.md`.
+
+   **One piece remains outstanding**: the Zabbix trapper item `openclaw.fleet.update` and
+   its two triggers must be created on host `cockpit.home.lan` (spec in the README). Until
+   then the server accepts each value and discards it, and only the `last-failure` file
+   and the optional webhook do anything.
 2. **Harden `openclaw-node.service`** so read-only is kernel-enforced rather than a
    side effect of lacking sudo — `ProtectSystem=strict`, `ProtectHome=read-only`,
    `ProtectKernelTunables=true`, `PrivateDevices=true`, with `ReadWritePaths` for
