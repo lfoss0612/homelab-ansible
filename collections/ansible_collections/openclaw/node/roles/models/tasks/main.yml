@@ -33,10 +33,9 @@
                                | default(openclaw_models_default_context_window),
               'maxTokens': m.max_tokens
                            | default(openclaw_models_default_max_tokens),
+              'reasoning': m.reasoning | default(false),
             } -%}
-        {%- set _ = out.append(
-              entry | combine({'reasoning': true}) if m.reasoning | default(false)
-              else entry) -%}
+        {%- set _ = out.append(entry) -%}
       {%- endfor -%}
       {{ out }}
     openclaw_models_alias_map: >-
@@ -120,6 +119,36 @@
     - agents.defaults.models
     - agents.defaults.model.primary
 
+# OpenClaw normalises the provider array as it writes it: every entry comes back
+# with `reasoning` present even when false, and with an `api` field inherited
+# from the provider overlay. A naive comparison against what was sent therefore
+# never matches, and the role rewrites and restarts the gateway on every run.
+#
+# So compare on the keys this role actually manages. `reasoning` is emitted
+# unconditionally above to line up with the normalised form; `api` is dropped
+# here because it is derived from the provider, not per-model state.
+#
+# Only the provider array needs this — agents.defaults.models and the primary
+# are stored back exactly as sent.
+- name: Normalise the stored catalogue for comparison
+  ansible.builtin.set_fact:
+    openclaw_models_current_entries: >-
+      {%- set out = [] -%}
+      {%- for m in (openclaw_models_current_provider.stdout | from_json) -%}
+        {%- set _ = out.append({
+              'id': m.id,
+              'name': m.name,
+              'input': m.input,
+              'cost': m.cost,
+              'contextWindow': m.contextWindow,
+              'maxTokens': m.maxTokens,
+              'reasoning': m.reasoning | default(false),
+            }) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  when: openclaw_models_current_provider.rc == 0
+
 # A missing path exits non-zero — that is a first run, not an error, so it is
 # treated as "no current value" and forces the patch.
 - name: Determine whether the catalogue is already converged
@@ -128,7 +157,7 @@
       {{ openclaw_models_current_provider.rc == 0
          and openclaw_models_current_agents.results[0].rc == 0
          and openclaw_models_current_agents.results[1].rc == 0
-         and (openclaw_models_current_provider.stdout | from_json)
+         and (openclaw_models_current_entries | default([]))
              == openclaw_models_provider_entries
          and (openclaw_models_current_agents.results[0].stdout | from_json)
              == openclaw_models_alias_map
