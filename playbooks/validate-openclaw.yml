@@ -157,13 +157,14 @@
     # Ansible does not supply. Closing stdin immediately (empty, no trailing
     # newline) lets it finish. The timeout stays as the backstop.
     - name: Run openclaw doctor
-      ansible.builtin.command: timeout -s KILL {{ openclaw_validate_timeout }} openclaw doctor
+      ansible.builtin.command:
+        cmd: timeout -s KILL {{ openclaw_validate_timeout }} openclaw doctor
+        stdin: ""
+        stdin_add_newline: false
       become_user: "{{ openclaw_user }}"
       register: openclaw_doctor
       changed_when: false
       failed_when: false
-      stdin: ""
-      stdin_add_newline: false
 
     - name: Assert doctor reports clean
       ansible.builtin.assert:
