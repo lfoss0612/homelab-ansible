@@ -154,7 +154,33 @@ Related, from `openclaw doctor --lint`: `gateway.auth.token` is stored **in plai
 that can read config files may see these API keys/tokens". The `openclaw` identity is
 exactly such a reader, and that token is the fleet-wide node credential.
 
-## TODO — remaining
+## TODO — gateway security, scheduled after Phase 8
+
+Deferred by decision on 2026-08-01: Phase 8 (the cockpit convergence timer) goes first,
+these follow. All three surfaced from `openclaw doctor --lint` on the gateway, which only
+started running once `validate-openclaw.yml` was fixed — nothing had been checking.
+
+**None of them are Ansible fixes.** They are `openclaw config` / `openclaw secrets`
+changes on the gateway, so keeping them in git means either a new role that templates
+gateway config or a documented runbook. Applying them by hand leaves no record, which is
+the exact failure this whole document exists to prevent.
+
+1. **`gateway.auth.token` is stored in plaintext** in `openclaw.json` on the gateway.
+   Doctor's warning: "agents or workspace tools that can read config files may see these
+   API keys/tokens" — the `openclaw` identity is exactly such a reader, and this is the
+   fleet-wide node credential. Fix with `openclaw secrets configure` / `secrets apply`,
+   verify with `openclaw secrets audit --check`. Note it is already Ansible-Vault-encrypted
+   in `group_vars/openclaw.yml`, so this is at-rest exposure on the host, not in git.
+2. **Gateway is bound to `0.0.0.0`** ("lan", network-accessible). Combined with
+   `openclaw_allow_insecure_ws: true` in the node role defaults, node traffic carries that
+   token over the LAN unencrypted. Doctor suggests keeping the bind on loopback and
+   fronting it with an SSH tunnel or Tailscale Serve.
+3. **No command owner is configured.** Without `commands.ownerAllowFrom`, no account is
+   authorized to approve exec approvals or run owner-only commands. This connects to the
+   capability question below: nodes hold `system.run`, and re-approvals want
+   `system.execApprovals.set`, with no designated human gating any of it.
+
+## TODO — read plane, unscheduled
 
 1. **Harden `openclaw-node.service`** so read-only is kernel-enforced rather than a
    side effect of lacking sudo — `ProtectSystem=strict`, `ProtectHome=read-only`,
@@ -165,12 +191,9 @@ exactly such a reader, and that token is the fleet-wide node credential.
    `(ALL) NOPASSWD: ALL` by design, but the sweep above only asked about `openclaw`.
 3. **Decide whether the read plane extends to the capability layer** — see "What this does
    not cover" above.
-4. **Move `gateway.auth.token` out of plaintext** on the gateway (`openclaw secrets
-   configure`). It is Ansible-Vault-encrypted in `group_vars/openclaw.yml`, so this is
-   about at-rest exposure on the host, not in git.
 
-These are themselves write-plane changes: they belong in the roles, applied by playbook,
-never hand-edited on the hosts.
+These are write-plane changes: they belong in the roles, applied by playbook, never
+hand-edited on the hosts.
 
 ## Related
 
