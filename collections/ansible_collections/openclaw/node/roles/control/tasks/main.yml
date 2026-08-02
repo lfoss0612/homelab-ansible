@@ -131,8 +131,14 @@
 - name: Apply pending unit changes before arming the timer
   ansible.builtin.meta: flush_handlers
 
+# Skipped under --check for the same reason as the restart handler: on a first
+# dry run the unit file was never written, so systemd cannot find it. Note that
+# the three permission tasks above also report "skipping" under --check —
+# `command` does not support check mode, so Ansible skips it whatever the
+# `when` says. That is not the condition evaluating false.
 - name: Enable and start the fleet-update timer
   ansible.builtin.systemd:
     name: "{{ openclaw_control_unit }}.timer"
     enabled: true
     state: started
+  when: not ansible_check_mode
