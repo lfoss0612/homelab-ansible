@@ -52,6 +52,17 @@
   gather_facts: false
   become: true
 
+  vars:
+    # Every openclaw CLI call below is wrapped in this. `openclaw doctor` was
+    # observed hanging indefinitely on the gateway after the 2026.7.1-2 upgrade
+    # (>22 min, no output, unaffected by a plain SIGTERM), which stalls the whole
+    # play. A validation play must always terminate — it is a health gate, and
+    # Phase 8 intends to run it unattended on a timer.
+    #
+    # -s KILL because SIGTERM did not stop it. A killed command surfaces as
+    # rc 137 and fails the assertion loudly, which is the correct outcome.
+    openclaw_validate_timeout: 60
+
   tasks:
     - name: Check gateway health endpoint
       ansible.builtin.uri:
@@ -86,7 +97,7 @@
         label: "{{ item.item }}"
 
     - name: Query node status from the gateway
-      ansible.builtin.command: openclaw nodes status --json
+      ansible.builtin.command: timeout -s KILL {{ openclaw_validate_timeout }} openclaw nodes status --json
       become_user: "{{ openclaw_user }}"
       register: openclaw_nodes_status_raw
       changed_when: false
@@ -142,7 +153,7 @@
       when: openclaw_nodes_unapproved | length > 0
 
     - name: Run openclaw doctor
-      ansible.builtin.command: openclaw doctor
+      ansible.builtin.command: timeout -s KILL {{ openclaw_validate_timeout }} openclaw doctor
       become_user: "{{ openclaw_user }}"
       register: openclaw_doctor
       changed_when: false
@@ -152,7 +163,11 @@
       ansible.builtin.assert:
         that:
           - openclaw_doctor.rc == 0
-        fail_msg: "openclaw doctor exited {{ openclaw_doctor.rc }}: {{ openclaw_doctor.stdout }}"
+        fail_msg: >-
+          {% if openclaw_doctor.rc == 137 %}openclaw doctor did not finish within
+          {{ openclaw_validate_timeout }}s and was killed — this is the post-2026.7.1-2
+          hang, not a doctor finding.{% else %}openclaw doctor exited
+          {{ openclaw_doctor.rc }}: {{ openclaw_doctor.stdout }}{% endif %}
         success_msg: "openclaw doctor is clean."
 
 - name: Report pve-router state (report-only — deliberately unmanaged, never asserted, never targeted for change)
