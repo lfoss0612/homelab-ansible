@@ -152,31 +152,71 @@
           — run approve-openclaw-nodes.yml -e openclaw_approve_confirm=true
       when: openclaw_nodes_unapproved | length > 0
 
-    # `openclaw doctor` renders an interactive TUI: it prints every section and
-    # then blocks on a prompt. It was never slow — it was waiting for input that
-    # Ansible does not supply. Closing stdin immediately (empty, no trailing
-    # newline) lets it finish. The timeout stays as the backstop.
-    - name: Run openclaw doctor
+    # Bare `openclaw doctor` renders an interactive TUI and blocks on a prompt
+    # it opens directly rather than reading stdin, so closing stdin does not
+    # help — it hangs until killed. `--lint --json --non-interactive` is the
+    # scriptable form: read-only checks, machine-readable, no prompts.
+    #
+    # Output schema, captured live from 2026.7.1-2 on 2026-08-01:
+    #
+    #   {"ok": <bool>, "checksRun": <int>, "checksSkipped": <int>,
+    #    "findings": [{"checkId": "...", "severity": "info|warning|error",
+    #                  "message": "..."}]}
+    #
+    # Exit is 1 whenever findings exist, so rc is not a useful assertion.
+    - name: Run openclaw doctor (read-only lint)
       ansible.builtin.command:
-        cmd: timeout -s KILL {{ openclaw_validate_timeout }} openclaw doctor
-        stdin: ""
-        stdin_add_newline: false
+        cmd: >-
+          timeout -s KILL {{ openclaw_validate_timeout }}
+          openclaw doctor --lint --json --non-interactive
       become_user: "{{ openclaw_user }}"
       register: openclaw_doctor
       changed_when: false
       failed_when: false
 
-    - name: Assert doctor reports clean
+    - name: Assert doctor completed rather than being killed
       ansible.builtin.assert:
         that:
-          - openclaw_doctor.rc == 0
+          - openclaw_doctor.rc not in [137, -9]
         fail_msg: >-
-          {% if openclaw_doctor.rc in [137, -9] %}openclaw doctor did not finish within
-          {{ openclaw_validate_timeout }}s and was killed (rc {{ openclaw_doctor.rc }}) —
-          it blocks on an interactive prompt, so this is a stdin problem, not a doctor
-          finding.{% else %}openclaw doctor exited {{ openclaw_doctor.rc }}:
-          {{ openclaw_doctor.stdout }}{% endif %}
-        success_msg: "openclaw doctor is clean."
+          openclaw doctor did not finish within {{ openclaw_validate_timeout }}s
+          and was killed (rc {{ openclaw_doctor.rc }}).
+
+    - name: Parse doctor findings
+      ansible.builtin.set_fact:
+        openclaw_doctor_report: "{{ openclaw_doctor.stdout | from_json }}"
+
+    - name: Split doctor findings by severity
+      ansible.builtin.set_fact:
+        openclaw_doctor_errors: >-
+          {{ openclaw_doctor_report.findings
+             | selectattr('severity', 'equalto', 'error') | list }}
+        openclaw_doctor_warnings: >-
+          {{ openclaw_doctor_report.findings
+             | selectattr('severity', 'equalto', 'warning') | list }}
+
+    # Reported, not asserted. `ok` is false whenever any finding exists, and the
+    # current warnings are accepted configuration (plaintext gateway.auth.token,
+    # gateway bound to 0.0.0.0). Gating on `ok` would leave this play permanently
+    # red and therefore useless. Errors do gate.
+    - name: Report doctor warnings
+      ansible.builtin.debug:
+        msg: >-
+          doctor warnings ({{ openclaw_doctor_warnings | length }} of
+          {{ openclaw_doctor_report.checksRun }} checks):
+          {{ openclaw_doctor_warnings | map(attribute='message') | join(' | ') }}
+      when: openclaw_doctor_warnings | length > 0
+
+    - name: Assert doctor reports no errors
+      ansible.builtin.assert:
+        that:
+          - openclaw_doctor_errors | length == 0
+        fail_msg: >-
+          doctor reported {{ openclaw_doctor_errors | length }} error-severity
+          finding(s): {{ openclaw_doctor_errors | map(attribute='message') | join(' | ') }}
+        success_msg: >-
+          openclaw doctor: no errors across {{ openclaw_doctor_report.checksRun }} checks
+          ({{ openclaw_doctor_warnings | length }} warning(s) reported above).
 
 - name: Report pve-router state (report-only — deliberately unmanaged, never asserted, never targeted for change)
   hosts: pve-router.home.lan
