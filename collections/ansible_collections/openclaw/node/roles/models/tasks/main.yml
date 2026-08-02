@@ -1,0 +1,219 @@
+---
+# Converge the OpenClaw model catalogue from defaults/main.yml.
+#
+# Why `openclaw config patch` and not a templated openclaw.json: that file is
+# state, not configuration. It also carries `auth.profiles`, `gateway`, and
+# `wizard`, with device pairing beside it in identity/ — templating it would
+# take out gateway auth. The gateway role already reaches this conclusion; it
+# backs the file up and only fixes its permissions. `config patch` writes one
+# schema-validated change into named subtrees and leaves the rest alone.
+#
+# There is no drop-in or include mechanism in the config schema (checked against
+# `openclaw config schema`), so a separate Ansible-owned file is not an option.
+
+# --- Build the desired state -------------------------------------------------
+# One catalogue in defaults produces both structures OpenClaw needs. They live
+# in different parts of the config and are trivially easy to let drift apart:
+# the provider array is what can be called, the alias map is what agents route
+# by. A model present in one and absent from the other is silently broken.
+
+# Built in Jinja rather than a filter plugin to keep the role dependency-free.
+- name: Assemble the desired model catalogue
+  ansible.builtin.set_fact:
+    openclaw_models_provider_entries: >-
+      {%- set out = [] -%}
+      {%- for m in openclaw_models_catalog -%}
+        {%- set entry = {
+              'id': m.id,
+              'name': m.name,
+              'input': m.input | default(['text']),
+              'cost': m.cost | default({'input': 0, 'output': 0,
+                                        'cacheRead': 0, 'cacheWrite': 0}),
+              'contextWindow': m.context_window
+                               | default(openclaw_models_default_context_window),
+              'maxTokens': m.max_tokens
+                           | default(openclaw_models_default_max_tokens),
+            } -%}
+        {%- set _ = out.append(
+              entry | combine({'reasoning': true}) if m.reasoning | default(false)
+              else entry) -%}
+      {%- endfor -%}
+      {{ out }}
+    openclaw_models_alias_map: >-
+      {%- set out = {} -%}
+      {%- for m in openclaw_models_catalog -%}
+        {%- set _ = out.update({
+              openclaw_models_provider ~ '/' ~ m.id: {'alias': m.name}}) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# The failure this role exists to prevent. A primary outside the catalogue is
+# not rejected by the config schema — it validates fine and then fails at every
+# agent turn, which is exactly how qwen3-coder-tools:30b went unnoticed after
+# the model was deleted from Ollama.
+- name: Assert the primary model is in the catalogue
+  ansible.builtin.assert:
+    that:
+      - openclaw_models_primary in (openclaw_models_catalog | map(attribute='id') | list)
+    fail_msg: >-
+      openclaw_models_primary is '{{ openclaw_models_primary }}', which is not in
+      openclaw_models_catalog. Agents would validate clean and then fail on every
+      turn. Add the model to the catalogue or point the primary at one of:
+      {{ openclaw_models_catalog | map(attribute='id') | join(', ') }}
+    quiet: true
+
+# The providers mapping is built as a Jinja dict literal rather than as YAML
+# with a "{{ ... }}" key, because set_fact does not template dict *keys* — the
+# provider name would end up in the config literally as '{{ openclaw_models_provider }}'.
+- name: Compose the config patch
+  ansible.builtin.set_fact:
+    openclaw_models_patch:
+      models:
+        providers: >-
+          {{ {openclaw_models_provider: {
+                'baseUrl': openclaw_models_base_url,
+                'api': openclaw_models_api,
+                'models': openclaw_models_provider_entries,
+                'request': {
+                  'allowPrivateNetwork': openclaw_models_allow_private_network},
+              }} }}
+      agents:
+        defaults:
+          models: "{{ openclaw_models_alias_map }}"
+          model:
+            primary: "{{ openclaw_models_provider }}/{{ openclaw_models_primary }}"
+  changed_when: false
+
+# --- Read current state ------------------------------------------------------
+# Every openclaw CLI call below runs as the openclaw user. This is load-bearing,
+# not tidiness: run as root and the CLI silently operates on
+# /root/.openclaw/openclaw.json — a different, near-empty config. It prints
+# `~/.openclaw/openclaw.json`, exits 0, and changes nothing that matters.
+#
+# become from root to an unprivileged user needs ACLs on the temp dir; see
+# playbooks/bootstrap/install-acl.yml, already a fleet prerequisite.
+#
+# `check_mode: false` on the reads for the usual command-module reason: they
+# must run under --check or the comparison below has nothing to compare.
+
+- name: Read the current provider model catalogue
+  ansible.builtin.command:
+    cmd: openclaw config get models.providers.{{ openclaw_models_provider }}.models --json
+  become: true
+  become_user: "{{ openclaw_models_user }}"
+  register: openclaw_models_current_provider
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Read the current agent alias map and primary
+  ansible.builtin.command:
+    cmd: openclaw config get {{ item }} --json
+  become: true
+  become_user: "{{ openclaw_models_user }}"
+  register: openclaw_models_current_agents
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  loop:
+    - agents.defaults.models
+    - agents.defaults.model.primary
+
+# A missing path exits non-zero — that is a first run, not an error, so it is
+# treated as "no current value" and forces the patch.
+- name: Determine whether the catalogue is already converged
+  ansible.builtin.set_fact:
+    openclaw_models_converged: >-
+      {{ openclaw_models_current_provider.rc == 0
+         and openclaw_models_current_agents.results[0].rc == 0
+         and openclaw_models_current_agents.results[1].rc == 0
+         and (openclaw_models_current_provider.stdout | from_json)
+             == openclaw_models_provider_entries
+         and (openclaw_models_current_agents.results[0].stdout | from_json)
+             == openclaw_models_alias_map
+         and (openclaw_models_current_agents.results[1].stdout | from_json)
+             == openclaw_models_provider ~ '/' ~ openclaw_models_primary }}
+  changed_when: false
+
+# The command module is skipped outright under --check rather than reporting
+# "would change", so a check run would otherwise say nothing about what is
+# pending. Spell it out — under --check this is the entire useful output.
+- name: Report the pending catalogue change
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: adding [{{ openclaw_models_to_add | join(', ') | default('none', true) }}];
+      removing [{{ openclaw_models_to_remove | join(', ') | default('none', true) }}];
+      primary {{ openclaw_models_current_primary | default('(unset)', true) }}
+      -> {{ openclaw_models_provider }}/{{ openclaw_models_primary }}
+  vars:
+    openclaw_models_current_ids: >-
+      {{ (openclaw_models_current_provider.stdout | from_json | map(attribute='id') | list)
+         if openclaw_models_current_provider.rc == 0 else [] }}
+    openclaw_models_to_add: >-
+      {{ (openclaw_models_catalog | map(attribute='id') | list)
+         | difference(openclaw_models_current_ids) }}
+    openclaw_models_to_remove: >-
+      {{ openclaw_models_current_ids
+         | difference(openclaw_models_catalog | map(attribute='id') | list) }}
+    openclaw_models_current_primary: >-
+      {{ (openclaw_models_current_agents.results[1].stdout | from_json)
+         if openclaw_models_current_agents.results[1].rc == 0 else '' }}
+  when: not openclaw_models_converged
+
+# --- Apply -------------------------------------------------------------------
+# Validation runs on every pass, including --check, so a bad catalogue is caught
+# without waiting for someone to run for real. --dry-run checks the patch
+# against the config schema and writes nothing (verified: the primary was
+# unchanged afterwards).
+
+- name: Validate the patch against the config schema
+  ansible.builtin.command:
+    cmd: openclaw config patch --stdin --dry-run {{ openclaw_models_patch_flags }}
+    stdin: "{{ openclaw_models_patch | to_json }}"
+  become: true
+  become_user: "{{ openclaw_models_user }}"
+  changed_when: false
+  check_mode: false
+  when: not openclaw_models_converged
+
+- name: Apply the model catalogue
+  ansible.builtin.command:
+    cmd: openclaw config patch --stdin {{ openclaw_models_patch_flags }}
+    stdin: "{{ openclaw_models_patch | to_json }}"
+  become: true
+  become_user: "{{ openclaw_models_user }}"
+  register: openclaw_models_patch_result
+  changed_when: openclaw_models_patch_result.rc == 0
+  when: not openclaw_models_converged
+  notify: restart openclaw gateway for model catalogue
+
+# `config patch` reports "N update(s)" counting paths in the patch, not actual
+# diffs — a no-op patch still says 1 — so it cannot be trusted for changed
+# reporting. The re-read is the honest check, and it also catches the case where
+# the write succeeded but landed somewhere unexpected.
+- name: Re-read the catalogue to confirm the write landed
+  ansible.builtin.command:
+    cmd: openclaw config get agents.defaults.model.primary --json
+  become: true
+  become_user: "{{ openclaw_models_user }}"
+  register: openclaw_models_verify
+  changed_when: false
+  when:
+    - not openclaw_models_converged
+    - not ansible_check_mode
+
+- name: Assert the primary model is what was asked for
+  ansible.builtin.assert:
+    that:
+      - (openclaw_models_verify.stdout | from_json)
+        == openclaw_models_provider ~ '/' ~ openclaw_models_primary
+    fail_msg: >-
+      Patch reported success but the primary model is
+      {{ openclaw_models_verify.stdout | default('(unreadable)') }}. Check that
+      the CLI ran as {{ openclaw_models_user }} and not root — running as root
+      edits /root/.openclaw/openclaw.json and reports success.
+    quiet: true
+  when:
+    - not openclaw_models_converged
+    - not ansible_check_mode

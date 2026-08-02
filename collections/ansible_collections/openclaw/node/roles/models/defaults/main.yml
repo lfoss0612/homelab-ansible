@@ -1,0 +1,156 @@
+---
+# Desired model catalogue for the OpenClaw gateway.
+#
+# This is the source of truth. `openclaw.json` on the host is state — it also
+# holds auth profiles, gateway settings and wizard progress — so the role never
+# templates that file. It patches only the two subtrees below via
+# `openclaw config patch`, leaving everything else untouched.
+#
+# Capability data comes from the LiteLLM catalogue documented in the vault at
+# Kubernetes/Services/litellm-models.md. Two rules decide what belongs here:
+#
+#   1. **Tool calling is mandatory.** OpenClaw drives agents; a model Ollama
+#      does not report `tools` for cannot complete an agent turn. That rules out
+#      deepseek-r1:*, glm4:9b and gemma3:27b regardless of their other merits.
+#   2. **It has to fit 32 GB of VRAM.** One RTX 5090 on k8s-worker-2 serves all
+#      local inference. Anything larger spills to CPU and answers in minutes.
+
+openclaw_models_user: openclaw
+openclaw_models_provider: litellm
+
+# The provider overlay itself. `baseUrl` is not optional even when only the
+# model list is being changed: OpenClaw rejects a patch that touches a custom
+# provider without it ("provider overlays without baseUrl are only supported for
+# bundled providers"), so the role declares the whole overlay rather than
+# assuming what is already on the host.
+#
+# allow_private_network is what permits the RFC1918 baseUrl above — without it
+# OpenClaw refuses to call a private address at all.
+openclaw_models_base_url: "http://10.2.6.1:4000"
+openclaw_models_api: openai-completions
+openclaw_models_allow_private_network: true
+
+# Applied identically to the --dry-run validation and the real write, so the two
+# can never validate one thing and apply another.
+#
+# Both paths need explicit replace semantics, for different reasons:
+#
+#   models.providers.<p>.models  is an ARRAY. OpenClaw refuses a patch that
+#     would drop entries from it and demands the intent be stated.
+#   agents.defaults.models       is an OBJECT, so it merges recursively — a model
+#     removed from the catalogue would otherwise keep its alias entry forever.
+#
+# The refusal message suggests `--merge` and `--replace`. Neither flag exists
+# (verified against 2026.7.1-2, which answers "does not recognize option").
+# --replace-path is the real mechanism.
+openclaw_models_patch_flags: >-
+  --replace-path models.providers.{{ openclaw_models_provider }}.models
+  --replace-path agents.defaults.models
+
+# Applied to every catalogue entry unless the entry overrides it. 64k of context
+# is a VRAM decision, not a model limit: the qwen3.x family advertises 262k, but
+# a 24 GB model plus a 262k KV cache does not fit alongside itself in 32 GB.
+openclaw_models_default_context_window: 65536
+openclaw_models_default_max_tokens: 32768
+
+# The model an agent turn uses when nothing more specific is routed. Asserted
+# below to exist in the catalogue — the incident this role was written after was
+# a primary pointing at `qwen3-coder-tools:30b`, a model deleted from Ollama
+# months earlier. Every default agent turn failed and nothing surfaced it.
+openclaw_models_primary: "qwen3-coder:30b"
+
+# `id` is the LiteLLM model name; the provider prefix is added automatically.
+# `input` defaults to [text]. Set `reasoning: true` for thinking models.
+openclaw_models_catalog:
+  # --- Agentic coding — the primary working set --------------------------
+  - id: "qwen3-coder:30b"
+    name: Qwen3 Coder 30B
+    # MoE, so it is quick for its size, and 262k upstream context makes it the
+    # best choice for reading a lot of code at once.
+  - id: "devstral:24b"
+    name: Devstral 24B
+    # Purpose-built for agentic coding; the fallback if qwen3-coder's tool
+    # calling disappoints in practice.
+  - id: "qwen2.5-coder:32b"
+    name: Qwen2.5 Coder 32B
+  - id: "qwen2.5-coder:14b"
+    name: Qwen2.5 Coder 14B
+    # Same family at half the weight — the cheap option for routine edits.
+
+  # --- General-purpose all-rounders --------------------------------------
+  - id: "qwen3.5:35b"
+    name: Qwen3.5 35B
+    input: [text, image]
+    reasoning: true
+  - id: "qwen3.6:35b"
+    name: Qwen3.6 35B
+    input: [text, image]
+    reasoning: true
+    # Reports size, parameters, context and capabilities identical to
+    # qwen3.5:35b. Kept until they are benchmarked against each other; if they
+    # are the same model twice, drop one.
+  - id: "qwen3.5:27b"
+    name: Qwen3.5 27B
+    input: [text, image]
+    reasoning: true
+  - id: "gpt-oss:20b"
+    name: GPT-OSS 20B
+    reasoning: true
+    # Tools + thinking in 13.8 GB. Also the local answer to the retired hosted
+    # gpt-oss-120b, which sat in this catalogue failing on an OpenRouter quota.
+  - id: "gemma4:31b"
+    name: Gemma4 31B
+    # Text only: gemma4 reports tools and thinking but no vision, despite the
+    # previous config declaring image input for it.
+
+  # --- Vision, audio -----------------------------------------------------
+  - id: "nemotron3:33b"
+    name: Nemotron3 33B
+    input: [text, image]
+    reasoning: true
+    # The only model in the catalogue combining tools with vision AND audio,
+    # and at 27.6 GB it still fits. This is the correct home for image work
+    # that gemma3:27b was miscast in.
+
+  # --- Fast tier ---------------------------------------------------------
+  - id: "qwen3:4b"
+    name: Qwen3 4B
+    context_window: 32768
+    max_tokens: 16384
+    reasoning: true
+  - id: "llama3.1:8b"
+    name: Llama 3.1 8B
+    context_window: 32768
+    max_tokens: 16384
+    # Fills a real gap: before this, the only tools-capable model under 13 GB
+    # was qwen3:4b. This is the workhorse for routing and simple subagent steps.
+
+  # --- Concurrency -------------------------------------------------------
+  - id: "qwen3-8b"
+    name: Qwen3 8B (vLLM)
+    context_window: 16384
+    max_tokens: 8192
+    # Served by vLLM, not Ollama, and the reason it is here is batching rather
+    # than quality: Ollama largely serialises, so parallel agents queue behind
+    # each other. Also the only model in LiteLLM declared in git.
+
+  # --- Hosted fallback ---------------------------------------------------
+  # Costs money and leaves the network, but does not touch the GPU — the escape
+  # hatch while the 5090 is busy. Verified working 2026-08-02, unlike the four
+  # retired NVIDIA NIM entries and the over-quota OpenRouter one.
+  #
+  # NOTE: `cost` is left at zero for both. Every local model is genuinely free,
+  # so zero is correct there, but these two are not — the real per-token rates
+  # were not looked up, and inventing them would put fictional numbers into
+  # OpenClaw's spend reporting. Fill them in from Google's current rate card if
+  # cost tracking matters; leaving them at zero only understates spend.
+  - id: "gemini-3-flash-preview"
+    name: Gemini 3 Flash (preview)
+    input: [text, image]
+    context_window: 131072
+    max_tokens: 65536
+  - id: "gemini-3.1-flash-lite"
+    name: Gemini 3.1 Flash Lite
+    input: [text, image]
+    context_window: 131072
+    max_tokens: 65536

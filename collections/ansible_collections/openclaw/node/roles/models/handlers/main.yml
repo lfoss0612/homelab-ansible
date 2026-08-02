@@ -1,0 +1,8 @@
+---
+# Whether the gateway rereads the catalogue live is unverified, so the restart
+# is deliberate rather than optimistic. It is cheap and the gateway role's
+# health gate covers the recovery.
+- name: restart openclaw gateway for model catalogue
+  ansible.builtin.systemd:
+    name: openclaw-gateway
+    state: restarted

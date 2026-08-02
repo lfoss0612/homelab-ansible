@@ -1,0 +1,13 @@
+- name: Converge the OpenClaw model catalogue
+  # Gateway only. The catalogue lives in the gateway's openclaw.json; nodes
+  # route through it and hold no model config of their own.
+  #
+  # Deliberately not folded into deploy-openclaw.yml: that playbook installs and
+  # upgrades the runtime fleet-wide, and a model list change should not have to
+  # wait behind an npm rollout — nor should a routine deploy quietly rewrite the
+  # catalogue. Run this one on its own.
+  hosts: openclaw_gateway
+  become: true
+  roles:
+    - role: openclaw.node.models
+      tags: models
