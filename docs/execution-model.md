@@ -233,22 +233,64 @@ the exact failure this whole document exists to prevent.
 
 ## TODO — read plane, unscheduled
 
-1. **Harden `openclaw-node.service`** so read-only is kernel-enforced rather than a
+1. **Give `openclaw-fleet-update` a failure notification path.** First of these four,
+   because the timer is live: a failed weekly run is visible only in the unit state and
+   the journal, so a fleet that quietly stops converging stays quiet. That is the same
+   shape as the self-masking failure Phase 8 was built to kill — just moved one level up.
+   An `OnFailure=` unit pointing at Zabbix or any existing alert path closes it.
+2. **Harden `openclaw-node.service`** so read-only is kernel-enforced rather than a
    side effect of lacking sudo — `ProtectSystem=strict`, `ProtectHome=read-only`,
    `ProtectKernelTunables=true`, `PrivateDevices=true`, with `ReadWritePaths` for
    `~openclaw/.openclaw` and the log directory. Needs a `validate-openclaw.yml` run behind
    it before going fleet-wide; the paths the node actually writes are not fully enumerated.
-2. **Audit the other identities** the same way. `lfoss` and `ansible` hold
+3. **Audit the other identities** the same way. `lfoss` and `ansible` hold
    `(ALL) NOPASSWD: ALL` by design, but the sweep above only asked about `openclaw`.
-3. **Decide whether the read plane extends to the capability layer** — see "What this does
+4. **Decide whether the read plane extends to the capability layer** — see "What this does
    not cover" above.
-4. **Give `openclaw-fleet-update` a failure notification path.** Today a failed weekly
-   run is visible only in the unit state and the journal, so a fleet that stops
-   converging is silent until someone looks. An `OnFailure=` unit pointing at Zabbix or
-   any existing alert path would close it.
 
 These are write-plane changes: they belong in the roles, applied by playbook, never
 hand-edited on the hosts.
+
+## TODO — cleanup, unscheduled
+
+Everything the migration deliberately left in place, because a rollback path was worth
+more than the disk. The fleet is converged and validated, so the reason to keep it has
+expired. **This is write-plane work too** — a playbook with an explicit gate, not a
+`for host in ...; do ssh rm -rf; done`.
+
+1. **58.1 GB of dead `/opt/openclaw` trees across the 12 hosts.** Nothing runs from them;
+   npm owns the install everywhere. Measured 2026-08-02:
+
+   | Size | Hosts |
+   |---|---|
+   | 6.0 G each | `zabbix`, `omv`, `k8s-master`, `k8s-worker`, `k8s-worker-2`, `vscode` |
+   | 5.9 G | `pbs` |
+   | 4.0 G | `openclaw` (the gateway's pnpm source tree) |
+   | 3.4 G each | `pve`, `pve-ai` |
+   | 2.7 G each | `cockpit`, `pdm` |
+
+   Take the 11 nodes first. **The gateway's 4.0 G goes last and separately** — it is the
+   source-build fallback, and removing it ends any path back to a non-npm gateway.
+2. **`/srv/openclaw`** on the gateway — 1.6 GB of superseded tarballs, none of them the
+   running version.
+3. **The `openclaw-artifacts` nginx site.** Check the `openclaw` site's `server_name`
+   first: `openclaw-artifacts` is `default_server` on :80, so removing it changes what an
+   unmatched vhost request hits.
+4. **The moved-aside `openclaw.pre-npm.disabled` wrappers** on the gateway and cockpit,
+   and any `main.sqlite.pre-2026.7-migration.disabled` left from Phase 7.
+5. **`Lester's S23 Ultra`** is paired but not approved on the gateway. Not a failure —
+   it is correctly outside `openclaw_nodes`, so no play asserts on it — but it needs a
+   decision: approve it or unpair it, rather than leaving it pending forever.
+
+## Tracked in the other repo
+
+Not Ansible's to fix, recorded here only so the list is complete. Both live in
+`homelab-gitops` and predate the fleet work:
+
+- `CLAUDE.md` is untracked — commit it or add it to `.gitignore`.
+- `argocd/open-webui/open-webui.yaml` has uncommitted local changes. Under `selfHeal: true`
+  an uncommitted manifest is a change that does not exist as far as the cluster is
+  concerned; decide whether it ships or gets reverted.
 
 ## Related
 
