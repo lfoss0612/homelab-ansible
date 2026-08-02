@@ -219,48 +219,32 @@ changes on the gateway, so keeping them in git means either a new role that temp
 gateway config or a documented runbook. Applying them by hand leaves no record, which is
 the exact failure this whole document exists to prevent.
 
-1. **`gateway.auth.token` is stored in plaintext** in `openclaw.json` on the gateway.
-   Doctor's warning: "agents or workspace tools that can read config files may see these
-   API keys/tokens" — the `openclaw` identity is exactly such a reader, and this is the
-   fleet-wide node credential. Fix with `openclaw secrets configure` / `secrets apply`,
-   verify with `openclaw secrets audit --check`. Note it is already Ansible-Vault-encrypted
-   in `group_vars/openclaw.yml`, so this is at-rest exposure on the host, not in git.
-2. **Gateway is bound to `0.0.0.0`** ("lan", network-accessible). Combined with
-   `openclaw_allow_insecure_ws: true` in the node role defaults, node traffic carries that
-   token over the LAN unencrypted. Doctor suggests keeping the bind on loopback and
-   fronting it with an SSH tunnel or Tailscale Serve.
-3. **No command owner is configured.** Without `commands.ownerAllowFrom`, no account is
-   authorized to approve exec approvals or run owner-only commands. This connects to the
-   capability question below: nodes hold `system.run`, and re-approvals want
-   `system.execApprovals.set`, with no designated human gating any of it.
+The three items — the plaintext `gateway.auth.token`, the `0.0.0.0` bind combined with
+`openclaw_allow_insecure_ws: true`, and the missing `commands.ownerAllowFrom` owner — are
+tracked in the homelab-vault `TODO.md`, under "OpenClaw — gateway security". The third
+connects to the capability question below: nodes hold `system.run`, and re-approvals want
+`system.execApprovals.set`, with no designated human gating any of it.
 
 ## TODO — read plane, unscheduled
 
-1. ~~**Give `openclaw-fleet-update` a failure notification path.**~~ **Done 2026-08-02**,
-   and not a moment early: the concern was hypothetical when it was written, and the very
-   first scheduled run (2026-08-02 03:46) then died in `git pull` and told nobody. It was
-   found only by reading the journal by hand, days later, by which point systemd had
-   dropped even the failed state. Cause: the sync command documented in `CLAUDE.md` ran
-   the git module as root — `ansible.cfg` sets `become = True` — leaving root-owned
-   objects the `ansible` user could not write. Both are fixed; see the convergence
-   section above and `CLAUDE.md`.
+~~**Give `openclaw-fleet-update` a failure notification path.**~~ **Done 2026-08-02**,
+and not a moment early: the concern was hypothetical when it was written, and the very
+first scheduled run (2026-08-02 03:46) then died in `git pull` and told nobody. It was
+found only by reading the journal by hand, days later, by which point systemd had
+dropped even the failed state. Cause: the sync command documented in `CLAUDE.md` ran
+the git module as root — `ansible.cfg` sets `become = True` — leaving root-owned
+objects the `ansible` user could not write. Both are fixed; see the convergence
+section above and `CLAUDE.md`.
 
-   **One piece remains outstanding**: the Zabbix trapper item `openclaw.fleet.update` and
-   its two triggers must be created on host `cockpit.home.lan` (spec in the README). Until
-   then the server accepts each value and discards it, and only the `last-failure` file
-   and the optional webhook do anything.
-2. **Harden `openclaw-node.service`** so read-only is kernel-enforced rather than a
-   side effect of lacking sudo — `ProtectSystem=strict`, `ProtectHome=read-only`,
-   `ProtectKernelTunables=true`, `PrivateDevices=true`, with `ReadWritePaths` for
-   `~openclaw/.openclaw` and the log directory. Needs a `validate-openclaw.yml` run behind
-   it before going fleet-wide; the paths the node actually writes are not fully enumerated.
-3. **Audit the other identities** the same way. `lfoss` and `ansible` hold
-   `(ALL) NOPASSWD: ALL` by design, but the sweep above only asked about `openclaw`.
-4. **Decide whether the read plane extends to the capability layer** — see "What this does
-   not cover" above.
+**One piece remains outstanding**: the Zabbix trapper item `openclaw.fleet.update` and
+its two triggers must be created on host `cockpit.home.lan` (spec in the README). Until
+then the server accepts each value and discards it, and only the `last-failure` file
+and the optional webhook do anything.
 
-These are write-plane changes: they belong in the roles, applied by playbook, never
-hand-edited on the hosts.
+The four remaining items — harden `openclaw-node.service`, audit the other identities,
+decide on the capability layer, and create the Zabbix trapper — are tracked in the
+homelab-vault `TODO.md`, under "OpenClaw — read plane". These are write-plane changes:
+they belong in the roles, applied by playbook, never hand-edited on the hosts.
 
 ## TODO — cleanup, unscheduled
 
@@ -269,29 +253,11 @@ more than the disk. The fleet is converged and validated, so the reason to keep 
 expired. **This is write-plane work too** — a playbook with an explicit gate, not a
 `for host in ...; do ssh rm -rf; done`.
 
-1. **58.1 GB of dead `/opt/openclaw` trees across the 12 hosts.** Nothing runs from them;
-   npm owns the install everywhere. Measured 2026-08-02:
-
-   | Size | Hosts |
-   |---|---|
-   | 6.0 G each | `zabbix`, `omv`, `k8s-master`, `k8s-worker`, `k8s-worker-2`, `vscode` |
-   | 5.9 G | `pbs` |
-   | 4.0 G | `openclaw` (the gateway's pnpm source tree) |
-   | 3.4 G each | `pve`, `pve-ai` |
-   | 2.7 G each | `cockpit`, `pdm` |
-
-   Take the 11 nodes first. **The gateway's 4.0 G goes last and separately** — it is the
-   source-build fallback, and removing it ends any path back to a non-npm gateway.
-2. **`/srv/openclaw`** on the gateway — 1.6 GB of superseded tarballs, none of them the
-   running version.
-3. **The `openclaw-artifacts` nginx site.** Check the `openclaw` site's `server_name`
-   first: `openclaw-artifacts` is `default_server` on :80, so removing it changes what an
-   unmatched vhost request hits.
-4. **The moved-aside `openclaw.pre-npm.disabled` wrappers** on the gateway and cockpit,
-   and any `main.sqlite.pre-2026.7-migration.disabled` left from Phase 7.
-5. **`Lester's S23 Ultra`** is paired but not approved on the gateway. Not a failure —
-   it is correctly outside `openclaw_nodes`, so no play asserts on it — but it needs a
-   decision: approve it or unpair it, rather than leaving it pending forever.
+The five cleanup items — 58.1 GB of dead `/opt/openclaw` trees, `/srv/openclaw`
+tarballs, the `openclaw-artifacts` nginx site, moved-aside `.pre-npm.disabled`
+wrappers, and the unapproved `Lester's S23 Ultra` device — are tracked in the
+homelab-vault `TODO.md`, under "OpenClaw — cleanup", along with per-host disk
+measurements.
 
 ## Tracked in the other repo
 
