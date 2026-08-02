@@ -9,9 +9,47 @@
 - name: Deploy OpenClaw Nodes
   # No gateway subtraction: the gateway host is deliberately a node too, and
   # the gateway play above already converged its gateway service first.
-  hosts: openclaw_nodes
+  #
+  # openclaw_optional IS subtracted: those hosts are legitimately powered off
+  # part of the time and get their own play below, where unreachable is not a
+  # failure. Everything here must be up.
+  hosts: openclaw_nodes:!openclaw_optional
   serial: 1
   become: true
   roles:
     - role: openclaw.node.node
+      tags: node
+
+- name: Deploy OpenClaw Nodes (intermittently-powered hosts)
+  # Same role, same convergence — the only difference is that a host being
+  # switched off is a skip, not a failure. See [openclaw_optional] in
+  # inventory.ini.
+  #
+  # The probe is load-bearing: ignore_unreachable stops a powered-off host
+  # being counted as failed, but it does not stop the role running against it
+  # task by task. `tags: always` so the guard still applies under --tags node
+  # or --tags privileges.
+  hosts: openclaw_optional
+  serial: 1
+  become: true
+  ignore_unreachable: true
+
+  pre_tasks:
+    - name: Probe reachability — this host is allowed to be powered off
+      ansible.builtin.ping:
+      register: openclaw_optional_probe
+      changed_when: false
+      tags: always
+
+    - name: Report a powered-off optional host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is unreachable — expected for an
+          [openclaw_optional] host; skipping it, not failing.
+      when: openclaw_optional_probe.unreachable | default(false)
+      tags: always
+
+  roles:
+    - role: openclaw.node.node
+      when: not (openclaw_optional_probe.unreachable | default(false))
       tags: node

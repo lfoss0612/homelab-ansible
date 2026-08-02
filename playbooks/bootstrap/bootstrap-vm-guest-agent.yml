@@ -1,0 +1,182 @@
+---
+# Bootstrap a Proxmox guest that has NO sshd yet, so Ansible cannot reach it.
+#
+# playbooks/users/ansible-user.yml already creates the `ansible` account, but it
+# connects over SSH as `lfoss` — useless on a host where sshd was never
+# installed. This play instead runs against the *hypervisor* (which Ansible does
+# manage) and pushes a bootstrap script into the guest through the QEMU guest
+# agent. That keeps the write plane in Ansible rather than in a hand-typed
+# console session — see docs/execution-model.md.
+#
+# It is a one-shot: after it succeeds the guest is a normal inventory host and
+# every later change goes through ordinary SSH-based playbooks.
+#
+# Requirements on the guest: `agent: 1` in its VM config AND the qemu-guest-agent
+# service actually running (verified by the ping task below).
+#
+# Usage:
+#   ansible-playbook playbooks/bootstrap/bootstrap-vm-guest-agent.yml \
+#       -e bootstrap_vmid=104 -e bootstrap_guest_name=desktop.home.lan --check --diff
+#   ansible-playbook playbooks/bootstrap/bootstrap-vm-guest-agent.yml \
+#       -e bootstrap_vmid=104 -e bootstrap_guest_name=desktop.home.lan
+#
+# --check reports what it *would* run without executing anything in the guest.
+
+- name: Bootstrap SSH and the ansible user on a guest via the QEMU guest agent
+  hosts: "{{ bootstrap_pve_host | default('pve.home.lan') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    bootstrap_ansible_user: ansible
+    bootstrap_ansible_pubkey: "{{ lookup('file', playbook_dir + '/../../keys/ansible.pub') | trim }}"
+    # Set the VM to start with the hypervisor. A host in openclaw_nodes that is
+    # normally powered off never converges; onboot is what makes the weekly
+    # fleet update meaningful for it.
+    bootstrap_set_onboot: true
+    bootstrap_exec_timeout: 600
+    bootstrap_remote_script: /root/.ansible-bootstrap.sh
+
+  tasks:
+    - name: Assert a target VMID was given
+      ansible.builtin.assert:
+        that:
+          - bootstrap_vmid is defined
+          - bootstrap_vmid | string | length > 0
+        fail_msg: >-
+          Pass -e bootstrap_vmid=<vmid> (and optionally
+          -e bootstrap_pve_host=<hypervisor> if the VM is not on pve.home.lan).
+
+    - name: Read the VM config
+      ansible.builtin.command: "qm config {{ bootstrap_vmid }}"
+      register: bootstrap_vm_config
+      changed_when: false
+      check_mode: false
+
+    - name: Assert the guest agent is enabled in the VM config
+      ansible.builtin.assert:
+        that:
+          - bootstrap_vm_config.stdout is search('^agent:\s*1', multiline=True)
+        fail_msg: >-
+          VM {{ bootstrap_vmid }} does not have `agent: 1`. Enable the QEMU guest
+          agent on the VM (and install qemu-guest-agent inside it) first —
+          without it there is no way in.
+
+    - name: Ping the guest agent
+      ansible.builtin.command: "qm guest cmd {{ bootstrap_vmid }} ping"
+      register: bootstrap_agent_ping
+      changed_when: false
+      check_mode: false
+      failed_when: bootstrap_agent_ping.rc != 0
+
+    - name: Report the guest OS the agent sees
+      ansible.builtin.command: "qm guest cmd {{ bootstrap_vmid }} get-osinfo"
+      register: bootstrap_guest_osinfo
+      changed_when: false
+      check_mode: false
+
+    # This script only knows apt. Refuse loudly rather than half-run on anything
+    # else — notably Home Assistant OS, which reports id "haos" and cannot be
+    # bootstrapped at all (see README, "Hosts Ansible does not manage").
+    - name: Assert the guest is a Debian-family OS
+      ansible.builtin.assert:
+        that:
+          - (bootstrap_guest_osinfo.stdout | from_json).id in ['debian', 'ubuntu']
+        fail_msg: >-
+          Guest {{ bootstrap_vmid }} reports OS id
+          '{{ (bootstrap_guest_osinfo.stdout | from_json).id }}'
+          ({{ (bootstrap_guest_osinfo.stdout | from_json)['pretty-name'] | default('unknown') }}).
+          This bootstrap is apt-only and will not run against it.
+        success_msg: >-
+          Guest {{ bootstrap_vmid }} is
+          {{ (bootstrap_guest_osinfo.stdout | from_json)['pretty-name'] }}.
+
+    - name: Render the bootstrap script
+      ansible.builtin.set_fact:
+        bootstrap_script_b64: "{{ lookup('template', 'templates/bootstrap-ansible-user.sh.j2') | b64encode }}"
+
+    # argv (not a shell string) so the base64 payload is passed as one opaque
+    # argument with no quoting games on the hypervisor side. The only shell
+    # involved is the `/bin/sh -c` running inside the guest.
+    - name: Run the bootstrap script inside the guest
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - exec
+          - "{{ bootstrap_vmid }}"
+          - --timeout
+          - "{{ bootstrap_exec_timeout }}"
+          - --
+          - /bin/sh
+          - -c
+          - >-
+            echo {{ bootstrap_script_b64 }} | base64 -d > {{ bootstrap_remote_script }}
+            && /bin/sh {{ bootstrap_remote_script }}
+      register: bootstrap_exec
+      changed_when: bootstrap_exec.rc == 0
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Show what would run (check mode)
+      ansible.builtin.debug:
+        msg: >-
+          Would exec the rendered bootstrap script in VM {{ bootstrap_vmid }}
+          via `qm guest exec` (installs openssh-server/sudo/python3/acl/gnupg,
+          enables ssh, creates the {{ bootstrap_ansible_user }} user with
+          keys/ansible.pub and NOPASSWD sudo).
+      when: ansible_check_mode
+
+    # qm guest exec returns rc 0 for "the agent ran your command"; the guest's
+    # own exit code is inside the JSON. Both have to be checked.
+    - name: Parse the guest exec result
+      ansible.builtin.set_fact:
+        bootstrap_result: "{{ bootstrap_exec.stdout | from_json }}"
+      when: not ansible_check_mode
+
+    - name: Show the bootstrap script output
+      ansible.builtin.debug:
+        msg: "{{ (bootstrap_result['out-data'] | default('')).split('\n') }}"
+      when: not ansible_check_mode
+
+    - name: Assert the bootstrap script succeeded inside the guest
+      ansible.builtin.assert:
+        that:
+          - bootstrap_result.exitcode | int == 0
+          - "'BOOTSTRAP_OK' in (bootstrap_result['out-data'] | default(''))"
+        fail_msg: >-
+          Bootstrap failed inside VM {{ bootstrap_vmid }}
+          (exitcode {{ bootstrap_result.exitcode | default('?') }}):
+          {{ bootstrap_result['err-data'] | default(bootstrap_result['out-data'] | default('no output')) }}
+      when: not ansible_check_mode
+
+    - name: Read the current onboot setting
+      ansible.builtin.command: "qm config {{ bootstrap_vmid }}"
+      register: bootstrap_vm_config_onboot
+      changed_when: false
+      check_mode: false
+      when: bootstrap_set_onboot | bool
+
+    - name: Start this VM with the hypervisor
+      ansible.builtin.command: "qm set {{ bootstrap_vmid }} --onboot 1"
+      when:
+        - bootstrap_set_onboot | bool
+        - not (bootstrap_vm_config_onboot.stdout is search('^onboot:\s*1', multiline=True))
+
+    - name: Wait for sshd in the guest to accept connections
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[bootstrap_guest_name].ansible_host | default(bootstrap_guest_name) }}"
+        port: 22
+        timeout: 60
+      delegate_to: localhost
+      become: false
+      when:
+        - not ansible_check_mode
+        - bootstrap_guest_name is defined
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ bootstrap_vmid }} is now reachable over SSH as the ansible user."
+          - "Next: ansible-playbook playbooks/bootstrap/nodesource-repo.yml --limit {{ bootstrap_guest_name | default('<host>') }}"
+          - "Then: ansible-playbook playbooks/deploy-openclaw.yml --limit {{ bootstrap_guest_name | default('<host>') }}"

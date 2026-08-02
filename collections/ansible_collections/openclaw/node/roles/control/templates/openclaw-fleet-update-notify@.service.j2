@@ -1,0 +1,33 @@
+# Managed by Ansible — openclaw.node.control role
+#
+# Instantiated unit: the instance name IS the outcome, so one template covers
+# both hooks on {{ openclaw_control_unit }}.service:
+#   OnFailure={{ openclaw_control_notify_unit }}@failed.service
+#   OnSuccess={{ openclaw_control_notify_unit }}@ok.service
+#
+# Deliberately has no OnFailure= of its own. If the notifier breaks there is
+# nothing left to announce it with, and a notifier that notifies about itself
+# is a loop; it logs to the journal under its own SyslogIdentifier instead.
+[Unit]
+Description=OpenClaw fleet convergence notification (%i)
+Documentation=file://{{ openclaw_control_dir }}/docs/execution-model.md
+
+[Service]
+Type=oneshot
+
+# Runs as root, unlike the convergence unit itself: it reads the failing unit's
+# journal, which the ansible user cannot. It touches no part of the checkout,
+# so it cannot recreate the root-owned-.git problem the control role repairs.
+ExecStart={{ openclaw_control_notify_script }} %i {{ openclaw_control_unit }}.service
+
+# A notification that hangs delays nothing but itself, but bound it anyway.
+TimeoutStartSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ openclaw_control_notify_unit }}
+
+NoNewPrivileges=true
+PrivateTmp=true
+LockPersonality=true
+RestrictSUIDSGID=true

@@ -4,7 +4,7 @@ Standing decision, 2026-08-01. Fleet work is split by **verb**, not by host.
 
 | Plane | Tool | Scope |
 |---|---|---|
-| **Read** | OpenClaw nodes (12 hosts) | Observe, tail logs, inspect running state, debug interactively. No host mutation. |
+| **Read** | OpenClaw nodes (13 hosts) | Observe, tail logs, inspect running state, debug interactively. No host mutation. |
 | **Write — hosts** | Ansible, from cockpit | Every change to a host goes through a playbook in this repo. |
 | **Write — cluster** | Argo CD (`homelab-gitops`) | Everything in-cluster. Neither OpenClaw nor Ansible should touch k8s workloads. |
 

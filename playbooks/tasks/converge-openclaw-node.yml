@@ -1,0 +1,31 @@
+---
+# Node convergence body, shared by the two node plays in update-openclaw.yml:
+# the strict one (openclaw_nodes:!openclaw_optional) and the one that tolerates
+# a powered-off host (openclaw_optional, ignore_unreachable: true). The plays
+# differ only in host pattern and unreachable handling — the work itself is
+# identical, so it lives here rather than being copied.
+#
+# Included under `when: openclaw_update_required` by both callers, which is
+# what replaces the earlier `meta: end_host` skip: the include simply does not
+# run for a host already at the pin.
+
+- name: Converge node to the pinned version
+  ansible.builtin.include_role:
+    name: openclaw.node.node
+
+- name: Flush handlers so the health check reflects the current unit
+  ansible.builtin.meta: flush_handlers
+
+- name: Health-gate — openclaw-node must be active before moving to the next host
+  ansible.builtin.command: systemctl is-active openclaw-node
+  register: openclaw_node_active
+  changed_when: false
+  until: openclaw_node_active.stdout == "active"
+  retries: 6
+  delay: 5
+
+- name: Health-gate — installed version must match the pin
+  ansible.builtin.command: openclaw --version
+  register: openclaw_node_version_check
+  changed_when: false
+  failed_when: openclaw_version not in openclaw_node_version_check.stdout

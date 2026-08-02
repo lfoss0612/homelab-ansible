@@ -1,12 +1,25 @@
 ---
-# Approves pending OpenClaw node capability-reapproval requests. Explicit
-# invocation only — never included from deploy-openclaw.yml or
-# update-openclaw.yml. Auto-approves only entries whose displayName matches
-# an openclaw_nodes inventory hostname (nodes are started with
-# --display-name {{ inventory_hostname }}, so the two should always agree);
-# anything else — including pve-router (deliberately not in openclaw_nodes)
-# and non-infrastructure devices like phone clients — is reported but left
-# untouched for a human to look at.
+# Approves pending OpenClaw pairing requests. Explicit invocation only — never
+# included from deploy-openclaw.yml or update-openclaw.yml. Auto-approves only
+# entries whose displayName matches an openclaw_nodes inventory hostname (nodes
+# are started with --display-name {{ inventory_hostname }}, so the two should
+# always agree); anything else — including pve-router (deliberately not in
+# openclaw_nodes) and non-infrastructure devices like phone clients — is
+# reported but left untouched for a human to look at.
+#
+# There are TWO pending queues, and a node onboarding hits the second one:
+#
+#   1. `openclaw nodes status --json` → nodes[] with approvalState
+#      "pending-approval"/"pending-reapproval" → `openclaw nodes approve <id>`.
+#      This is an ALREADY-KNOWN node re-declaring capabilities.
+#   2. `openclaw devices list --json` → pending[] → `openclaw devices approve <id>`.
+#      This is a FIRST-TIME pairing. A brand-new node does not appear in
+#      `nodes status` at all until it is approved, so a playbook that reads only
+#      queue 1 silently reports "nothing to approve" while the new node sits in
+#      a crash loop logging "device pairing required (requestId: ...)".
+#
+# Verified live on 2026-08-02 while onboarding desktop.home.lan, which was
+# invisible to queue 1 and sitting in queue 2. Both are handled below.
 #
 # Verified against real output from `openclaw nodes status --json` on
 # 2026-08-01 (gateway 2026.7.1-2): re-approval requests live here, not in
@@ -98,6 +111,64 @@
       ansible.builtin.command: "openclaw nodes approve {{ item.pendingRequestId }}"
       become_user: "{{ openclaw_user }}"
       loop: "{{ openclaw_pending_matched }}"
+      loop_control:
+        label: "{{ item.displayName }}"
+      when: openclaw_approve_confirm | bool
+
+    # --- Queue 2: first-time device pairings ---------------------------------
+    # `devices list --json` returns {"pending": [...], "paired": [...]}. Entries
+    # in pending[] use `requestId` (not `pendingRequestId`) and are approved with
+    # `devices approve`, not `nodes approve` — the CLI rejects the wrong pairing
+    # of subcommand and queue.
+    - name: Query the device pairing queue from the gateway
+      ansible.builtin.command: openclaw devices list --json
+      become_user: "{{ openclaw_user }}"
+      register: openclaw_devices_raw
+      changed_when: false
+
+    - name: Parse the device pairing queue
+      ansible.builtin.set_fact:
+        openclaw_devices_pending: "{{ (openclaw_devices_raw.stdout | from_json).pending | default([]) }}"
+
+    - name: Split pending device pairings by inventory match
+      ansible.builtin.set_fact:
+        openclaw_devices_matched: >-
+          {{ openclaw_devices_pending
+             | selectattr('displayName', 'defined')
+             | selectattr('displayName', 'in', groups['openclaw_nodes'])
+             | list }}
+        openclaw_devices_unmatched: >-
+          {{ (openclaw_devices_pending | rejectattr('displayName', 'defined') | list)
+             +
+             (openclaw_devices_pending | selectattr('displayName', 'defined')
+              | rejectattr('displayName', 'in', groups['openclaw_nodes']) | list) }}
+
+    - name: Report pending device pairings with no inventory match — left pending
+      ansible.builtin.debug:
+        msg: >-
+          '{{ item.displayName | default('(no displayName)') }}' from {{ item.remoteIp | default('?') }}
+          (requestId={{ item.requestId }}) has no matching host in openclaw_nodes —
+          not auto-approved. This is the queue a personal device lands in; approve
+          by hand with `openclaw devices approve {{ item.requestId }}` only if you
+          recognise it.
+      loop: "{{ openclaw_devices_unmatched }}"
+      loop_control:
+        label: "{{ item.displayName | default(item.requestId) }}"
+
+    - name: Report matched pending device pairings
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Approving' if openclaw_approve_confirm | bool else 'Would approve (dry-run)' }}
+          first-time pairing for '{{ item.displayName }}'
+          ({{ item.remoteIp | default('?') }}, requestId={{ item.requestId }})
+      loop: "{{ openclaw_devices_matched }}"
+      loop_control:
+        label: "{{ item.displayName }}"
+
+    - name: Approve matched first-time device pairings
+      ansible.builtin.command: "openclaw devices approve {{ item.requestId }}"
+      become_user: "{{ openclaw_user }}"
+      loop: "{{ openclaw_devices_matched }}"
       loop_control:
         label: "{{ item.displayName }}"
       when: openclaw_approve_confirm | bool

@@ -108,6 +108,26 @@
     group: root
     mode: "0755"
 
+# Installed BEFORE the service unit that references it: systemd resolves
+# OnFailure=/OnSuccess= lazily, but a daemon-reload with the target missing
+# logs a warning for a unit that is meant to be the quiet one.
+- name: Install the fleet-update notification script
+  ansible.builtin.template:
+    src: openclaw-fleet-update-notify.sh.j2
+    dest: "{{ openclaw_control_notify_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the fleet-update notification unit
+  ansible.builtin.template:
+    src: openclaw-fleet-update-notify@.service.j2
+    dest: "/etc/systemd/system/{{ openclaw_control_notify_unit }}@.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload
+
 - name: Install the fleet-update service unit
   ansible.builtin.template:
     src: openclaw-fleet-update.service.j2

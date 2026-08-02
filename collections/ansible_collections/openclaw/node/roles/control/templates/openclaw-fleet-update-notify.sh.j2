@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Managed by Ansible — openclaw.node.control role. Do not edit on the host;
+# change the role and re-run playbooks/openclaw-automation.yml.
+#
+# Invoked by systemd, never by hand:
+#   OnFailure={{ openclaw_control_notify_unit }}@failed.service
+#   OnSuccess={{ openclaw_control_notify_unit }}@ok.service
+#
+# Two deliberate properties:
+#
+#   * It never exits non-zero, and never uses `set -e`. A notifier that fails
+#     loudly would mark ITS OWN unit failed while the real failure it was meant
+#     to report goes unmentioned — and there is nothing left to notify with
+#     about a broken notifier. Every channel is independent and best-effort;
+#     problems are logged to the journal and the run still exits 0.
+#   * Both outcomes are sent, not just failures. The Zabbix value is 1 on
+#     failure and 0 on success, so a trigger clears itself on the next good
+#     run instead of needing a manual acknowledgement.
+#
+# Usage: {{ openclaw_control_notify_script }} <failed|ok> [unit]
+
+set -uo pipefail
+
+OUTCOME="${1:-failed}"
+UNIT="${2:-{{ openclaw_control_unit }}.service}"
+
+STATE_DIR={{ openclaw_control_state_dir }}
+FAILURE_FILE="$STATE_DIR/last-failure"
+ANSIBLE_DIR={{ openclaw_control_dir }}
+JOURNAL_LINES={{ openclaw_control_notify_journal_lines }}
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*"; }
+
+case "$OUTCOME" in
+  ok) zabbix_value=0 ;;
+  *)  OUTCOME=failed; zabbix_value=1 ;;
+esac
+
+host=$(hostname -s 2>/dev/null || echo unknown)
+
+# -c safe.directory is load-bearing: this script runs as root against a
+# checkout owned by the ansible user, and git's dubious-ownership check refuses
+# such a repo for root too — without it every notification reported
+# "checkout unknown". Scoped to this invocation; nothing is written to any
+# git config.
+commit=$(git -c safe.directory="$ANSIBLE_DIR" -C "$ANSIBLE_DIR" \
+  rev-parse --short HEAD 2>/dev/null)
+commit=${commit:-unknown}
+summary="openclaw fleet convergence $OUTCOME on $host ($UNIT, checkout $commit)"
+
+log "$summary"
+
+# --- Always leave a record on disk -----------------------------------------
+# The journal is where the detail lives, but it rotates and needs privileges to
+# read. This file is the durable, greppable counterpart to last-success: if
+# last-success has stopped advancing, this says why.
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+if [ "$OUTCOME" = failed ]; then
+  result=$(systemctl show "$UNIT" -p Result --value 2>/dev/null)
+  status=$(systemctl show "$UNIT" -p ExecMainStatus --value 2>/dev/null)
+  {
+    printf 'timestamp=%s\n' "$(date -Iseconds)"
+    printf 'unit=%s\n' "$UNIT"
+    printf 'result=%s\n' "${result:-unknown}"
+    printf 'exit_status=%s\n' "${status:-unknown}"
+    printf 'commit=%s\n' "$commit"
+    printf -- '--- last %s journal lines ---\n' "$JOURNAL_LINES"
+    journalctl -u "$UNIT" -n "$JOURNAL_LINES" --no-pager 2>/dev/null
+  } > "$FAILURE_FILE" 2>/dev/null \
+    && log "recorded $FAILURE_FILE" \
+    || log "WARNING: could not write $FAILURE_FILE"
+fi
+
+# --- Channel: Zabbix trapper ------------------------------------------------
+{% if openclaw_control_notify_zabbix %}
+zabbix_conf={{ openclaw_control_notify_zabbix_conf }}
+zabbix_key={{ openclaw_control_notify_zabbix_key }}
+
+if ! command -v zabbix_sender >/dev/null 2>&1; then
+  log "zabbix_sender not installed — skipping the zabbix channel"
+elif [ ! -r "$zabbix_conf" ]; then
+  log "$zabbix_conf not readable — skipping the zabbix channel"
+else
+  zabbix_out=$(zabbix_sender -c "$zabbix_conf" -k "$zabbix_key" -o "$zabbix_value" 2>&1)
+  log "zabbix_sender($zabbix_key=$zabbix_value): $zabbix_out"
+  # The server returns success for the CONNECTION even when it throws the value
+  # away because no matching item exists, so the counters have to be read.
+  case "$zabbix_out" in
+    *"failed: 0"*) : ;;
+    *)
+      # The Zabbix host is whatever Hostname= in the agent config says, which is
+      # the FQDN here — not `hostname -s`. Naming the wrong one sends whoever
+      # reads this looking for an item on a host that does not exist.
+      zabbix_host=$(sed -n 's/^Hostname=//p' "$zabbix_conf" 2>/dev/null | tail -1)
+      log "WARNING: Zabbix discarded the value — is trapper item '$zabbix_key' defined on host '${zabbix_host:-$host}'? See README."
+      ;;
+  esac
+fi
+{% else %}
+log "zabbix channel disabled (openclaw_control_notify_zabbix=false)"
+{% endif %}
+
+# --- Channel: generic webhook ----------------------------------------------
+{% if openclaw_control_notify_webhook %}
+webhook_body="$summary"
+if [ "$OUTCOME" = failed ] && [ -r "$FAILURE_FILE" ]; then
+  webhook_body="$summary
+
+$(cat "$FAILURE_FILE")"
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  log "curl not installed — skipping the webhook channel"
+else
+  webhook_out=$(printf '%s' "$webhook_body" | curl -fsS -m 15 \
+    -H 'Content-Type: text/plain' --data-binary @- \
+    {{ openclaw_control_notify_webhook | quote }} 2>&1)
+  # shellcheck disable=SC2181
+  if [ $? -eq 0 ]; then
+    log "webhook delivered"
+  else
+    log "WARNING: webhook POST failed: $webhook_out"
+  fi
+fi
+{% else %}
+log "webhook channel disabled (openclaw_control_notify_webhook unset)"
+{% endif %}
+
+exit 0

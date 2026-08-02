@@ -8,6 +8,12 @@
 # The gateway is a member of openclaw_nodes (it manages its own VM), so it
 # is converged by the gateway play below, then converged again by the node
 # play for its own openclaw-node.service — same as deploy-openclaw.yml.
+#
+# Hosts in [openclaw_optional] are legitimately powered off part of the time.
+# This playbook runs unattended from the weekly openclaw-fleet-update timer, so
+# it must not go red because a desktop is switched off — those hosts are split
+# into their own play with ignore_unreachable, and are otherwise converged
+# identically.
 
 # ============================================================
 # PHASE 1 — Verify: compare installed version against the pin
@@ -16,6 +22,16 @@
   hosts: openclaw
   gather_facts: false
   become: true
+  # A host that cannot be reached here is not marked failed, so it is still
+  # tried in its own convergence play below — where a *required* host failing
+  # is loud, and an optional one is skipped. Suppressing it here loses nothing.
+  #
+  # It does NOT skip the rest of this play for that host, though: the two tasks
+  # below read `openclaw_installed_version`, which on an unreachable host is a
+  # dict with no `.rc`/`.stdout`. Both are therefore guarded, leaving
+  # openclaw_update_required undefined — which the convergence plays read as
+  # `| default(true)`.
+  ignore_unreachable: true
 
   tasks:
     - name: Check installed openclaw CLI version
@@ -29,6 +45,7 @@
         openclaw_update_required: >-
           {{ openclaw_installed_version.rc != 0 or
              openclaw_version not in openclaw_installed_version.stdout }}
+      when: not (openclaw_installed_version.unreachable | default(false))
 
     - name: Report current state
       ansible.builtin.debug:
@@ -36,6 +53,14 @@
           {{ inventory_hostname }}:
           {{ openclaw_installed_version.stdout | default('not installed') }}
           -> update {{ 'required' if openclaw_update_required else 'not required' }}
+      when: not (openclaw_installed_version.unreachable | default(false))
+
+    - name: Report an unreachable host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is unreachable — assuming an update is
+          required; its convergence play decides whether that is a failure.
+      when: openclaw_installed_version.unreachable | default(false)
 
 # ============================================================
 # PHASE 2 — Gateway first
@@ -47,9 +72,12 @@
   gather_facts: true
 
   tasks:
+    # default(true) covers a host that was unreachable in Phase 1: assume it
+    # needs updating rather than silently treating an undefined fact as
+    # "converged".
     - name: Skip — gateway already at the pinned version
       ansible.builtin.meta: end_host
-      when: not openclaw_update_required
+      when: not (openclaw_update_required | default(true))
 
     - name: Converge gateway to the pinned version
       ansible.builtin.include_role:
@@ -59,33 +87,44 @@
 # PHASE 3 — Nodes, serialized, gateway already verified healthy
 # ============================================================
 - name: Update nodes
-  hosts: openclaw_nodes
+  hosts: openclaw_nodes:!openclaw_optional
   serial: 1
   become: true
   gather_facts: false
 
   tasks:
-    - name: Skip — node already at the pinned version
-      ansible.builtin.meta: end_host
-      when: not openclaw_update_required
+    - name: Converge this node unless it is already at the pin
+      ansible.builtin.include_tasks: tasks/converge-openclaw-node.yml
+      when: openclaw_update_required | default(true)
 
-    - name: Converge node to the pinned version
-      ansible.builtin.include_role:
-        name: openclaw.node.node
+# ============================================================
+# PHASE 4 — Intermittently-powered nodes; offline is a skip, not a failure
+# ============================================================
+- name: Update intermittently-powered nodes
+  hosts: openclaw_optional
+  serial: 1
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
 
-    - name: Flush handlers so the health check reflects the current unit
-      ansible.builtin.meta: flush_handlers
-
-    - name: Health-gate — openclaw-node must be active before moving to the next host
-      ansible.builtin.command: systemctl is-active openclaw-node
-      register: openclaw_node_active
+  tasks:
+    # ignore_unreachable keeps a powered-off host out of the failed list but
+    # does not stop it entering the tasks below, so gate on an explicit probe
+    # rather than letting the role fail task by task.
+    - name: Probe reachability — this host is allowed to be powered off
+      ansible.builtin.ping:
+      register: openclaw_optional_probe
       changed_when: false
-      until: openclaw_node_active.stdout == "active"
-      retries: 6
-      delay: 5
 
-    - name: Health-gate — installed version must match the pin
-      ansible.builtin.command: openclaw --version
-      register: openclaw_node_version_check
-      changed_when: false
-      failed_when: openclaw_version not in openclaw_node_version_check.stdout
+    - name: Report a powered-off optional host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is unreachable — expected for an
+          [openclaw_optional] host; it converges on the next run while up.
+      when: openclaw_optional_probe.unreachable | default(false)
+
+    - name: Converge this node unless it is already at the pin
+      ansible.builtin.include_tasks: tasks/converge-openclaw-node.yml
+      when:
+        - not (openclaw_optional_probe.unreachable | default(false))
+        - openclaw_update_required | default(true)

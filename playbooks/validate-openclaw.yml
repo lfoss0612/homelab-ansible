@@ -10,6 +10,13 @@
 # it or targets it for change — the last play below only reads and prints
 # its state, for visibility that it hasn't silently dropped off.
 #
+# [openclaw_optional] hosts are managed, but are legitimately powered off part
+# of the time. They are asserted against exactly like any other node WHEN they
+# are up, and skipped when they are not: unreachable is tolerated, and they are
+# subtracted from the connected+paired assertion (an off host is not a fault).
+# This play is a health gate for the weekly timer, so "a desktop is switched
+# off" must never make it red.
+#
 # `nodes status --json` schema, captured from a real 2026.7.1-2 gateway on
 # 2026-08-01 (it was previously inferred from prose, which is what made the
 # connected+paired check fail with "object of type 'str' has no attribute
@@ -28,7 +35,7 @@
 # than comparing raw counts, which would never match.
 
 - name: Validate OpenClaw version pin fleet-wide
-  hosts: openclaw
+  hosts: openclaw:!openclaw_optional
   gather_facts: false
   become: true
 
@@ -46,6 +53,49 @@
           {{ inventory_hostname }} is at '{{ openclaw_validate_version.stdout }}',
           expected '{{ openclaw_version }}'.
         success_msg: "{{ inventory_hostname }} is at the pinned version."
+
+- name: Validate OpenClaw version pin on intermittently-powered hosts
+  # Same assertion, but reaching the host is not itself required. If it answers
+  # it must be at the pin; if it is switched off the play moves on.
+  #
+  # `ignore_unreachable` on its own is NOT enough: it keeps the host out of the
+  # failed list, but the host still runs every later task in the play, and the
+  # first one that reads a registered result from the task that never ran dies
+  # with "object of type 'dict' has no attribute 'stdout'". Hence the explicit
+  # probe below, whose result gates the real work.
+  hosts: openclaw_optional
+  gather_facts: false
+  become: true
+  ignore_unreachable: true
+
+  tasks:
+    - name: Probe reachability — this host is allowed to be powered off
+      ansible.builtin.ping:
+      register: openclaw_optional_probe
+      changed_when: false
+
+    - name: Report a powered-off optional host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is unreachable — expected for an
+          [openclaw_optional] host; skipping its checks, not failing.
+      when: openclaw_optional_probe.unreachable | default(false)
+
+    - name: Check installed openclaw CLI version
+      ansible.builtin.command: openclaw --version
+      register: openclaw_validate_version
+      changed_when: false
+      when: not (openclaw_optional_probe.unreachable | default(false))
+
+    - name: Assert installed version matches the pin
+      ansible.builtin.assert:
+        that:
+          - openclaw_version in openclaw_validate_version.stdout
+        fail_msg: >-
+          {{ inventory_hostname }} is at '{{ openclaw_validate_version.stdout }}',
+          expected '{{ openclaw_version }}'.
+        success_msg: "{{ inventory_hostname }} is at the pinned version."
+      when: not (openclaw_optional_probe.unreachable | default(false))
 
 - name: Validate the gateway service, its own node, and fleet-wide pairing
   hosts: openclaw_gateway
@@ -106,21 +156,28 @@
       ansible.builtin.set_fact:
         openclaw_nodes_status: "{{ openclaw_nodes_status_raw.stdout | from_json }}"
 
+    # openclaw_optional hosts are subtracted from the *required* set: a
+    # switched-off desktop is absent from the gateway's connected list by
+    # design, and gating the whole fleet's health on it would make this play
+    # permanently red. They are reported below instead.
     - name: Identify connected+paired nodes and any managed host missing from them
       ansible.builtin.set_fact:
+        openclaw_nodes_required: >-
+          {{ groups['openclaw_nodes'] | difference(groups['openclaw_optional'] | default([])) }}
         openclaw_nodes_connected_paired: >-
           {{ openclaw_nodes_status.nodes
              | selectattr('connected', 'equalto', true)
              | selectattr('paired', 'equalto', true)
              | map(attribute='displayName') | list }}
-        openclaw_nodes_missing: >-
-          {{ groups['openclaw_nodes'] | difference(
-               openclaw_nodes_status.nodes
-               | selectattr('connected', 'equalto', true)
-               | selectattr('paired', 'equalto', true)
-               | map(attribute='displayName') | list) }}
 
-    - name: Assert every managed node is connected and paired
+    - name: Identify required nodes that are not connected+paired
+      ansible.builtin.set_fact:
+        openclaw_nodes_missing: >-
+          {{ openclaw_nodes_required | difference(openclaw_nodes_connected_paired) }}
+        openclaw_optional_offline: >-
+          {{ (groups['openclaw_optional'] | default([])) | difference(openclaw_nodes_connected_paired) }}
+
+    - name: Assert every required node is connected and paired
       ansible.builtin.assert:
         that:
           - openclaw_nodes_missing | length == 0
@@ -130,7 +187,15 @@
           ({{ openclaw_nodes_connected_paired | length }} connected+paired, including
           any non-inventory device).
         success_msg: >-
-          All {{ groups['openclaw_nodes'] | length }} managed nodes are connected and paired.
+          All {{ openclaw_nodes_required | length }} required nodes are connected and paired.
+
+    - name: Report intermittently-powered nodes that are currently offline
+      ansible.builtin.debug:
+        msg: >-
+          Offline optional node(s): {{ openclaw_optional_offline | join(', ') }}
+          — expected if powered down; they converge on the next run while up.
+          Not asserted against.
+      when: openclaw_optional_offline | length > 0
 
     # Reported, not asserted: re-approval is a human decision (it grants newly
     # declared capabilities), so a node awaiting it is not a failure this play

@@ -1,0 +1,50 @@
+#!/bin/sh
+# Rendered by playbooks/bootstrap/bootstrap-vm-guest-agent.yml and executed
+# INSIDE the guest via `qm guest exec`. It exists only to get a host to the
+# point where normal SSH-based Ansible works; everything after that belongs in
+# a real playbook. Keep it POSIX sh and idempotent — it may be re-run.
+set -eu
+
+export DEBIAN_FRONTEND=noninteractive
+
+PUBKEY='{{ bootstrap_ansible_pubkey }}'
+USER_NAME='{{ bootstrap_ansible_user }}'
+
+echo "== packages =="
+apt-get update
+# openssh-server: the whole point. python3: Ansible's interpreter. acl: needed
+# for become-to-unprivileged-user file handoff (see bootstrap/install-acl.yml).
+# gnupg/ca-certificates: needed by nodesource-repo.yml immediately afterwards.
+apt-get install -y openssh-server sudo python3 acl gnupg ca-certificates
+
+echo "== sshd =="
+systemctl enable --now ssh
+
+echo "== ${USER_NAME} user =="
+if ! id -u "${USER_NAME}" >/dev/null 2>&1; then
+    useradd --create-home --shell /bin/bash "${USER_NAME}"
+fi
+# No password login, key only — same posture as playbooks/users/ansible-user.yml.
+passwd -l "${USER_NAME}" >/dev/null
+
+install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "/home/${USER_NAME}/.ssh"
+install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "/home/${USER_NAME}/.ansible/tmp"
+
+AUTH="/home/${USER_NAME}/.ssh/authorized_keys"
+touch "${AUTH}"
+if ! grep -qxF "${PUBKEY}" "${AUTH}"; then
+    printf '%s\n' "${PUBKEY}" >> "${AUTH}"
+fi
+chown "${USER_NAME}:${USER_NAME}" "${AUTH}"
+chmod 0600 "${AUTH}"
+
+echo "== sudoers =="
+# Validate on a temp file before moving into place: a malformed sudoers file
+# locks every user out of sudo.
+TMP_SUDOERS="/etc/sudoers.d/.${USER_NAME}.bootstrap"
+printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${USER_NAME}" > "${TMP_SUDOERS}"
+visudo -cf "${TMP_SUDOERS}"
+mv "${TMP_SUDOERS}" "/etc/sudoers.d/${USER_NAME}"
+chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
+echo "BOOTSTRAP_OK $(hostname) $(sshd -V 2>&1 | head -1 || true)"

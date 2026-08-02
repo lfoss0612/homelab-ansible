@@ -1,0 +1,116 @@
+---
+# Configure the NodeSource 22.x apt repository.
+#
+# Closes a real gap: openclaw.node.common raises Node.js to
+# openclaw_node_min_version with `apt: name=nodejs state=latest`, but explicitly
+# does not touch nodesource.sources — it assumes the repo is already there,
+# which was true only because it had been configured by hand on the original
+# fleet. On a fresh Debian 13 host the candidate is nodejs 20.19, below the
+# floor, so `common` would "succeed" while leaving the host unable to run the
+# pinned openclaw. Run this once on any new or rebuilt host before
+# deploy-openclaw.yml.
+#
+# Idempotent and safe fleet-wide: it reproduces exactly the layout the existing
+# hosts already have (armored key dearmored to /usr/share/keyrings/nodesource.gpg,
+# deb822 source pinned to the `nodistro` suite), so converged hosts report no
+# change.
+#
+# Usage:
+#   ansible-playbook playbooks/bootstrap/nodesource-repo.yml --limit desktop.home.lan --check --diff
+#   ansible-playbook playbooks/bootstrap/nodesource-repo.yml --limit desktop.home.lan
+
+- name: Configure the NodeSource apt repository
+  hosts: openclaw
+  become: true
+
+  vars:
+    nodesource_major: 22
+    nodesource_keyring: /usr/share/keyrings/nodesource.gpg
+    nodesource_key_url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+
+  tasks:
+    - name: Skip non-Debian-family hosts
+      ansible.builtin.meta: end_host
+      when: ansible_facts.os_family != 'Debian'
+
+    - name: Install prerequisites for apt key handling
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Check whether the NodeSource keyring already exists
+      ansible.builtin.stat:
+        path: "{{ nodesource_keyring }}"
+      register: nodesource_keyring_stat
+
+    - name: Fetch the NodeSource signing key
+      ansible.builtin.get_url:
+        url: "{{ nodesource_key_url }}"
+        dest: /tmp/nodesource-repo.gpg.key
+        mode: "0644"
+      when: not nodesource_keyring_stat.stat.exists
+
+    # Dearmor to a binary keyring rather than dropping the ASCII key inline in
+    # the .sources file: that is the layout every already-converged host has,
+    # and matching it is what keeps this play a no-op on them.
+    - name: Dearmor the signing key into the keyring
+      ansible.builtin.command:
+        cmd: "gpg --batch --yes --dearmor -o {{ nodesource_keyring }} /tmp/nodesource-repo.gpg.key"
+        creates: "{{ nodesource_keyring }}"
+      when: not nodesource_keyring_stat.stat.exists
+
+    - name: Ensure keyring permissions
+      ansible.builtin.file:
+        path: "{{ nodesource_keyring }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove the downloaded armored key
+      ansible.builtin.file:
+        path: /tmp/nodesource-repo.gpg.key
+        state: absent
+
+    # `nodistro` is not a typo — NodeSource publishes a single distribution-
+    # agnostic suite, so this same source is correct on trixie and on the
+    # Ubuntu hosts.
+    - name: Configure the NodeSource deb822 source
+      ansible.builtin.deb822_repository:
+        name: nodesource
+        types: deb
+        uris: "https://deb.nodesource.com/node_{{ nodesource_major }}.x"
+        suites: nodistro
+        components: main
+        architectures: amd64
+        signed_by: "{{ nodesource_keyring }}"
+        state: present
+        enabled: true
+      register: nodesource_repo
+
+    - name: Update apt cache after a repository change
+      ansible.builtin.apt:
+        update_cache: true
+      when: nodesource_repo.changed
+
+    - name: Read the nodejs candidate version
+      ansible.builtin.command: apt-cache policy nodejs
+      register: nodesource_policy
+      changed_when: false
+
+    - name: Assert the candidate now satisfies the OpenClaw Node.js floor
+      ansible.builtin.assert:
+        that:
+          - nodesource_candidate is version(openclaw_node_min_version, '>=')
+        fail_msg: >-
+          nodejs candidate is '{{ nodesource_candidate }}', below the
+          openclaw_node_min_version floor of {{ openclaw_node_min_version }}.
+          The NodeSource repo is not being used — check apt-cache policy nodejs.
+        success_msg: "nodejs candidate {{ nodesource_candidate }} satisfies the {{ openclaw_node_min_version }} floor."
+      vars:
+        nodesource_candidate: >-
+          {{ (nodesource_policy.stdout | regex_search('Candidate:\s*(\S+)', '\1') | first)
+             | regex_replace('^([0-9]+\.[0-9]+\.[0-9]+).*$', '\1') }}

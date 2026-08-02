@@ -5,6 +5,13 @@ Documentation=file://{{ openclaw_control_dir }}/docs/execution-model.md
 Wants=network-online.target
 After=network-online.target
 
+# Both outcomes are reported, not just failures — the trapper value is 1 on
+# failure and 0 on success, so an alert clears itself on the next good run.
+# Without this the only trace of a failed run was a journal entry and a
+# last-success file that quietly stopped advancing.
+OnFailure={{ openclaw_control_notify_unit }}@failed.service
+OnSuccess={{ openclaw_control_notify_unit }}@ok.service
+
 [Service]
 Type=oneshot
 

@@ -6,16 +6,17 @@ workstation, since cockpit has no push credentials.
 
 ## Topology
 
-13 inventory hosts total (`inventory.ini`):
+14 inventory hosts total (`inventory.ini`):
 
 - **`proxmox_hosts`** — `pve`, `pve-ai`, `pve-router` (three hypervisors).
-- **`vms`** — `omv`, `zabbix`, `cockpit`, `pbs`, `pdm`, `vscode`, `openclaw` (the gateway VM).
+- **`vms`** — `omv`, `zabbix`, `cockpit`, `pbs`, `pdm`, `vscode`, `openclaw` (the gateway
+  VM), `desktop`.
 - **`k8s_master` / `k8s_workers`** (parent group `k8s`) — `k8s-master`, `k8s-worker`,
   `k8s-worker-2`.
 
 ### OpenClaw fleet
 
-`openclaw_nodes` = `openclaw_proxmox` (`pve`, `pve-ai` only) + `vms` + `k8s` — **12 hosts**.
+`openclaw_nodes` = `openclaw_proxmox` (`pve`, `pve-ai` only) + `vms` + `k8s` — **13 hosts**.
 `openclaw.home.lan` (the gateway) is a deliberate member: it runs both
 `openclaw-gateway.service` and `openclaw-node.service`, managing its own VM as well as
 brokering the rest of the fleet.
@@ -24,6 +25,29 @@ brokering the rest of the fleet.
 independently-managed OpenClaw node (`openclaw-node.service`, registered with the gateway)
 that this repo does not touch — decommissioning it is a separate, unscheduled task. Omission
 from the group is what protects it; no play in this repo should ever target it by name.
+
+**`openclaw_optional`** (currently just `desktop`) is a behavioural overlay on top of the
+topology groups, not a separate tier: those hosts are full `openclaw_nodes` and are
+converged identically, but they are legitimately powered off part of the time, so no play
+may treat *unreachable* as a failure for them. `deploy-openclaw.yml`,
+`update-openclaw.yml` and `validate-openclaw.yml` therefore run their strict pass over
+`openclaw_nodes:!openclaw_optional` and pick these hosts up in a second play with
+`ignore_unreachable: true`; `validate-openclaw.yml` also subtracts them from its
+connected+paired assertion and reports them instead. Without this the weekly
+`openclaw-fleet-update` timer would go red every time a desktop was switched off.
+
+### Hosts Ansible does not manage
+
+**`haos`** (VMID 112 on `pve`, `10.10.5.3`) runs **Home Assistant OS 18.0**, an immutable
+appliance image: no apt, read-only `/usr`, no persistent `useradd`, nowhere to install a
+systemd unit, and no sshd on either 22 or the 22222 debug port. It can never be an
+Ansible-managed OpenClaw node, and it is deliberately **absent from `inventory.ini`** —
+listing it would add nothing but an unreachable host to every `hosts: all` play. The only
+viable route to an OpenClaw presence there is a Home Assistant add-on (a container managed
+by the HA supervisor), which is outside this repo's write plane. `inventory.ini` carries a
+comment where it would otherwise go, and
+`playbooks/bootstrap/bootstrap-vm-guest-agent.yml` refuses any guest whose agent reports
+an OS id outside `debian`/`ubuntu` — HAOS reports `haos`.
 
 Roles live in `collections/ansible_collections/openclaw/node/roles/`:
 
@@ -35,8 +59,9 @@ Roles live in `collections/ansible_collections/openclaw/node/roles/`:
 - **`node`** — installs `common`, templates `/etc/default/openclaw-node` (gateway token +
   `OPENCLAW_ALLOW_INSECURE_PRIVATE_WS`) and `openclaw-node.service`.
 - **`control`** — control-node only (group `openclaw_control` = cockpit): installs the
-  weekly `openclaw-fleet-update` script/service/timer, repairs `/opt/ansible` so the
-  `ansible` user can `git pull` unattended, and removes the legacy `openclaw-sync` units.
+  weekly `openclaw-fleet-update` script/service/timer plus its `OnFailure`/`OnSuccess`
+  notifier, repairs `/opt/ansible` so the `ansible` user can `git pull` unattended, and
+  removes the legacy `openclaw-sync` units.
 
 The CLI is npm-installed fleet-wide; there is no more per-host source build or
 `releases/current/shared` directory tree.
@@ -54,15 +79,17 @@ root-equivalent sudo on all 12 hosts, how the roles revoke it, and the unattende
 
 | File | Purpose |
 |---|---|
-| `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then all of `openclaw_nodes` in full — no gateway subtraction, since the gateway is deliberately a node too. |
-| `playbooks/update-openclaw.yml` | Fleet convergence: verify-before-mutate (compares `openclaw --version` against the `openclaw_version` pin, not a build hash — there's no build any more), gateway first, nodes serialized with a per-host health gate, `end_host` wherever a host is already converged. |
-| `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean. `pve-router` is report-only — printed, never asserted against, never targeted. |
+| `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then all of `openclaw_nodes` in full — no gateway subtraction, since the gateway is deliberately a node too. `openclaw_optional` hosts get the same role in a trailing `ignore_unreachable` play. |
+| `playbooks/update-openclaw.yml` | Fleet convergence: verify-before-mutate (compares `openclaw --version` against the `openclaw_version` pin, not a build hash — there's no build any more), gateway first, nodes serialized with a per-host health gate, skipping any host already converged. Phase 4 repeats phase 3 for `openclaw_optional`; both share `playbooks/tasks/converge-openclaw-node.yml`. |
+| `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean. `pve-router` is report-only — printed, never asserted against, never targeted. `openclaw_optional` hosts are asserted when up and reported when off. |
 | `playbooks/approve-openclaw-nodes.yml` | Explicit-invocation-only: auto-approves pending node pairing requests whose display name matches an inventory host; dry-run unless `-e openclaw_approve_confirm=true`. |
 | `playbooks/decommission-openclaw-node.yml` | Tears down a single node (`-e target_host=<host>`), parameterised, no group target. Refuses the gateway host outright — its `/opt/openclaw` is the source-tree fallback, not a node install. |
 | `playbooks/openclaw-automation.yml` | Installs the weekly `openclaw-fleet-update` timer on the control node and retires the legacy self-updaters (cockpit's `openclaw-sync` units, the gateway's archived `openclaw-update` files). Installs automation only — it changes no OpenClaw install itself. |
 | `playbooks/show-openclaw-version.yml` | Prints the resolved `openclaw_version`. |
 | `playbooks/users/*.yml` | Per-account provisioning: `ansible-user.yml`, `claude-user.yml` (see `docs/claude-access.md`), `lfoss-user.yml`, `disable-requiretty.yml`. |
 | `playbooks/bootstrap/install-acl.yml` | ACL package bootstrap. |
+| `playbooks/bootstrap/bootstrap-vm-guest-agent.yml` | Brings a Proxmox guest that has **no sshd at all** to the point where normal SSH-based Ansible works, by running against the *hypervisor* and pushing a rendered script in through the QEMU guest agent (`-e bootstrap_vmid=<id>`). Also sets `onboot 1`. Refuses non-Debian-family guests. |
+| `playbooks/bootstrap/nodesource-repo.yml` | Configures the NodeSource 22.x apt repo and asserts the `nodejs` candidate clears `openclaw_node_min_version`. Idempotent fleet-wide; required on any new host before `deploy-openclaw.yml`. |
 
 The `nodes status --json` and `doctor --lint --json` schemas used by
 `validate-openclaw.yml` are captured from live `2026.7.1-2` output (2026-08-01) and
@@ -84,6 +111,67 @@ systemctl list-timers openclaw-fleet-update.timer
 systemctl start openclaw-fleet-update.service     # run it now, out of schedule
 journalctl -u openclaw-fleet-update.service -n 200
 cat /var/lib/openclaw-fleet-update/last-success
+cat /var/lib/openclaw-fleet-update/last-failure    # absent while the last run was green
+```
+
+### Outcome notification
+
+The timer used to announce a failure to nobody. On **2026-08-02 03:46** the first
+real scheduled run died in `git pull` (root-owned objects under `/opt/ansible/.git`
+that the `ansible` user could not write), the fleet was neither converged nor
+validated that week, and the only evidence was a journal entry plus a `last-success`
+file that quietly stopped advancing — by the time it was found, systemd had lost even
+the failed state. That is the same class of self-masking failure the old
+`openclaw-sync.sh` had.
+
+`openclaw-fleet-update.service` now carries both hooks, pointing at one instantiated
+unit whose instance name is the outcome:
+
+```ini
+OnFailure=openclaw-fleet-update-notify@failed.service
+OnSuccess=openclaw-fleet-update-notify@ok.service
+```
+
+`openclaw-fleet-update-notify` (root, so it can read the failing unit's journal) then:
+
+1. **Always** writes `/var/lib/openclaw-fleet-update/last-failure` on a failure —
+   timestamp, unit result, exit status, checkout commit and the last 40 journal lines.
+   The durable, greppable counterpart to `last-success`: if that has stopped advancing,
+   this says why, without needing journal access.
+2. Pushes to a **Zabbix trapper** item — `1` on failure, `0` on success, so a trigger
+   raises *and clears itself* on the next good run.
+3. POSTs to a **generic webhook** if `openclaw_control_notify_webhook` is set
+   (ntfy/Gotify/Home Assistant/Discord). Empty by default.
+
+Every channel is independent and best-effort, and the script never exits non-zero: a
+notifier that failed loudly would mark its own unit failed while the real failure went
+unmentioned, and there is nothing left to notify with about a broken notifier. Problems
+go to the journal under `SyslogIdentifier=openclaw-fleet-update-notify`.
+
+Email is deliberately not a channel: cockpit's postfix has no `relayhost` and
+`myhostname=cockpit.localdomain`, so mail reaches a local mailbox nobody reads.
+
+**One manual step remains — the Zabbix item does not exist yet.** The transport is
+already working (the agent is active, `Server=10.0.5.9`, and the server recognises host
+`cockpit.home.lan`), but with no matching item the server accepts each value and
+discards it, logging `processed: 0; failed: 1`, which the script reports as a WARNING.
+Create on Zabbix host **`cockpit.home.lan`**:
+
+| | |
+|---|---|
+| Item | Type **Zabbix trapper**, key `openclaw.fleet.update`, type of information **Numeric (unsigned)** |
+| Trigger — run failed | `last(/cockpit.home.lan/openclaw.fleet.update)=1` |
+| Trigger — runs stopped | `nodata(/cockpit.home.lan/openclaw.fleet.update,10d)=1` |
+
+The second trigger is the one that would have caught 2026-08-02: a timer that stops
+firing altogether sends nothing at all, so only a nodata check notices. 10d spans the
+weekly schedule plus its randomized delay.
+
+Test either path without waiting for Sunday:
+
+```bash
+systemctl start openclaw-fleet-update-notify@failed.service
+journalctl -t openclaw-fleet-update-notify -n 20
 ```
 
 ## Bumping the OpenClaw version
@@ -97,14 +185,32 @@ The version is pinned by a human commit, not derived at runtime:
    `openclaw-fleet-update` timer to pick the commit up — `common`'s install task no-ops
    on any host already at that version.
 
-## Rebuilding a host
+## Adding or rebuilding a host
 
-The install is npm-owned and stateless on disk (no release tree to reconcile), so
-rebuilding a node is: ensure the host is in `openclaw_nodes`, then run
-`playbooks/deploy-openclaw.yml --limit <host>`. `common` handles the Node.js floor, user/
-group, CLI-path collisions, and the npm install idempotently. The gateway additionally
-needs its `.openclaw` state directory restored from `/var/backups/openclaw-state-*.tar.gz`
-if this is a disaster rebuild rather than a routine reprovision.
+The install is npm-owned and stateless on disk (no release tree to reconcile), so onboarding
+a node is:
+
+1. **Reachability.** The host needs sshd, python3 and the `ansible` user with
+   `keys/ansible.pub`. On a host that already has sshd, that is
+   `playbooks/users/ansible-user.yml`. On one that does not — a fresh desktop install, say —
+   use `playbooks/bootstrap/bootstrap-vm-guest-agent.yml -e bootstrap_vmid=<id>`, which
+   goes in through the Proxmox guest agent instead of SSH.
+2. **Node.js source.** `playbooks/bootstrap/nodesource-repo.yml --limit <host>`. Do not skip
+   this: `common` raises Node.js with `apt name=nodejs state=latest` but deliberately does
+   not configure the repo, and Debian 13's own candidate (20.19) is *below*
+   `openclaw_node_min_version`, so `common` would appear to succeed on a host that cannot
+   run the pinned CLI.
+3. **Inventory.** Add it to the relevant topology group (`vms`, `k8s_workers`, …) so it
+   lands in `openclaw_nodes`; add it to `openclaw_optional` as well if it is not expected
+   to be powered on continuously.
+4. **Deploy.** `playbooks/deploy-openclaw.yml --limit <host>`. `common` handles the Node.js
+   floor, user/group, CLI-path collisions, and the npm install idempotently.
+5. **Approve the pairing** once the node registers:
+   `playbooks/approve-openclaw-nodes.yml -e openclaw_approve_confirm=true`.
+
+The gateway additionally needs its `.openclaw` state directory restored from
+`/var/backups/openclaw-state-*.tar.gz` if this is a disaster rebuild rather than a routine
+reprovision.
 
 ## Vault
 
