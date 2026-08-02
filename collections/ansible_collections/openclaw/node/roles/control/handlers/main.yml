@@ -3,7 +3,11 @@
   ansible.builtin.systemd:
     daemon_reload: true
 
+# Skipped under --check: the unit file was not actually written, so systemd has
+# nothing to restart and the handler fails with "Could not find the requested
+# service" on a first dry run — a check-mode artifact, not a real problem.
 - name: restart openclaw-fleet-update timer
   ansible.builtin.systemd:
     name: "{{ openclaw_control_unit }}.timer"
     state: restarted
+  when: not ansible_check_mode
