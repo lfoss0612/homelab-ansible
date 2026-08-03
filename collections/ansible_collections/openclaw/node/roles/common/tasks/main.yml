@@ -9,12 +9,16 @@
   changed_when: false
   failed_when: false
 
+- name: Normalize installed Node.js version (a missing/broken node reads as 0.0.0)
+  ansible.builtin.set_fact:
+    openclaw_node_installed_version_clean: >-
+      {{ (openclaw_node_installed_version.stdout | trim | regex_replace('^v', ''))
+         if openclaw_node_installed_version.rc == 0 else '0.0.0' }}
+
 - name: Determine whether Node.js needs upgrading
   ansible.builtin.set_fact:
     openclaw_node_needs_upgrade: >-
-      {{ openclaw_node_installed_version.rc != 0 or
-         (openclaw_node_installed_version.stdout | trim | regex_replace('^v', ''))
-           is version(openclaw_node_min_version, '<') }}
+      {{ openclaw_node_installed_version_clean is version(openclaw_node_min_version, '<') }}
 
 # Guard on the installed version, not `creates:` — this must also catch a
 # host that already has an older Node.js from a previous NodeSource install.
