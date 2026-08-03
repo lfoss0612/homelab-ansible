@@ -109,6 +109,15 @@
   when: openclaw_sudo_commands | length > 0
   tags: privileges
 
+- name: Install Home LAN Internal CA
+  ansible.builtin.copy:
+    src: home-lan-ca.crt
+    dest: /usr/local/share/ca-certificates/home-lan-ca.crt
+    owner: root
+    group: root
+    mode: "0644"
+  notify: update ca certificates
+
 - name: Ensure log directory exists
   ansible.builtin.file:
     path: /var/log/openclaw

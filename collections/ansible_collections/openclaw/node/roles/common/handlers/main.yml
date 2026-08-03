@@ -1,4 +1,7 @@
 ---
+- name: update ca certificates
+  ansible.builtin.command: update-ca-certificates
+
 # Supplementary groups are resolved at process start, so a running agent keeps
 # its old set until restarted — without this the journal/adm access silently
 # does not take effect until the next unrelated restart.

@@ -8,6 +8,8 @@ vault_pass.txt
 *.key
 *.crt
 *.p12
+# Public CA cert (no private key), distributed fleet-wide by the common role.
+!collections/ansible_collections/openclaw/node/roles/common/files/home-lan-ca.crt
 *.kubeconfig
 inventory/*/hosts.ini
 inventory/*/group_vars/all/secrets.yml
