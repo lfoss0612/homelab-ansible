@@ -1,2 +1,9 @@
 # Managed by Ansible — openclaw.node.node role
 OPENCLAW_GATEWAY_TOKEN={{ openclaw_gateway_token }}
+
+# Node.js does not consult the system trust store (/etc/ssl/certs) by
+# default — it ships its own bundled CA list. --tls against HAProxy's
+# Home LAN Internal CA cert fails with "self-signed certificate in
+# certificate chain" without this, even after update-ca-certificates has
+# run. Points at the same file the common role installs system-wide.
+NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/home-lan-ca.crt
