@@ -196,13 +196,20 @@
     openclaw_version not in openclaw_cli_version.stdout
 
 # --- DNS resolver assertion -------------------------------------------------
-# Three specific, independently-gated fixes for DNS misconfigurations found
-# by hand on the gateway, pbs, and pve-ai on 2026-08-02 (see
-# docs/execution-model.md and homelab-vault TODO.md) — none of which were
-# git-tracked, so a rebuild of any of those three hosts reintroduced the same
-# breakage. OPNsense/Unbound is already the correct resolver on every VLAN;
-# each fix below just undoes a local override that bypasses it. Each is a
-# no-op (changed=0) on a host that doesn't have the specific problem.
+# Independently-gated fixes for DNS misconfigurations found by hand on the
+# gateway, pbs, and pve-ai on 2026-08-02 (see docs/execution-model.md and
+# homelab-vault TODO.md) — none of which were git-tracked, so a rebuild of
+# any of those hosts reintroduced the same breakage. OPNsense/Unbound is
+# already the correct resolver on every VLAN; each fix below just undoes a
+# local override that bypasses it. Each is a no-op (changed=0) on a host
+# that doesn't have the specific problem.
+#
+# Two of the three original findings are auto-fixed here (immutable
+# resolv.conf, resolved.conf override) and confirmed against the live fleet
+# to only fire on genuine instances — including catching a 4th, previously
+# undocumented case of the resolved.conf override on `pve`. The third
+# (stale /etc/hosts self-reference) is report-only, not auto-removed — see
+# the comment above that task for why.
 #
 # `openclaw_dns_resolver` defaults to this host's own default gateway
 # (common/defaults/main.yml) — OPNsense is the router on every VLAN here, so
@@ -337,8 +344,19 @@
 
 # The gateway case: a stale self-referential /etc/hosts entry (predating a
 # routing change) shadowing what DNS would otherwise correctly resolve.
-# Scoped to lines containing this host's own inventory hostname, so it can't
-# touch unrelated custom entries a host might legitimately have.
+#
+# NOT auto-removed, deliberately — a non-loopback "own IP -> own hostname"
+# line is normal on most hosts (cloud-init/provisioning writes it so a host
+# can resolve its own name before DNS is up), confirmed against the live
+# fleet: `k8s-worker` and `pve` both have exactly this pattern with a
+# correct, current IP, and blindly stripping it would have removed
+# legitimate config on most of the fleet. The gateway's actual bug was
+# narrower — its own node process needed to route to itself *through
+# HAProxy*, and a same-named entry pointing straight at its own LAN IP
+# bypassed that — which isn't reliably distinguishable from the benign case
+# without knowing about that specific routing requirement. So: report only,
+# for a human to judge, same pattern as the "reported, not asserted" doctor
+# findings in validate-openclaw.yml.
 - name: Find non-loopback /etc/hosts entries for this host's own name
   ansible.builtin.shell: >-
     set -o pipefail;
@@ -350,10 +368,13 @@
   check_mode: false
   tags: dns
 
-- name: Remove stale self-referential /etc/hosts entries
-  ansible.builtin.lineinfile:
-    path: /etc/hosts
-    line: "{{ item }}"
-    state: absent
-  loop: "{{ openclaw_hosts_self_ref.stdout_lines | default([]) }}"
+- name: Report a non-loopback /etc/hosts entry for this host's own name
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} has a non-loopback /etc/hosts entry for its own
+      name: {{ openclaw_hosts_self_ref.stdout_lines | join('; ') }}. Usually
+      benign (fast local self-resolution) — only a problem if it's stale or
+      bypasses routing that should go through DNS instead (the gateway's
+      HAProxy migration bug). Not auto-removed; review by hand.
+  when: (openclaw_hosts_self_ref.stdout_lines | default([])) | length > 0
   tags: dns

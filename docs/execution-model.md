@@ -167,8 +167,8 @@ breakage.
 
 ### How it's fixed
 
-Three independently-gated tasks in `common`, each a no-op on a host that
-doesn't have the specific problem:
+Independently-gated tasks in `common`, each a no-op on a host that doesn't
+have the specific problem. Two are auto-fixed; the third is report-only:
 
 - An immutable `resolv.conf` (the `pbs` case) is corrected in place —
   `chattr -i`, rewritten to `nameserver {{ openclaw_dns_resolver }}`,
@@ -179,9 +179,23 @@ doesn't have the specific problem:
   drop-in (the `pve-ai` case) is *removed*, not replaced, so the correct
   per-link DHCP value wins instead of hardcoding a second place the resolver
   IP has to be kept in sync. Only acts when `systemd-resolved.service` is a
-  known service on the host.
+  known service on the host. Confirmed against the live fleet via
+  `--check --diff` before this was ever applied for real — and it caught a
+  **4th, previously undocumented instance on `pve`** (same `DNS=8.8.8.8
+  1.1.1.1` override as `pve-ai`), so this wasn't just re-encoding the three
+  already-known cases.
 - A non-loopback `/etc/hosts` line containing the host's own inventory
-  hostname (the gateway case) is removed. Scoped to the host's own name only.
+  hostname (the gateway case) is **reported, not removed**. The first
+  version of this auto-removed it, but a `--check --diff` run against the
+  live fleet showed that was wrong: `k8s-worker` and `pve` both have exactly
+  this pattern with a correct, current IP — it's normal provisioning output
+  (fast local self-resolution before DNS is up), not a bug. The gateway's
+  actual failure was narrower — its own node process needed to route to
+  itself *through HAProxy*, and a same-named entry pointing straight at its
+  own LAN IP bypassed that — which isn't reliably distinguishable from the
+  benign case without knowing about that specific routing requirement. So
+  this one stays a human judgment call, same as the doctor-warnings pattern
+  in `validate-openclaw.yml`.
 
 `openclaw_dns_resolver` (`common/defaults/main.yml`) defaults to
 `ansible_default_ipv4.gateway` — OPNsense is both router and resolver on
