@@ -239,11 +239,16 @@
   tags: dns
 
 - name: Determine whether an immutable resolv.conf needs correcting
+  # Each clause must itself evaluate to a real boolean before `and`-chaining
+  # them: regex_search() returns None (not False) on no match, and
+  # `None and X` short-circuits to None rather than False. A strict/native
+  # Jinja `when:` rejects a None result outright ("Conditionals must have a
+  # boolean result") — hence `is not none` rather than a bare truthy check.
   ansible.builtin.set_fact:
     openclaw_resolv_conf_needs_fix: >-
-      {{ openclaw_resolv_conf_lsattr.rc == 0 and
-         (openclaw_resolv_conf_lsattr.stdout | regex_search('^\S*i\S* ')) and
-         ('nameserver ' ~ openclaw_dns_resolver) not in (openclaw_resolv_conf_raw.content | b64decode) }}
+      {{ (openclaw_resolv_conf_lsattr.rc == 0) and
+         ((openclaw_resolv_conf_lsattr.stdout | regex_search('^\S*i\S* ')) is not none) and
+         (('nameserver ' ~ openclaw_dns_resolver) not in (openclaw_resolv_conf_raw.content | b64decode)) }}
   tags: dns
 
 - name: Remove immutable attribute before correcting resolv.conf
