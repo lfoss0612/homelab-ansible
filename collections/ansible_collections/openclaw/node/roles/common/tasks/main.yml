@@ -8,6 +8,7 @@
   register: openclaw_node_installed_version
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: Normalize installed Node.js version (a missing/broken node reads as 0.0.0)
   ansible.builtin.set_fact:
@@ -142,6 +143,7 @@
   ansible.builtin.command: npm prefix -g
   register: openclaw_npm_prefix
   changed_when: false
+  check_mode: false
 
 - name: Stat the openclaw CLI path in the npm prefix
   ansible.builtin.stat:
@@ -183,6 +185,7 @@
   register: openclaw_cli_version
   changed_when: false
   failed_when: false
+  check_mode: false
 
 # Postinstall (postinstall-bundled-plugins.mjs) is allowed to run — no
 # --ignore-scripts — it installs the bundled plugins the CLI expects.
