@@ -56,7 +56,7 @@
 
 - name: Collect service facts
   ansible.builtin.service_facts:
-  tags: privileges
+  tags: [privileges, dns]
 
 - name: Grant the openclaw user read-only log access
   ansible.builtin.user:
@@ -194,3 +194,161 @@
   when: >-
     openclaw_cli_version.rc != 0 or
     openclaw_version not in openclaw_cli_version.stdout
+
+# --- DNS resolver assertion -------------------------------------------------
+# Three specific, independently-gated fixes for DNS misconfigurations found
+# by hand on the gateway, pbs, and pve-ai on 2026-08-02 (see
+# docs/execution-model.md and homelab-vault TODO.md) — none of which were
+# git-tracked, so a rebuild of any of those three hosts reintroduced the same
+# breakage. OPNsense/Unbound is already the correct resolver on every VLAN;
+# each fix below just undoes a local override that bypasses it. Each is a
+# no-op (changed=0) on a host that doesn't have the specific problem.
+#
+# `openclaw_dns_resolver` defaults to this host's own default gateway
+# (common/defaults/main.yml) — OPNsense is the router on every VLAN here, so
+# that stays correct without a per-VLAN lookup table.
+#
+# The `include_role` for this role is tagged `[privileges, dns]` in both the
+# node and gateway roles — same gotcha as `privileges`: with a dynamic
+# include, --tags is matched against the include first, so a task tagged
+# `dns` here is unreachable unless the include itself also carries that tag.
+
+- name: Gather network facts for DNS assertion, if not already present
+  ansible.builtin.setup:
+    gather_subset: network
+  when: ansible_default_ipv4 is not defined
+  tags: dns
+
+# The pbs case: a static resolv.conf, deliberately made immutable so nothing
+# (including DHCP) can silently overwrite it, but pointed at the wrong IP.
+# Non-immutable hosts are left alone — those are NetworkManager/resolvconf
+# managed and already track DHCP-learned per-link DNS correctly as long as
+# nothing else overrides it (handled below).
+- name: Check for an immutable /etc/resolv.conf
+  ansible.builtin.command: lsattr -d /etc/resolv.conf
+  register: openclaw_resolv_conf_lsattr
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: dns
+
+- name: Read current /etc/resolv.conf
+  ansible.builtin.slurp:
+    path: /etc/resolv.conf
+  register: openclaw_resolv_conf_raw
+  tags: dns
+
+- name: Determine whether an immutable resolv.conf needs correcting
+  ansible.builtin.set_fact:
+    openclaw_resolv_conf_needs_fix: >-
+      {{ openclaw_resolv_conf_lsattr.rc == 0 and
+         (openclaw_resolv_conf_lsattr.stdout | regex_search('^\S*i\S* ')) and
+         ('nameserver ' ~ openclaw_dns_resolver) not in (openclaw_resolv_conf_raw.content | b64decode) }}
+  tags: dns
+
+- name: Remove immutable attribute before correcting resolv.conf
+  ansible.builtin.command: chattr -i /etc/resolv.conf
+  when: openclaw_resolv_conf_needs_fix
+  tags: dns
+
+- name: Correct an immutable resolv.conf to point at the OPNsense resolver
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    content: |
+      search home.lan
+      nameserver {{ openclaw_dns_resolver }}
+    owner: root
+    group: root
+    mode: "0644"
+  when: openclaw_resolv_conf_needs_fix
+  tags: dns
+
+- name: Restore the immutable attribute on resolv.conf
+  ansible.builtin.command: chattr +i /etc/resolv.conf
+  when: openclaw_resolv_conf_needs_fix
+  tags: dns
+
+# The pve-ai case: a correct per-link DHCP-provided DNS= config, shadowed by
+# a global override in resolved.conf (or a drop-in) pointing somewhere else.
+# Removing the override — not replacing it — is deliberate: it lets the
+# correct per-link value win instead of hardcoding a second place the
+# resolver IP has to be kept in sync.
+- name: Look for a global DNS override in resolved.conf
+  ansible.builtin.command: grep -E '^DNS=' /etc/systemd/resolved.conf
+  register: openclaw_resolved_conf_dns
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: "'systemd-resolved.service' in ansible_facts.services"
+  tags: dns
+
+- name: Remove a global DNS override that isn't the OPNsense resolver
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/resolved.conf
+    regexp: '^DNS='
+    state: absent
+  when:
+    - "'systemd-resolved.service' in ansible_facts.services"
+    - openclaw_resolved_conf_dns.rc == 0
+    - openclaw_dns_resolver not in openclaw_resolved_conf_dns.stdout
+  notify: restart systemd-resolved
+  tags: dns
+
+- name: Find systemd-resolved drop-ins
+  ansible.builtin.find:
+    paths: /etc/systemd/resolved.conf.d
+    patterns: "*.conf"
+  register: openclaw_resolved_dropins
+  when: "'systemd-resolved.service' in ansible_facts.services"
+  tags: dns
+
+- name: Check each drop-in for a DNS override
+  ansible.builtin.command: grep -E '^DNS=' {{ item.path }}
+  loop: "{{ openclaw_resolved_dropins.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: openclaw_resolved_dropin_dns
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: "'systemd-resolved.service' in ansible_facts.services"
+  tags: dns
+
+- name: Remove a drop-in DNS override that isn't the OPNsense resolver
+  ansible.builtin.lineinfile:
+    path: "{{ item.item.path }}"
+    regexp: '^DNS='
+    state: absent
+  loop: "{{ openclaw_resolved_dropin_dns.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path | default('n/a') }}"
+  when:
+    - "'systemd-resolved.service' in ansible_facts.services"
+    - item.rc is defined
+    - item.rc == 0
+    - openclaw_dns_resolver not in item.stdout
+  notify: restart systemd-resolved
+  tags: dns
+
+# The gateway case: a stale self-referential /etc/hosts entry (predating a
+# routing change) shadowing what DNS would otherwise correctly resolve.
+# Scoped to lines containing this host's own inventory hostname, so it can't
+# touch unrelated custom entries a host might legitimately have.
+- name: Find non-loopback /etc/hosts entries for this host's own name
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    grep -E '^[0-9]' /etc/hosts | grep -vE '^127\.' | grep -w '{{ inventory_hostname }}' || true
+  args:
+    executable: /bin/bash
+  register: openclaw_hosts_self_ref
+  changed_when: false
+  check_mode: false
+  tags: dns
+
+- name: Remove stale self-referential /etc/hosts entries
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ item }}"
+    state: absent
+  loop: "{{ openclaw_hosts_self_ref.stdout_lines | default([]) }}"
+  tags: dns

@@ -141,6 +141,84 @@ real log line from a unit the agent does **not** own. All 12 hosts satisfied thi
 `pve-router` is not in `openclaw_nodes`, so its own `openclaw` user keeps whatever grant it
 has. That host is independently managed and deliberately out of scope.
 
+## DNS resolver assertion
+
+Added 2026-08-03, same `common` role, same `--tags` mechanism as `privileges`
+above — added here rather than as its own doc because the split (`privileges`
+tags gate root-adjacent changes, `dns` tags gate resolver changes) follows the
+exact same pattern.
+
+### What was found
+
+`homelab-vault` `TODO.md` (2026-08-02) records three DNS misconfigurations
+found by hand while debugging node reconnection after the HAProxy migration,
+none of them git-tracked:
+
+| Host | Problem |
+|---|---|
+| gateway | Stale self-referential `/etc/hosts` entry (`10.0.5.7 openclaw.home.lan`, predating the HAProxy migration), causing the gateway's own node instance to try connecting to itself on `:443` instead of resolving through Unbound. |
+| `pbs` | Static, `chattr +i`-immutable `/etc/resolv.conf` pointed at `10.0.5.2` (`pve-router`, not a DNS server), with public fallbacks that don't know `.home.lan`. |
+| `pve-ai` | Correct per-link `DNS=10.0.5.1` in `/etc/systemd/network/10-vmbr0.network`, shadowed by a global `DNS=8.8.8.8 1.1.1.1` override in `/etc/systemd/resolved.conf`. |
+
+OPNsense/Unbound was confirmed correct in all three cases — every failure was
+a local override bypassing it, not a bad answer from OPNsense itself. A
+rebuild of any of these three hosts would have reintroduced the exact same
+breakage.
+
+### How it's fixed
+
+Three independently-gated tasks in `common`, each a no-op on a host that
+doesn't have the specific problem:
+
+- An immutable `resolv.conf` (the `pbs` case) is corrected in place —
+  `chattr -i`, rewritten to `nameserver {{ openclaw_dns_resolver }}`,
+  `chattr +i` restored — only when its content doesn't already match. A
+  non-immutable `resolv.conf` is left alone; those track DHCP-learned
+  per-link DNS correctly on their own.
+- A global `DNS=` override in `resolved.conf` or a `resolved.conf.d/*.conf`
+  drop-in (the `pve-ai` case) is *removed*, not replaced, so the correct
+  per-link DHCP value wins instead of hardcoding a second place the resolver
+  IP has to be kept in sync. Only acts when `systemd-resolved.service` is a
+  known service on the host.
+- A non-loopback `/etc/hosts` line containing the host's own inventory
+  hostname (the gateway case) is removed. Scoped to the host's own name only.
+
+`openclaw_dns_resolver` (`common/defaults/main.yml`) defaults to
+`ansible_default_ipv4.gateway` — OPNsense is both router and resolver on
+every VLAN in this network, so the host's own default gateway is a correct,
+subnet-agnostic stand-in for "the right nameserver" with no per-VLAN table to
+maintain.
+
+### Applying it
+
+Same dry-run-first discipline as `privileges`:
+
+```bash
+ansible-playbook playbooks/deploy-openclaw.yml --tags dns --check --diff
+```
+
+Expect `changed` only on hosts that actually have one of the three problems;
+everything else should show `changed=0`.
+
+**Not part of the weekly timer.** Like `privileges`, this only runs inside
+the node/gateway roles, which `update-openclaw.yml` only re-enters via
+`openclaw_update_required` — a host already at the pinned version skips the
+role entirely, `common` included. Once the fleet is converged, a `--tags dns`
+run has to be triggered manually (or added to the timer's playbook list
+separately) to catch a rebuilt or newly-added host.
+
+### Verifying
+
+```bash
+ansible openclaw -m shell -a 'resolvectl status 2>/dev/null | grep "DNS Server" || cat /etc/resolv.conf'
+```
+
+Every host should show the same resolver family it started with (its own
+VLAN's OPNsense IP) — not a public resolver, not a stale LAN IP.
+
+`pve-router` is not in `openclaw_nodes`, so it is not touched by any of this —
+same standing exclusion as `privileges`.
+
 ## The unattended arm of the write plane
 
 Since 2026-08-01 the write plane has an automated arm: `openclaw-fleet-update.timer` on

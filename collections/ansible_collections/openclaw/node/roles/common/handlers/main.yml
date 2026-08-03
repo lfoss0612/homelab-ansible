@@ -22,3 +22,13 @@
     - openclaw-node.service
   when: item in (ansible_facts.services | default({}))
   tags: privileges
+
+# Only notified when a DNS-block task actually edits resolved.conf or a
+# drop-in, and only reachable at all when systemd-resolved.service already
+# exists on the host (see the `when` guards in the dns tasks) — so this never
+# fires on a host that doesn't run it.
+- name: restart systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved.service
+    state: restarted
+  tags: dns

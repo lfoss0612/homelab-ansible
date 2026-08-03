@@ -22,3 +22,11 @@ openclaw_sudo_commands: []
 openclaw_read_groups:
   - systemd-journal
   - adm
+
+# Expected DNS resolver for this host. OPNsense (Unbound) is both the router
+# and the resolver on every VLAN in this network, so the host's own default
+# gateway is a correct, subnet-agnostic proxy for "the right nameserver" —
+# no per-VLAN lookup table to keep in sync, and it self-adjusts if a VLAN's
+# OPNsense IP ever changes. Override per-host/group if a VLAN's resolver and
+# gateway ever diverge.
+openclaw_dns_resolver: "{{ ansible_default_ipv4.gateway }}"

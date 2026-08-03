@@ -11,16 +11,16 @@
       - openclaw_version != "latest"
     fail_msg: "Set openclaw_gateway_token and openclaw_version in group_vars/openclaw.yml"
 
-# The `privileges` tag must be here as well as on common's own tasks: with a
-# dynamic include, --tags is evaluated against this task first, so an untagged
-# include is filtered out and the inner tags never get a chance to match. The
-# inner tasks are still filtered by their own tags once the include runs, so
-# `--tags privileges` reaches only common's six privilege tasks, not the npm
-# install.
+# Both `privileges` and `dns` must be here as well as on common's own tasks:
+# with a dynamic include, --tags is evaluated against this task first, so an
+# untagged include is filtered out and the inner tags never get a chance to
+# match. The inner tasks are still filtered by their own tags once the
+# include runs, so `--tags privileges` or `--tags dns` each reach only their
+# own tasks in common, not the npm install.
 - name: Install shared OpenClaw runtime
   ansible.builtin.include_role:
     name: openclaw.node.common
-  tags: privileges
+  tags: [privileges, dns]
 
 - name: Write environment file (token, insecure-ws flag)
   ansible.builtin.template:

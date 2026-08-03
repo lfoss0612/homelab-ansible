@@ -54,6 +54,29 @@
           expected '{{ openclaw_version }}'.
         success_msg: "{{ inventory_hostname }} is at the pinned version."
 
+    # Reported, not remediated here — see docs/execution-model.md "DNS
+    # resolver assertion". The fix (common role, --tags dns) is not part of
+    # the weekly convergence, so this is what catches drift or a rebuilt host
+    # in between manual runs.
+    - name: Resolve the gateway hostname from this host
+      ansible.builtin.command: getent hosts openclaw.home.lan
+      register: openclaw_gateway_resolution
+      changed_when: false
+      failed_when: false
+
+    - name: Assert this host resolves the gateway to its real address
+      ansible.builtin.assert:
+        that:
+          - openclaw_gateway_resolution.rc == 0
+          - openclaw_gateway_resolution.stdout.split()[0] == hostvars[groups['openclaw_gateway'][0]].ansible_host
+        fail_msg: >-
+          {{ inventory_hostname }} resolves openclaw.home.lan to
+          '{{ openclaw_gateway_resolution.stdout.split()[0] | default("nothing") }}',
+          expected '{{ hostvars[groups['openclaw_gateway'][0]].ansible_host }}' —
+          check for a local /etc/hosts override or resolver misconfiguration
+          (run deploy-openclaw.yml --tags dns).
+        success_msg: "{{ inventory_hostname }} resolves openclaw.home.lan correctly."
+
 - name: Validate OpenClaw version pin on intermittently-powered hosts
   # Same assertion, but reaching the host is not itself required. If it answers
   # it must be at the pin; if it is switched off the play moves on.
@@ -95,6 +118,27 @@
           {{ inventory_hostname }} is at '{{ openclaw_validate_version.stdout }}',
           expected '{{ openclaw_version }}'.
         success_msg: "{{ inventory_hostname }} is at the pinned version."
+      when: not (openclaw_optional_probe.unreachable | default(false))
+
+    - name: Resolve the gateway hostname from this host
+      ansible.builtin.command: getent hosts openclaw.home.lan
+      register: openclaw_gateway_resolution
+      changed_when: false
+      failed_when: false
+      when: not (openclaw_optional_probe.unreachable | default(false))
+
+    - name: Assert this host resolves the gateway to its real address
+      ansible.builtin.assert:
+        that:
+          - openclaw_gateway_resolution.rc == 0
+          - openclaw_gateway_resolution.stdout.split()[0] == hostvars[groups['openclaw_gateway'][0]].ansible_host
+        fail_msg: >-
+          {{ inventory_hostname }} resolves openclaw.home.lan to
+          '{{ openclaw_gateway_resolution.stdout.split()[0] | default("nothing") }}',
+          expected '{{ hostvars[groups['openclaw_gateway'][0]].ansible_host }}' —
+          check for a local /etc/hosts override or resolver misconfiguration
+          (run deploy-openclaw.yml --tags dns).
+        success_msg: "{{ inventory_hostname }} resolves openclaw.home.lan correctly."
       when: not (openclaw_optional_probe.unreachable | default(false))
 
 - name: Validate the gateway service, its own node, and fleet-wide pairing
