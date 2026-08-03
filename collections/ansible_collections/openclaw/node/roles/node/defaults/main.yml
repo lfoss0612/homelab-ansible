@@ -2,6 +2,6 @@
 openclaw_user: openclaw
 openclaw_group: openclaw
 openclaw_version: "latest"
-openclaw_gateway_host: "10.0.5.7"
-openclaw_gateway_port: 18789
+openclaw_node_gateway_host: "10.0.5.7"
+openclaw_node_gateway_port: 18789
 openclaw_gateway_token: "REQUIRED_SET_IN_GROUP_VARS"

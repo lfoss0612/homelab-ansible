@@ -11,13 +11,22 @@ openclaw_version: "2026.7.1-2"
 # Node.js floor required by openclaw_version. common role upgrades below this.
 openclaw_node_min_version: "22.22.3"
 
-# Gateway endpoint (used by node role). Routed through the OPNsense HAProxy
+# What NODES dial to reach the gateway — routed through the OPNsense HAProxy
 # frontend (be-openclaw, SNI openclaw.home.lan) rather than the gateway's raw
 # 10.0.5.7:18789 — nodes connect over TLS (--tls in the node unit) instead of
 # plaintext WS across the LAN. HAProxy's own backend leg to the gateway is
 # still plain HTTP (10.0.5.7:18789), which is unchanged and out of scope here.
-openclaw_gateway_host: "openclaw.home.lan"
-openclaw_gateway_port: 443
+#
+# Deliberately NOT named openclaw_gateway_host/port: those control the
+# gateway's OWN --bind/--port and its own health-check URL (gateway role,
+# always 10.0.5.7:18789 internally). Before HAProxy, "what nodes dial" and
+# "what the gateway binds to" were the same value by coincidence, so sharing
+# one variable name never mattered. Reusing it here silently overrode the
+# gateway's own --port to 443 the first time the gateway role re-ran after
+# this change, which it can't bind to as the unprivileged openclaw user —
+# took the gateway down. Keep these separate.
+openclaw_node_gateway_host: "openclaw.home.lan"
+openclaw_node_gateway_port: 443
 
 # Shared gateway auth token. This is the real token gateway.auth.token uses
 # for token-mode auth (verified by digest comparison 2026-07-29) — required

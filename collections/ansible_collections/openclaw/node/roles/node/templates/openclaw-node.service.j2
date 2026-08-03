@@ -17,8 +17,8 @@ EnvironmentFile=/etc/default/openclaw-node
 Environment=NODE_ENV=production
 
 ExecStart={{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw node run \
-  --host {{ openclaw_gateway_host }} \
-  --port {{ openclaw_gateway_port }} \
+  --host {{ openclaw_node_gateway_host }} \
+  --port {{ openclaw_node_gateway_port }} \
   --tls \
   --display-name {{ inventory_hostname }}
 
