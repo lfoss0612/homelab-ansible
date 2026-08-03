@@ -57,7 +57,23 @@ openclaw_models_default_max_tokens: 32768
 # below to exist in the catalogue — the incident this role was written after was
 # a primary pointing at `qwen3-coder-tools:30b`, a model deleted from Ollama
 # months earlier. Every default agent turn failed and nothing surfaced it.
-openclaw_models_primary: "qwen3-coder:30b"
+#
+# NOT qwen3-coder:30b, despite being the strongest coding model here: verified
+# 2026-08-03 by calling Ollama's native /api/chat directly with a tools payload
+# (bypassing LiteLLM and OpenClaw) that the entire qwen-coder family
+# (qwen3-coder:30b, qwen2.5-coder:14b, qwen2.5-coder:32b) answers tool-call
+# requests as plain JSON text with no structured tool_calls field populated —
+# an Ollama/template-level limitation for that model family, not a LiteLLM or
+# OpenClaw config issue. OpenClaw's own fallback ("Assistant reply looks like
+# a tool call, but no structured tool invocation was emitted") then surfaces as
+# NO_REPLY whenever the whole answer was nested inside the unparsed call.
+# llama3.1:8b, devstral:24b, and gpt-oss:20b were confirmed the same way to
+# return real tool_calls. devstral:24b is purpose-built for agentic coding, so
+# it's the closest replacement in kind for what qwen3-coder:30b was meant to do
+# here — matches the fallback this role's own catalogue comment already named.
+# Still fine to keep the qwen-coder models in the catalogue for non-agentic use
+# (FIM/completion), just not safe as anything a tool-using agent turn routes to.
+openclaw_models_primary: "devstral:24b"
 
 # `id` is the LiteLLM model name; the provider prefix is added automatically.
 # `input` defaults to [text]. Set `reasoning: true` for thinking models.
