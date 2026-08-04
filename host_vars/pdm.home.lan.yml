@@ -1,0 +1,14 @@
+---
+# host_vars/pdm.home.lan.yml
+
+# Part of the systemd-networkd standardization rollout (homelab-vault
+# TODO.md). Unlike cockpit, this one is a real conflict, not just harmless
+# duplication: networking.service (ifupdown) declares eth0 static while
+# networkd's 10-eth0.network says DHCP=yes -- networkctl shows eth0 stuck in
+# "configuring" rather than "configured", unlike every other host in the
+# fleet. Masking ifupdown here prevents it from re-applying its static
+# config on the next boot/container restart, letting networkd's DHCP=yes
+# win outright. Masking alone doesn't retroactively fix the already-applied
+# live state -- a container restart is expected to be needed afterward to
+# actually clear the "configuring" state.
+openclaw_networkd_standardize: true

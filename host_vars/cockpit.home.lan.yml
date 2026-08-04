@@ -1,0 +1,12 @@
+---
+# host_vars/cockpit.home.lan.yml
+
+# Part of the systemd-networkd standardization rollout (homelab-vault
+# TODO.md). networking.service (ifupdown) has a static eth0 stanza that
+# duplicates -- matches exactly, doesn't conflict with -- networkd's own
+# 10-eth0.network. Masking is a no-op on live behavior, same as the gateway:
+# just removes the redundant, dormant-in-effect config path.
+#
+# cockpit is this repo's own control node and the host granting this
+# identity's own SSH access -- treat any future change here with extra care.
+openclaw_networkd_standardize: true
