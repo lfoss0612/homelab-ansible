@@ -56,7 +56,7 @@
 
 - name: Collect service facts
   ansible.builtin.service_facts:
-  tags: [privileges, dns]
+  tags: [privileges, dns, networkd]
 
 - name: Grant the openclaw user read-only log access
   ansible.builtin.user:
