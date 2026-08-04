@@ -385,6 +385,7 @@
   ansible.builtin.apt:
     name: systemd-resolved
     state: present
+  register: openclaw_resolved_install
   when: openclaw_resolved_standardize
   tags: dns
 
@@ -394,6 +395,26 @@
     enabled: true
     state: started
   when: openclaw_resolved_standardize
+  tags: dns
+
+# Found on pbs 2026-08-03: a systemd-resolved that has never run on this host
+# before can lose its own D-Bus name-registration race on its very first
+# start -- dbus.service is typically already running (long-lived, predates
+# the install) and hasn't necessarily re-scanned /usr/share/dbus-1 for the
+# resolve1 activation file the package just dropped, right when resolved's
+# own startup tries to claim that name. The process stays up (systemd sees
+# it as active) but resolvectl/anything over D-Bus times out
+# ("Failed to activate service 'org.freedesktop.resolve1'"). Restarting the
+# already-running daemon after the fresh install clears it reliably; only
+# fires on the run that actually just installed the package, never on a
+# host where it was already present and working.
+- name: Restart systemd-resolved once, to clear a first-install D-Bus registration race
+  ansible.builtin.systemd:
+    name: systemd-resolved.service
+    state: restarted
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_install.changed | default(false)
   tags: dns
 
 # systemd-networkd pushes each link's DNS= servers to resolved over D-Bus as
