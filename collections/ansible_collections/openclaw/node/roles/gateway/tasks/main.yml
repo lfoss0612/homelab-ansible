@@ -34,7 +34,7 @@
 - name: Install shared OpenClaw runtime
   ansible.builtin.include_role:
     name: openclaw.node.common
-  tags: [privileges, dns]
+  tags: [privileges, dns, networkd]
 
 - name: Install gateway systemd unit
   ansible.builtin.template:

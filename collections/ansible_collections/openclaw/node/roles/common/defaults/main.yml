@@ -35,5 +35,12 @@ openclaw_dns_resolver: "{{ ansible_default_ipv4.gateway }}"
 # at its stub, only on hosts explicitly flipped on via host_vars. Default false —
 # fleet-wide standardization (homelab-vault TODO.md) is being rolled out one host
 # at a time, each with its own pre-migration audit, not as a single fleet-wide
-# flip. See host_vars/pbs.yml for the first one.
+# flip. See host_vars/pbs.home.lan.yml for the first one.
 openclaw_resolved_standardize: false
+
+# Opt-in, per-host: mask networking.service (ifupdown) once systemd-networkd is
+# confirmed to already own the interface for real. Same rollout philosophy as
+# openclaw_resolved_standardize -- a pre-migration audit per host before
+# flipping this on, not a fleet-wide default. See host_vars/openclaw.home.lan.yml
+# for the first one.
+openclaw_networkd_standardize: false

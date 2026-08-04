@@ -536,6 +536,22 @@
     - openclaw_resolved_precheck.rc == 0
   tags: dns
 
+# --- systemd-networkd standardization ----------------------------------------
+# Opt-in per host (openclaw_networkd_standardize, default false), same rollout
+# philosophy as the resolved work above: a pre-migration audit per host,
+# flipped on individually via host_vars, not a fleet-wide default. Only masks
+# networking.service (ifupdown) -- never touches an interface, address, route,
+# or DNS setting. The `masked` param on the systemd module is itself
+# idempotent, so this is a no-op once already masked.
+- name: Mask networking.service now that systemd-networkd owns the interface
+  ansible.builtin.systemd:
+    name: networking.service
+    masked: true
+  when:
+    - openclaw_networkd_standardize
+    - "'networking.service' in (ansible_facts.services | default({}))"
+  tags: networkd
+
 - name: Report a non-loopback /etc/hosts entry for this host's own name
   ansible.builtin.debug:
     msg: >-

@@ -15,12 +15,12 @@
 # with a dynamic include, --tags is evaluated against this task first, so an
 # untagged include is filtered out and the inner tags never get a chance to
 # match. The inner tasks are still filtered by their own tags once the
-# include runs, so `--tags privileges` or `--tags dns` each reach only their
-# own tasks in common, not the npm install.
+# include runs, so `--tags privileges`, `--tags dns`, or `--tags networkd`
+# each reach only their own tasks in common, not the npm install.
 - name: Install shared OpenClaw runtime
   ansible.builtin.include_role:
     name: openclaw.node.common
-  tags: [privileges, dns]
+  tags: [privileges, dns, networkd]
 
 - name: Write environment file (token, insecure-ws flag)
   ansible.builtin.template:

@@ -1,0 +1,11 @@
+---
+# host_vars/openclaw.home.lan.yml
+
+# First host in the systemd-networkd standardization rollout (homelab-vault
+# TODO.md). Pre-migration check 2026-08-03: networking.service is already
+# inactive/disabled (not just "not the active manager" -- genuinely not
+# running), and networkctl confirms systemd-networkd already owns ens18 for
+# real (State: routable (configured), via /etc/systemd/network/10-ens18.network).
+# Masking is a no-op on live behavior -- it only prevents the already-dormant
+# ifupdown unit from ever being started again, matching pve/pve-ai/pve-router/pbs.
+openclaw_networkd_standardize: true
