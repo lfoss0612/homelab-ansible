@@ -368,6 +368,153 @@
   check_mode: false
   tags: dns
 
+# --- systemd-resolved standardization ---------------------------------------
+# Opt-in per host (openclaw_resolved_standardize, default false — see
+# common/defaults/main.yml) as the fleet-wide standardize-on-systemd-resolved
+# TODO (homelab-vault TODO.md) is rolled out one audited host at a time.
+# Installs/enables systemd-resolved and repoints /etc/resolv.conf at its stub.
+#
+# Safety gate: resolution is proven working *through resolved specifically*
+# (resolvectl talks to the resolved daemon directly, independent of whatever
+# /etc/resolv.conf currently points at) before the existing, working
+# /etc/resolv.conf is touched at all. If that check fails, the cutover tasks
+# below are skipped — a safe no-op, not a play failure — and the host keeps
+# resolving exactly as it did before this ran.
+
+- name: Install systemd-resolved
+  ansible.builtin.apt:
+    name: systemd-resolved
+    state: present
+  when: openclaw_resolved_standardize
+  tags: dns
+
+- name: Enable and start systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved.service
+    enabled: true
+    state: started
+  when: openclaw_resolved_standardize
+  tags: dns
+
+# systemd-networkd pushes each link's DNS= servers to resolved over D-Bus as
+# part of applying a link's configuration -- it does this when the link comes
+# up, not retroactively just because resolved started existing. A host whose
+# link was already configured before resolved was ever installed (the pbs
+# case: networkd has owned enp3s0, DNS= included, since before this task
+# existed) needs one reload to make it push that already-correct config to
+# the now-running daemon. Reload, not restart: re-applies config over the
+# existing bus connection without tearing down the daemon or the interface.
+- name: Reload systemd-networkd so it (re)registers DNS servers with resolved
+  ansible.builtin.systemd:
+    name: systemd-networkd.service
+    state: reloaded
+  when:
+    - openclaw_resolved_standardize
+    - "'systemd-networkd.service' in (ansible_facts.services | default({}))"
+  tags: dns
+
+- name: Check whether /etc/resolv.conf already points at the resolved stub
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+  register: openclaw_resolv_conf_link
+  when: openclaw_resolved_standardize
+  tags: dns
+
+- name: Determine whether the stub cutover is still needed
+  ansible.builtin.set_fact:
+    openclaw_resolved_cutover_needed: >-
+      {{ not (openclaw_resolv_conf_link.stat.islnk | default(false) and
+              'stub-resolv.conf' in (openclaw_resolv_conf_link.stat.lnk_source | default(''))) }}
+  when: openclaw_resolved_standardize
+  tags: dns
+
+# Read, not written -- safe even while the file is still chattr +i.  force:
+# false makes this a one-time backup: later idempotent runs (already migrated)
+# never reach this block at all (openclaw_resolved_cutover_needed is false by
+# then), but force: false is cheap insurance if it's ever re-run mid-cutover.
+- name: Back up the pre-migration /etc/resolv.conf
+  ansible.builtin.copy:
+    src: /etc/resolv.conf
+    dest: /etc/resolv.conf.pre-resolved-migration
+    remote_src: true
+    force: false
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+  tags: dns
+
+- name: Check for an immutable /etc/resolv.conf before cutover
+  ansible.builtin.command: lsattr -d /etc/resolv.conf
+  register: openclaw_resolved_cutover_lsattr
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+  tags: dns
+
+- name: Remove immutable attribute before cutover
+  ansible.builtin.command: chattr -i /etc/resolv.conf
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+    - openclaw_resolved_cutover_lsattr.rc == 0
+    - (openclaw_resolved_cutover_lsattr.stdout | regex_search('^\S*i\S* ')) is not none
+  tags: dns
+
+# The actual safety gate. resolvectl queries resolved directly -- this proves
+# end-to-end resolution works through the daemon *before* the known-working
+# /etc/resolv.conf is replaced, not after.
+- name: Prove resolution works through resolved before touching resolv.conf
+  ansible.builtin.command: resolvectl query openclaw.home.lan
+  register: openclaw_resolved_precheck
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+  tags: dns
+
+- name: Report a failed pre-cutover resolution check
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: resolvectl could not resolve through
+      systemd-resolved ({{ openclaw_resolved_precheck.stdout
+      | default(openclaw_resolved_precheck.stderr) | default('no output') }}).
+      Leaving /etc/resolv.conf untouched -- not cutting over this run.
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+    - openclaw_resolved_precheck.rc != 0
+  tags: dns
+
+- name: Point /etc/resolv.conf at the resolved stub
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    state: link
+    src: /run/systemd/resolve/stub-resolv.conf
+    force: true
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+    - openclaw_resolved_precheck.rc == 0
+  tags: dns
+
+- name: Verify resolution still works after cutover
+  ansible.builtin.command: getent hosts openclaw.home.lan
+  register: openclaw_resolved_postcheck
+  changed_when: false
+  failed_when: openclaw_resolved_postcheck.rc != 0
+  check_mode: false
+  when:
+    - openclaw_resolved_standardize
+    - openclaw_resolved_cutover_needed
+    - openclaw_resolved_precheck.rc == 0
+  tags: dns
+
 - name: Report a non-loopback /etc/hosts entry for this host's own name
   ansible.builtin.debug:
     msg: >-

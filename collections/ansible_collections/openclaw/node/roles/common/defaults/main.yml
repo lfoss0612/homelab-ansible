@@ -30,3 +30,10 @@ openclaw_read_groups:
 # OPNsense IP ever changes. Override per-host/group if a VLAN's resolver and
 # gateway ever diverge.
 openclaw_dns_resolver: "{{ ansible_default_ipv4.gateway }}"
+
+# Opt-in, per-host: install/enable systemd-resolved and repoint /etc/resolv.conf
+# at its stub, only on hosts explicitly flipped on via host_vars. Default false —
+# fleet-wide standardization (homelab-vault TODO.md) is being rolled out one host
+# at a time, each with its own pre-migration audit, not as a single fleet-wide
+# flip. See host_vars/pbs.yml for the first one.
+openclaw_resolved_standardize: false

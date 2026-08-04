@@ -1,0 +1,13 @@
+---
+# host_vars/pbs.yml
+
+# First host in the systemd-resolved standardization rollout (homelab-vault
+# TODO.md). Pre-migration audit 2026-08-03 found no blocker: networking.service
+# is already masked, systemd-networkd already owns enp3s0 with the correct
+# static Address=/Gateway=/DNS= (nothing else competes for /etc/resolv.conf),
+# and the immutable attribute on the current static file was deliberate
+# hardening rather than protection against an active manager. See
+# collections/ansible_collections/openclaw/node/roles/common/tasks/main.yml,
+# the "systemd-resolved standardization" section, for the actual cutover logic
+# and its safety gate.
+openclaw_resolved_standardize: true
