@@ -56,6 +56,19 @@
         name: "{{ claude_user }}"
         password_lock: true
 
+    # useradd's default home mode (0700, owner-only) blocks `sudo -u ansible`
+    # ad-hoc commands run with this directory as cwd -- sudo doesn't chdir, and
+    # ansible can't stat '.' without traverse access, failing with
+    # "Permission denied: b'.'" (hit 2026-08-03 syncing /opt/ansible). Group
+    # stays owner-private (claude:claude) for file creation; only the
+    # directory's own group is widened, and only to ansible, not other.
+    - name: Let the ansible group traverse claude's home directory
+      ansible.builtin.file:
+        path: "/home/{{ claude_user }}"
+        state: directory
+        group: ansible
+        mode: "0750"
+
     - name: Ensure .ssh directory exists
       ansible.builtin.file:
         path: "/home/{{ claude_user }}/.ssh"
