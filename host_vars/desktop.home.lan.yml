@@ -10,3 +10,11 @@
 # ens18 is plain DHCP with no static overrides (confirmed via `nmcli con show
 # "Wired connection 1"` 2026-08-03) -- no static Address/DNS to replicate.
 openclaw_networkd_migrate_from_nm: true
+
+# systemd-resolved standardization (homelab-vault TODO.md). Networkd cutover
+# above is confirmed live (systemd-networkd active, NetworkManager inactive,
+# 2026-08-04) -- the only thing left on this host is the resolver: no
+# systemd-resolved package installed, /etc/resolv.conf is a static leftover
+# NetworkManager wrote before it was disabled (nameserver 10.10.5.1, no
+# chattr +i). No blocker found; same shape as pbs's rollout.
+openclaw_resolved_standardize: true
