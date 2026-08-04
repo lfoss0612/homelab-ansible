@@ -17,8 +17,15 @@
   vars:
     claude_user: claude
     claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
-    # Pin the key to the workstation it is used from. Set to "" to allow any source.
-    claude_key_from: "10.10.5.198"
+    # Pin the key to the workstation's VLAN. Set to "" to allow any source.
+    # Was a single exact IP (10.10.5.198) until 2026-08-04: desktop's DHCP
+    # lease changed to 10.10.5.199 as a direct side effect of its
+    # NetworkManager -> systemd-networkd migration (different DHCP client
+    # ID -> new lease), silently breaking claude's access until caught and
+    # hand-fixed live on cockpit. Widened to the subnet so a future lease
+    # change doesn't repeat this — desktop is the only host on this VLAN,
+    # so the practical exposure is the same as pinning the single IP.
+    claude_key_from: "10.10.5.0/24"
     # Read access to /opt/ansible. Grants NO sudo — claude is not in sudo/wheel.
     claude_extra_groups:
       - ansible
