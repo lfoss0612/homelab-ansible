@@ -9,14 +9,22 @@ workstation, since cockpit has no push credentials.
 14 inventory hosts total (`inventory.ini`):
 
 - **`proxmox_hosts`** — `pve`, `pve-ai`, `pve-router` (three hypervisors).
-- **`vms`** — `omv`, `zabbix`, `cockpit`, `pbs`, `pdm`, `vscode`, `openclaw` (the gateway
-  VM), `desktop`.
+- **`qemu_vms`** — `omv`, `zabbix`, `vscode`, `openclaw` (the gateway VM), `desktop`.
+- **`lxc`** — `cockpit`, `pdm`. Both are unprivileged LXC containers on `pve-router`, not
+  QEMU VMs — split out of a single `vms` group 2026-08-03 because Proxmox's `pct` tooling
+  writes `/etc/resolv.conf` directly into the container rootfs from host-side config on
+  every start, overriding anything set inside the guest (including `systemd-resolved`'s
+  own stub symlink). See `homelab-vault` TODO.md, "Standardize the fleet on
+  systemd-resolved".
+- **`bare_metal`** — `pbs`. Physical, not virtualized (also previously miscategorized
+  under `vms`).
 - **`k8s_master` / `k8s_workers`** (parent group `k8s`) — `k8s-master`, `k8s-worker`,
   `k8s-worker-2`.
 
 ### OpenClaw fleet
 
-`openclaw_nodes` = `openclaw_proxmox` (`pve`, `pve-ai` only) + `vms` + `k8s` — **13 hosts**.
+`openclaw_nodes` = `openclaw_proxmox` (`pve`, `pve-ai` only) + `qemu_vms` + `lxc` +
+`bare_metal` + `k8s` — **13 hosts**.
 `openclaw.home.lan` (the gateway) is a deliberate member: it runs both
 `openclaw-gateway.service` and `openclaw-node.service`, managing its own VM as well as
 brokering the rest of the fleet.
