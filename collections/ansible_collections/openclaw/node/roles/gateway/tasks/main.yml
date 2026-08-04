@@ -36,6 +36,63 @@
     name: openclaw.node.common
   tags: [privileges, dns, networkd]
 
+# Found ON in a security audit 2026-08-04: gateway.controlUi.allowedOrigins
+# includes the public duckdns hostname, so this was reachable well past a
+# trusted LAN. The schema's own description calls the flag "short-lived
+# debugging on trusted networks, then turn it off immediately" — it was
+# never turned back off. Read/compare/patch/verify, same shape as the models
+# role, for the same reason: `config set`'s exit code doesn't prove the
+# write landed in the right file (see the become_user note there — running
+# as root silently edits /root/.openclaw/openclaw.json instead).
+- name: Read the current Control UI device-auth bypass setting
+  ansible.builtin.command:
+    cmd: openclaw config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
+  become: true
+  become_user: "{{ openclaw_user }}"
+  register: openclaw_device_auth_bypass
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: openclaw_state_dir.stat.exists
+
+- name: Harden the Control UI device-auth bypass setting
+  ansible.builtin.command:
+    cmd: openclaw config set gateway.controlUi.dangerouslyDisableDeviceAuth false --strict-json
+  become: true
+  become_user: "{{ openclaw_user }}"
+  register: openclaw_device_auth_bypass_fix
+  changed_when: openclaw_device_auth_bypass_fix.rc == 0
+  when:
+    - openclaw_state_dir.stat.exists
+    - openclaw_device_auth_bypass.rc == 0
+    - (openclaw_device_auth_bypass.stdout | from_json) == true
+  notify: restart openclaw gateway
+
+- name: Re-read the Control UI device-auth setting to confirm the write landed
+  ansible.builtin.command:
+    cmd: openclaw config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
+  become: true
+  become_user: "{{ openclaw_user }}"
+  register: openclaw_device_auth_bypass_verify
+  changed_when: false
+  when:
+    - openclaw_device_auth_bypass_fix is changed
+    - not ansible_check_mode
+
+- name: Assert the device-auth bypass is off
+  ansible.builtin.assert:
+    that:
+      - (openclaw_device_auth_bypass_verify.stdout | from_json) == false
+    fail_msg: >-
+      Patch reported success but gateway.controlUi.dangerouslyDisableDeviceAuth
+      is still {{ openclaw_device_auth_bypass_verify.stdout | default('(unreadable)') }}.
+      Check that the CLI ran as {{ openclaw_user }} and not root — running as
+      root edits /root/.openclaw/openclaw.json and reports success.
+    quiet: true
+  when:
+    - openclaw_device_auth_bypass_fix is changed
+    - not ansible_check_mode
+
 - name: Install gateway systemd unit
   ansible.builtin.template:
     src: openclaw-gateway.service.j2
