@@ -44,3 +44,18 @@ openclaw_resolved_standardize: false
 # flipping this on, not a fleet-wide default. See host_vars/openclaw.home.lan.yml
 # for the first one.
 openclaw_networkd_standardize: false
+
+# Opt-in, per-host: migrate a NetworkManager-managed interface to
+# systemd-networkd. Unlike openclaw_networkd_standardize (masking an already-
+# dormant ifupdown), this is a real interface-manager migration -- deliberately
+# staged as prep-only. It installs networkd and a matching .network file, and
+# disables NetworkManager, but only for the *next* boot (systemctl
+# enable/disable, never start/stop) -- the live interface is never touched.
+# A host with this flipped on needs an actual reboot, on its own schedule, to
+# complete the cutover. See host_vars/desktop.home.lan.yml, the first (and, as
+# of writing, only) host on this path.
+openclaw_networkd_migrate_from_nm: false
+
+# Interface to migrate when openclaw_networkd_migrate_from_nm is set. Defaults
+# to the host's own default-route interface.
+openclaw_networkd_migrate_iface: "{{ ansible_default_ipv4.interface }}"

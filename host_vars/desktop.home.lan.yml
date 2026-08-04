@@ -1,0 +1,12 @@
+---
+# host_vars/desktop.home.lan.yml
+
+# Second host in the systemd-networkd standardization rollout (homelab-vault
+# TODO.md) -- the one real NetworkManager -> networkd migration in the fleet.
+# desktop is the user's actively-used interactive workstation, so unlike every
+# other host touched by this project, this is deliberately staged as
+# prep-now/cutover-on-next-reboot rather than a live hot-swap: NetworkManager
+# keeps running normally until the user reboots on their own schedule.
+# ens18 is plain DHCP with no static overrides (confirmed via `nmcli con show
+# "Wired connection 1"` 2026-08-03) -- no static Address/DNS to replicate.
+openclaw_networkd_migrate_from_nm: true
