@@ -554,18 +554,14 @@
 
 # --- systemd-networkd migration from NetworkManager --------------------------
 # Opt-in per host (openclaw_networkd_migrate_from_nm, default false).
-# Deliberately staged as prep-only: installs networkd and writes the matching
-# .network file, and disables NetworkManager -- but only for the *next* boot
-# (enabled/disabled, never started/stopped). The live interface is never
-# touched by this play; a host on this path needs an actual reboot, on its
-# own schedule, to complete the cutover -- see the report task below.
-
-- name: Install systemd-networkd (NetworkManager migration)
-  ansible.builtin.apt:
-    name: systemd-networkd
-    state: present
-  when: openclaw_networkd_migrate_from_nm
-  tags: networkd
+# Deliberately staged as prep-only: writes the matching .network file and
+# disables NetworkManager -- but only for the *next* boot (enabled/disabled,
+# never started/stopped). No separate package to install: systemd-networkd
+# ships inside the base systemd package (confirmed via dpkg -S on desktop —
+# `apt install systemd-networkd` fails outright, "No package matching" — the
+# unit already exists, just disabled). The live interface is never touched
+# by this play; a host on this path needs an actual reboot, on its own
+# schedule, to complete the cutover -- see the report task below.
 
 - name: Write the networkd config for the migrated interface
   ansible.builtin.copy:
