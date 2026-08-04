@@ -45,6 +45,14 @@ openclaw_resolved_standardize: false
 # for the first one.
 openclaw_networkd_standardize: false
 
+# Opt-in, per-host: correct a broken/incorrect networkd .network directive to
+# a static config before openclaw_networkd_standardize is allowed to mask
+# ifupdown. Empty dict (default) is a no-op everywhere. Set the four keys
+# (iface, address, gateway, dns -- a list; domains is optional) on a host that
+# needs it. See host_vars/pdm.home.lan.yml, the first (and, as of writing,
+# only) host on this path.
+openclaw_networkd_static_network: {}
+
 # Opt-in, per-host: migrate a NetworkManager-managed interface to
 # systemd-networkd. Unlike openclaw_networkd_standardize (masking an already-
 # dormant ifupdown), this is a real interface-manager migration -- deliberately

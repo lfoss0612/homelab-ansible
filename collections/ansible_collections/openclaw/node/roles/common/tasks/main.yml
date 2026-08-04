@@ -536,13 +536,114 @@
     - openclaw_resolved_precheck.rc == 0
   tags: dns
 
+# --- systemd-networkd static config correction -------------------------------
+# Opt-in per host via openclaw_networkd_static_network (a dict; empty/unset is
+# a no-op for every host that doesn't need it). For a host where networkd
+# already owns the interface but its .network file has the wrong directive --
+# pdm's DHCP=yes, when the subnet's dynamic pool doesn't cover its address at
+# all (10.0.5.8 is below the LAB pool's 10.0.5.50 floor -- see homelab-vault
+# Network/dhcp.md) -- this replaces it with a static config matching every
+# other host on the subnet, then proves address assignment actually works
+# live BEFORE the ifupdown-masking task below is allowed to run.
+#
+# ifupdown is deliberately left running during the write+verify: since the
+# target values match exactly what ifupdown already has applied, having both
+# active at once here is provably safe (identical to cockpit's permanent,
+# harmless duplicate-config state) -- there's always a working fallback in
+# place while networkd's own config is being proven, unlike the first attempt
+# at this (2026-08-04), which masked ifupdown before ever confirming networkd
+# could actually bring the interface up on its own, and caused a real
+# connectivity outage when it turned out it couldn't (DHCP=yes against a pool
+# that would never serve that address).
+
+- name: Write a static networkd config, replacing a broken/incorrect directive
+  ansible.builtin.copy:
+    dest: "/etc/systemd/network/10-{{ openclaw_networkd_static_network.iface }}.network"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Match]
+      Name={{ openclaw_networkd_static_network.iface }}
+
+      [Network]
+      Address={{ openclaw_networkd_static_network.address }}
+      Gateway={{ openclaw_networkd_static_network.gateway }}
+      {% for server in openclaw_networkd_static_network.dns %}
+      DNS={{ server }}
+      {% endfor %}
+      {% if openclaw_networkd_static_network.domains is defined %}
+      Domains={{ openclaw_networkd_static_network.domains }}
+      {% endif %}
+  register: openclaw_networkd_static_write
+  when: (openclaw_networkd_static_network | default({})) | length > 0
+  tags: networkd
+
+- name: Enable and start systemd-networkd to test the corrected config
+  ansible.builtin.systemd:
+    name: systemd-networkd.service
+    enabled: true
+    state: started
+  when: (openclaw_networkd_static_network | default({})) | length > 0
+  tags: networkd
+
+- name: Reload systemd-networkd if the config file just changed
+  ansible.builtin.systemd:
+    name: systemd-networkd.service
+    state: reloaded
+  when:
+    - (openclaw_networkd_static_network | default({})) | length > 0
+    - openclaw_networkd_static_write.changed
+  tags: networkd
+
+# A fixed, bounded wait -- not a hang-risking networkctl reconfigure/query
+# call like the ones that got stuck for minutes earlier tonight.
+- name: Give networkd a moment to apply the corrected config
+  ansible.builtin.pause:
+    seconds: 5
+  when: (openclaw_networkd_static_network | default({})) | length > 0
+  tags: networkd
+
+- name: Check the interface's actual live address
+  ansible.builtin.command: "ip -4 addr show {{ openclaw_networkd_static_network.iface }}"
+  register: openclaw_networkd_static_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: (openclaw_networkd_static_network | default({})) | length > 0
+  tags: networkd
+
+- name: Set whether the static networkd config is confirmed working
+  ansible.builtin.set_fact:
+    openclaw_networkd_static_confirmed: >-
+      {{ (openclaw_networkd_static_network.address.split('/')[0] ~ '/') in (openclaw_networkd_static_check.stdout | default(''))
+         if (openclaw_networkd_static_network | default({})) | length > 0
+         else true }}
+  tags: networkd
+
+- name: Report a failed static networkd config verification
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: expected address
+      {{ openclaw_networkd_static_network.address }} on
+      {{ openclaw_networkd_static_network.iface }} but it wasn't found live --
+      NOT masking ifupdown this run. ifupdown is still active as a fallback.
+  when:
+    - (openclaw_networkd_static_network | default({})) | length > 0
+    - not openclaw_networkd_static_confirmed
+  tags: networkd
+
 # --- systemd-networkd standardization ----------------------------------------
 # Opt-in per host (openclaw_networkd_standardize, default false), same rollout
 # philosophy as the resolved work above: a pre-migration audit per host,
 # flipped on individually via host_vars, not a fleet-wide default. Only masks
 # networking.service (ifupdown) -- never touches an interface, address, route,
 # or DNS setting. The `masked` param on the systemd module is itself
-# idempotent, so this is a no-op once already masked.
+# idempotent, so this is a no-op once already masked. Gated additionally on
+# openclaw_networkd_static_confirmed (defaults true when no static-network
+# correction applies to this host, so this is unchanged for cockpit/the
+# gateway) -- for a host that needed the correction above, masking only
+# proceeds once networkd is proven to actually hold the interface up itself.
 - name: Mask networking.service now that systemd-networkd owns the interface
   ansible.builtin.systemd:
     name: networking.service
@@ -550,6 +651,7 @@
   when:
     - openclaw_networkd_standardize
     - "'networking.service' in (ansible_facts.services | default({}))"
+    - openclaw_networkd_static_confirmed | default(true)
   tags: networkd
 
 # --- systemd-networkd migration from NetworkManager --------------------------

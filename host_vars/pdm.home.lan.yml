@@ -1,14 +1,23 @@
 ---
 # host_vars/pdm.home.lan.yml
 
-# Part of the systemd-networkd standardization rollout (homelab-vault
-# TODO.md). Unlike cockpit, this one is a real conflict, not just harmless
-# duplication: networking.service (ifupdown) declares eth0 static while
-# networkd's 10-eth0.network says DHCP=yes -- networkctl shows eth0 stuck in
-# "configuring" rather than "configured", unlike every other host in the
-# fleet. Masking ifupdown here prevents it from re-applying its static
-# config on the next boot/container restart, letting networkd's DHCP=yes
-# win outright. Masking alone doesn't retroactively fix the already-applied
-# live state -- a container restart is expected to be needed afterward to
-# actually clear the "configuring" state.
+# Root cause found 2026-08-04, documented in homelab-vault Network/dhcp.md:
+# 10.0.5.8 sits below the LAB dnsmasq pool's 10.0.5.50 floor, and has no
+# static DHCP reservation either -- it was never going to get a lease, DHCP
+# isn't broken. The .network file's DHCP=yes was simply the wrong directive.
+# Corrected here to a static config matching every other host on this subnet
+# (pve, zabbix, cockpit, pbs all do the same). openclaw_networkd_standardize
+# only masks ifupdown once this is proven live (see the static-config-
+# correction block in common/tasks/main.yml) -- unlike the first attempt at
+# this, which masked ifupdown before ever confirming networkd could bring the
+# interface up on its own and caused a real outage.
+openclaw_networkd_static_network:
+  iface: eth0
+  address: "10.0.5.8/24"
+  gateway: "10.0.5.1"
+  dns:
+    - "10.0.5.1"
+    - "8.8.8.8"
+    - "1.1.1.1"
+  domains: "home.lan"
 openclaw_networkd_standardize: true
