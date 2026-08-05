@@ -15,7 +15,10 @@ workstation, since cockpit has no push credentials.
   writes `/etc/resolv.conf` directly into the container rootfs from host-side config on
   every start, overriding anything set inside the guest (including `systemd-resolved`'s
   own stub symlink). See `homelab-vault` TODO.md, "Standardize the fleet on
-  systemd-resolved".
+  systemd-resolved". **The host-side `pct` config is now managed by
+  `playbooks/proxmox-config.yml`**, which applies the declared nameserver to both containers
+  on `pve-router` — the actual `/etc/resolv.conf` inside each guest updates on the next
+  container start.
 - **`bare_metal`** — `pbs`. Physical, not virtualized (also previously miscategorized
   under `vms`).
 - **`k8s_master` / `k8s_workers`** (parent group `k8s`) — `k8s-master`, `k8s-worker`,
@@ -92,6 +95,7 @@ root-equivalent sudo on all 12 hosts, how the roles revoke it, and the unattende
 
 | File | Purpose |
 |---|---|
+| `playbooks/proxmox-config.yml` | Apply declarative Proxmox `pct`/`qm` config to LXC containers and VMs. Compares current vs. declared settings and runs `pct set`/`qm set` only if they differ. Idempotent; safe with `--check --diff`. **Skips `pve-router` unless `-e confirm_pve_router=true`.** Config declared per-host in `host_vars` as `proxmox_lxc_config`/`proxmox_qm_config` lists. Currently used to fix cockpit/pdm's DNS resolution (see Topology, LXC bullet, and homelab-vault TODO.md). |
 | `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then all of `openclaw_nodes` in full — no gateway subtraction, since the gateway is deliberately a node too. `openclaw_optional` hosts get the same role in a trailing `ignore_unreachable` play. **Skips `pve-router` unless `-e confirm_pve_router=true`.** |
 | `playbooks/update-openclaw.yml` | Fleet convergence: verify-before-mutate (compares `openclaw --version` against the `openclaw_version` pin, not a build hash — there's no build any more), gateway first, nodes serialized with a per-host health gate, skipping any host already converged. Phase 4 repeats phase 3 for `openclaw_optional`; both share `playbooks/tasks/converge-openclaw-node.yml`. **Not gated on `confirm_pve_router`** — this is the weekly-timer path, and `pve-router`'s automatic weekly convergence is a deliberate, already-made decision (2026-08-04), not an accidental sweep. See `homelab-vault` `TODO.md` for the planned ntfy-notification-with-approval-button replacement. |
 | `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean, now including `pve-router` like any other node. `openclaw_optional` hosts are asserted when up and reported when off. Read-only — not gated. |

@@ -15,3 +15,18 @@
 # or the network path OPNsense's guest traffic actually uses. Same shape as
 # desktop's rollout: no blocker found.
 openclaw_resolved_standardize: true
+
+# LXC container config, managed by playbooks/proxmox-config.yml.
+# Fixes the LXC DNS issue documented in README.md, Topology section: Proxmox's
+# `pct` tooling writes /etc/resolv.conf directly into the container rootfs on
+# every start, from host-side config only — not from anything set inside the
+# guest. See homelab-vault TODO.md, "Standardize the fleet on systemd-resolved".
+# The `ansible_default_ipv4.gateway` is a correct stand-in for "the right
+# resolver" since OPNsense is both router and resolver on every VLAN.
+proxmox_lxc_config:
+  - vmid: 107   # cockpit (Ansible control node)
+    settings:
+      nameserver: "{{ ansible_default_ipv4.gateway }}"
+  - vmid: 108   # pdm (Proxmox Datacenter Manager)
+    settings:
+      nameserver: "{{ ansible_default_ipv4.gateway }}"

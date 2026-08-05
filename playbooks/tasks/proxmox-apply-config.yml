@@ -1,0 +1,36 @@
+---
+# Apply declarative pct/qm config to a single container/VM.
+# Imported by playbooks/proxmox-config.yml, once per declared item.
+#
+# Params: proxmox_binary (pct|qm), pve_item (vmid, settings dict)
+# Example from host_vars:
+#   proxmox_lxc_config:
+#     - vmid: 107
+#       settings:
+#         nameserver: "10.0.5.1"
+
+- name: "Read current {{ proxmox_binary }} config for {{ pve_item.vmid }}"
+  ansible.builtin.command: "{{ proxmox_binary }} config {{ pve_item.vmid }}"
+  register: proxmox_current_config
+  changed_when: false
+  check_mode: false
+
+# Parse each setting from the current config and compare with declared value.
+# Only run `pct set` / `qm set` if the declared value differs from current.
+#
+# Regex only matches against the key (static, known-safe); the desired value
+# is compared with plain string equality, avoiding regex-injection issues.
+- name: "Apply declared {{ proxmox_binary }} settings for {{ pve_item.vmid }}"
+  ansible.builtin.command: "{{ proxmox_binary }} set {{ pve_item.vmid }} --{{ setting.key }} {{ setting.value }}"
+  loop: "{{ pve_item.settings | dict2items }}"
+  loop_control:
+    loop_var: setting
+  when: >-
+    (proxmox_current_config.stdout_lines
+      | select('match', '^' + setting.key + ':')
+      | map('regex_replace', '^' + setting.key + ':\s*', '')
+      | map('trim')
+      | first | default(''))
+    != (setting.value | string)
+  register: proxmox_set_result
+  changed_when: proxmox_set_result.rc == 0

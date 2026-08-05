@@ -1,0 +1,44 @@
+---
+# Apply declarative Proxmox pct/qm config (LXC containers and VMs).
+# Gated on confirm_pve_router for hosts that include pve-router.
+# See homelab-vault TODO.md, "Bring pve-router and OPNsense under Ansible
+# management", and docs/execution-model.md, "pve-router — out-of-band recovery
+# path".
+#
+# Usage:
+#   ansible-playbook playbooks/proxmox-config.yml --check --diff
+#   ansible-playbook playbooks/proxmox-config.yml --check --diff -e confirm_pve_router=true
+#   ansible-playbook playbooks/proxmox-config.yml -e confirm_pve_router=true
+
+- name: Apply declarative Proxmox pct/qm config
+  hosts: openclaw_proxmox
+  become: true
+
+  pre_tasks:
+    - name: Confirm pve-router before any write-capable role runs
+      ansible.builtin.include_tasks: tasks/confirm-pve-router.yml
+      tags: always
+
+  tasks:
+    - name: Apply declared LXC (pct) config
+      ansible.builtin.include_tasks: tasks/proxmox-apply-config.yml
+      loop: "{{ proxmox_lxc_config | default([]) }}"
+      loop_control:
+        loop_var: pve_item
+      vars:
+        proxmox_binary: pct
+
+    - name: Apply declared VM (qm) config
+      ansible.builtin.include_tasks: tasks/proxmox-apply-config.yml
+      loop: "{{ proxmox_qm_config | default([]) }}"
+      loop_control:
+        loop_var: pve_item
+      vars:
+        proxmox_binary: qm
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg: |
+          pct set and qm set only take effect on a container's/VM's next start.
+          For LXCs: cockpit/pdm are not auto-restarted by this play — restart
+          manually via `pct reboot <vmid>` once the diff above looks correct.

@@ -335,8 +335,11 @@ path to a procedural + technical gate (2026-08-04):**
   with an approval button that triggers a confirmed run, rather than either blind
   auto-convergence or blind skipping.
 
-The remaining piece — real hypervisor/OPNsense-scope automation (`pct`/`qm` config, VM
-lifecycle, OPNsense's own config) — is still unstarted; see `TODO.md`.
+**LXC/pct config automation is now implemented** (2026-08-05): `playbooks/proxmox-config.yml`
+reads current config, compares against declared state in `host_vars`, and runs `pct set` only
+for settings that differ — idempotent and safe with `--check --diff`. The concrete forcing
+case (cockpit/pdm nameserver fixing DNS resolution) is covered. VM lifecycle, storage, and
+OPNsense's own config remain unstarted; see `TODO.md`.
 
 ## TODO — gateway security, next up
 
