@@ -1,0 +1,17 @@
+---
+# host_vars/pve-router.home.lan.yml
+
+# Third host in the systemd-resolved standardization rollout (homelab-vault
+# TODO.md). Pre-migration audit 2026-08-04, after pve-router joined
+# openclaw_nodes: /etc/resolv.conf is a plain, non-immutable `nameserver
+# 8.8.8.8` with no `.home.lan` awareness (this is why the openclaw-node
+# service couldn't resolve openclaw.home.lan after the same-day fleet
+# convergence). systemd-networkd is already active and owns the interfaces
+# (vmbr0/vmbr1, the bridges the OPNsense VM's taps sit on, plus the VLAN
+# sub-interface); systemd-resolved is not installed; NetworkManager and
+# networking.service (ifupdown) are both inactive -- nothing competing for
+# /etc/resolv.conf. This only changes the host's own userland DNS resolution
+# (apt, openclaw-node, etc.) -- it does not touch vmbr0/vmbr1 bridge config
+# or the network path OPNsense's guest traffic actually uses. Same shape as
+# desktop's rollout: no blocker found.
+openclaw_resolved_standardize: true
