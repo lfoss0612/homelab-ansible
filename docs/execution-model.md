@@ -138,8 +138,9 @@ Expect `openclaw adm systemd-journal`, `User openclaw is not allowed to run sudo
 real log line from a unit the agent does **not** own. All 12 hosts satisfied this on
 2026-08-01.
 
-`pve-router` is not in `openclaw_nodes`, so its own `openclaw` user keeps whatever grant it
-has. That host is independently managed and deliberately out of scope.
+`pve-router` joined `openclaw_nodes` 2026-08-04, so this privileges assertion now runs
+against it too on the next converge — its `openclaw` user's grant will be brought in line
+with the rest of the fleet rather than left as-is.
 
 ## DNS resolver assertion
 
@@ -230,8 +231,8 @@ ansible openclaw -m shell -a 'resolvectl status 2>/dev/null | grep "DNS Server" 
 Every host should show the same resolver family it started with (its own
 VLAN's OPNsense IP) — not a public resolver, not a stale LAN IP.
 
-`pve-router` is not in `openclaw_nodes`, so it is not touched by any of this —
-same standing exclusion as `privileges`.
+`pve-router` joined `openclaw_nodes` 2026-08-04, so the DNS resolver assertion now runs
+against it too on the next converge — same change as `privileges` above.
 
 ## The unattended arm of the write plane
 

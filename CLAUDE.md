@@ -55,9 +55,12 @@ ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook 
   `common` role does.
 - **Approving a pending node is `openclaw nodes approve <id>`**, not `devices approve` —
   different tables (`nodes status --json` vs `devices list --json`).
-- **`pve-router` is deliberately excluded** from `openclaw_nodes`. It runs an
-  independently-managed node this repo must not touch. Omission from the group is the only
-  thing protecting it — no play should ever target it by name.
+- **`pve-router` joined `openclaw_nodes` 2026-08-04**, after previously being deliberately
+  excluded. It had been running an independently-managed node this repo never touched; now
+  it converges normally via `deploy-openclaw.yml`/`update-openclaw.yml`/`validate-openclaw.yml`,
+  including the weekly timer. It hosts the OPNsense VM for the whole house network, so treat
+  it carefully — see README.md and `homelab-vault` TODO.md for the fuller writeup (that TODO
+  item is about managing the hypervisor/OPNsense itself, which is still out of scope here).
 - **`haos` is not in the inventory at all, on purpose.** It is Home Assistant OS — immutable,
   no apt, read-only `/usr`, no persistent `useradd`, no sshd — so the openclaw roles cannot
   run on it and adding it would only break every `hosts: all` play. Don't "fix" its absence.

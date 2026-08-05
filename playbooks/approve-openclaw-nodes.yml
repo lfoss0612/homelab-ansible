@@ -3,9 +3,12 @@
 # included from deploy-openclaw.yml or update-openclaw.yml. Auto-approves only
 # entries whose displayName matches an openclaw_nodes inventory hostname (nodes
 # are started with --display-name {{ inventory_hostname }}, so the two should
-# always agree); anything else — including pve-router (deliberately not in
-# openclaw_nodes) and non-infrastructure devices like phone clients — is
-# reported but left untouched for a human to look at.
+# always agree); anything else — non-infrastructure devices like phone clients,
+# for example — is reported but left untouched for a human to look at.
+#
+# pve-router joined openclaw_nodes 2026-08-04, so its already-registered node
+# (previously reported-unmatched here since it predates this repo managing it)
+# will now auto-match and auto-approve like any other host.
 #
 # There are TWO pending queues, and a node onboarding hits the second one:
 #

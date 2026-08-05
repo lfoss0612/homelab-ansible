@@ -23,16 +23,21 @@ workstation, since cockpit has no push credentials.
 
 ### OpenClaw fleet
 
-`openclaw_nodes` = `openclaw_proxmox` (`pve`, `pve-ai` only) + `qemu_vms` + `lxc` +
-`bare_metal` + `k8s` — **13 hosts**.
+`openclaw_nodes` = `openclaw_proxmox` (`pve`, `pve-ai`, `pve-router`) + `qemu_vms` + `lxc` +
+`bare_metal` + `k8s` — **14 hosts**.
 `openclaw.home.lan` (the gateway) is a deliberate member: it runs both
 `openclaw-gateway.service` and `openclaw-node.service`, managing its own VM as well as
 brokering the rest of the fleet.
 
-**`pve-router` is intentionally excluded** from `openclaw_nodes`. It runs a live,
+**`pve-router` joined `openclaw_nodes` 2026-08-04.** It already ran a live,
 independently-managed OpenClaw node (`openclaw-node.service`, registered with the gateway)
-that this repo does not touch — decommissioning it is a separate, unscheduled task. Omission
-from the group is what protects it; no play in this repo should ever target it by name.
+that this repo previously never touched; it now converges through the same
+`deploy-openclaw.yml`/`update-openclaw.yml`/`validate-openclaw.yml` path as every other
+node, including the weekly `openclaw-fleet-update` timer. This host hosts the OPNsense VM
+the whole house network runs on — see `homelab-vault` TODO.md, "Bring `pve-router` and
+OPNsense under Ansible management", for the broader (still unscheduled) risk writeup about
+managing the *hypervisor itself*; that concern is separate from the openclaw-node agent
+covered here.
 
 **`openclaw_optional`** (currently just `desktop`) is a behavioural overlay on top of the
 topology groups, not a separate tier: those hosts are full `openclaw_nodes` and are
@@ -89,7 +94,7 @@ root-equivalent sudo on all 12 hosts, how the roles revoke it, and the unattende
 |---|---|
 | `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then all of `openclaw_nodes` in full — no gateway subtraction, since the gateway is deliberately a node too. `openclaw_optional` hosts get the same role in a trailing `ignore_unreachable` play. |
 | `playbooks/update-openclaw.yml` | Fleet convergence: verify-before-mutate (compares `openclaw --version` against the `openclaw_version` pin, not a build hash — there's no build any more), gateway first, nodes serialized with a per-host health gate, skipping any host already converged. Phase 4 repeats phase 3 for `openclaw_optional`; both share `playbooks/tasks/converge-openclaw-node.yml`. |
-| `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean. `pve-router` is report-only — printed, never asserted against, never targeted. `openclaw_optional` hosts are asserted when up and reported when off. |
+| `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean, now including `pve-router` like any other node. `openclaw_optional` hosts are asserted when up and reported when off. |
 | `playbooks/approve-openclaw-nodes.yml` | Explicit-invocation-only: auto-approves pending node pairing requests whose display name matches an inventory host; dry-run unless `-e openclaw_approve_confirm=true`. |
 | `playbooks/decommission-openclaw-node.yml` | Tears down a single node (`-e target_host=<host>`), parameterised, no group target. Refuses the gateway host outright — its `/opt/openclaw` is the source-tree fallback, not a node install. |
 | `playbooks/openclaw-automation.yml` | Installs the weekly `openclaw-fleet-update` timer on the control node and retires the legacy self-updaters (cockpit's `openclaw-sync` units, the gateway's archived `openclaw-update` files). Installs automation only — it changes no OpenClaw install itself. |

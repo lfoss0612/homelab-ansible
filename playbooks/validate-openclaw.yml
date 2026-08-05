@@ -5,10 +5,10 @@
 # accident — the gateway is deliberately a node now (it manages its own VM),
 # so this file instead asserts it runs BOTH services.
 #
-# pve-router is report-only: it is deliberately unmanaged, so it is never a
-# member of openclaw/openclaw_nodes and this playbook never asserts against
-# it or targets it for change — the last play below only reads and prints
-# its state, for visibility that it hasn't silently dropped off.
+# pve-router joined openclaw_nodes 2026-08-04 (previously excluded — see git
+# history/README for that era's reasoning) and is now covered by the main
+# strict assertion play below like any other node; the old dedicated
+# report-only play for it was removed since it would just duplicate that.
 #
 # [openclaw_optional] hosts are managed, but are legitimately powered off part
 # of the time. They are asserted against exactly like any other node WHEN they
@@ -326,28 +326,3 @@
         success_msg: >-
           openclaw doctor: no errors across {{ openclaw_doctor_report.checksRun }} checks
           ({{ openclaw_doctor_warnings | length }} warning(s) reported above).
-
-- name: Report pve-router state (report-only — deliberately unmanaged, never asserted, never targeted for change)
-  hosts: pve-router.home.lan
-  gather_facts: false
-  become: true
-
-  tasks:
-    - name: Check openclaw-node service state
-      ansible.builtin.command: systemctl is-active openclaw-node
-      register: openclaw_pve_router_service
-      changed_when: false
-      failed_when: false
-
-    - name: Check installed openclaw version
-      ansible.builtin.command: openclaw --version
-      register: openclaw_pve_router_version
-      changed_when: false
-      failed_when: false
-
-    - name: Report pve-router state
-      ansible.builtin.debug:
-        msg: >-
-          pve-router openclaw-node service: {{ openclaw_pve_router_service.stdout | default('unknown') }};
-          version: {{ openclaw_pve_router_version.stdout | default('unknown') }}
-          — report-only, not managed by this migration, not asserted against.
