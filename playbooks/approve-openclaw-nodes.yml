@@ -59,6 +59,21 @@
   vars:
     openclaw_approve_confirm: false
 
+  # gateway.auth.token resolves as {"source": "env", "id":
+  # "OPENCLAW_GATEWAY_AUTH_TOKEN"} (openclaw config get gateway.auth). That
+  # var only exists inside openclaw-gateway.service's own process (injected
+  # by an out-of-band systemd drop-in, /etc/systemd/system/openclaw-gateway.
+  # service.d/override.conf -- not templated by this repo, same as any other
+  # secret). A command run outside that unit -- which is exactly what every
+  # task below does via become_user -- doesn't inherit it, so any CLI command
+  # that needs gateway auth (approve/devices, not the read-only status query)
+  # fails with "gateway.auth.token is configured as a secret reference but is
+  # unavailable in this command path." openclaw_gateway_token (group_vars/
+  # openclaw.yml, vault-encrypted) is the same value already confirmed live
+  # 2026-08-04 -- reuse it here instead of touching the out-of-band drop-in.
+  environment:
+    OPENCLAW_GATEWAY_AUTH_TOKEN: "{{ openclaw_gateway_token }}"
+
   tasks:
     - name: Query node status from the gateway
       ansible.builtin.command: openclaw nodes status --json
