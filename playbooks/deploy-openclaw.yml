@@ -16,6 +16,10 @@
   hosts: openclaw_nodes:!openclaw_optional
   serial: 1
   become: true
+  pre_tasks:
+    - name: Confirm pve-router before any write-capable role runs
+      ansible.builtin.include_tasks: tasks/confirm-pve-router.yml
+      tags: always
   roles:
     - role: openclaw.node.node
       tags: node

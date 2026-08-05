@@ -9,6 +9,9 @@
 
   tasks:
 
+    - name: Confirm pve-router before provisioning users
+      ansible.builtin.include_tasks: ../tasks/confirm-pve-router.yml
+
     - name: Ensure ansible user exists
       ansible.builtin.user:
         name: "{{ ansible_user_name }}"

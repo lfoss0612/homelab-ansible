@@ -4,6 +4,9 @@
   become: yes
 
   tasks:
+    - name: Confirm pve-router before editing sudoers
+      ansible.builtin.include_tasks: ../tasks/confirm-pve-router.yml
+
     - name: Remove requiretty restriction if present
       ansible.builtin.lineinfile:
         path: /etc/sudoers

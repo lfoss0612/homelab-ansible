@@ -295,6 +295,49 @@ Related, from `openclaw doctor --lint`: `gateway.auth.token` is stored **in plai
 that can read config files may see these API keys/tokens". The `openclaw` identity is
 exactly such a reader, and that token is the fleet-wide node credential.
 
+## pve-router — out-of-band recovery path
+
+`pve-router` joined `openclaw_nodes` 2026-08-04 (see the DNS resolver assertion section
+above) via the same `openclaw_nodes`/`deploy-openclaw.yml` path as every other Proxmox
+host, no special-casing. That host is higher-risk than the rest of the fleet: it's the
+hypervisor for the OPNsense VM that the whole house network routes through, and for
+`cockpit`, the Ansible control node itself. A bad play here can take down the network and
+the control path used to fix it in the same stroke. `homelab-vault` `TODO.md`'s "Bring
+pve-router and OPNsense under Ansible management" item requires a documented,
+network-independent recovery path *before* any write-capable play is allowed to target
+this host — that's now written up in the vault, not duplicated here: see
+`Proxmox/ops/pve-router-recovery.md` (direct Proxmox-UI-over-a-patched-cable as primary,
+physical console as fallback; documented 2026-08-04, not yet rehearsed end-to-end).
+
+With that documented, the precondition the TODO called for is met for the *access* half of
+the risk.
+
+**The execution-model half is now implemented too, scoped down from a separate playbook
+path to a procedural + technical gate (2026-08-04):**
+
+- **Procedural:** any write-capable play targeting `pve-router` should get a mandatory
+  `--check --diff` dry run first, read by a human, before running live — same practice
+  that already caught real bugs during the DNS/networkd rollouts above. Not enforced by
+  tooling; a discipline to follow.
+- **Technical:** `playbooks/tasks/confirm-pve-router.yml` is a reusable gate — `meta:
+  end_host` for `pve-router.home.lan` unless `-e confirm_pve_router=true` is passed,
+  with a `debug` report first so a skip is visible in the run output, not silent.
+  Imported as the first task of every write-capable play whose host pattern can include
+  `pve-router.home.lan`: `deploy-openclaw.yml` (the nodes play), `bootstrap/install-acl.yml`,
+  `bootstrap/nodesource-repo.yml`, `users/ansible-user.yml`, `users/lfoss-user.yml`,
+  `users/disable-requiretty.yml`. `decommission-openclaw-node.yml` gets an explicit
+  `assert` instead (louder failure, appropriate for a single-named-target playbook rather
+  than a fleet sweep). Read-only plays (`validate-openclaw.yml`) don't need it.
+- **Deliberately not gated: `update-openclaw.yml`.** That's the weekly-timer path, and
+  `pve-router`'s automatic weekly convergence there is an already-made decision
+  (2026-08-04), not an accidental sweep — gating it would silently stop `pve-router` from
+  ever auto-updating. See `TODO.md` for the planned replacement: an ntfy push notification
+  with an approval button that triggers a confirmed run, rather than either blind
+  auto-convergence or blind skipping.
+
+The remaining piece — real hypervisor/OPNsense-scope automation (`pct`/`qm` config, VM
+lifecycle, OPNsense's own config) — is still unstarted; see `TODO.md`.
+
 ## TODO — gateway security, next up
 
 Deferred by decision on 2026-08-01 behind the cockpit convergence timer, which is now

@@ -29,6 +29,9 @@
     nodesource_key_url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
 
   tasks:
+    - name: Confirm pve-router before installing/mutating packages
+      ansible.builtin.include_tasks: ../tasks/confirm-pve-router.yml
+
     - name: Skip non-Debian-family hosts
       ansible.builtin.meta: end_host
       when: ansible_facts.os_family != 'Debian'

@@ -5,6 +5,9 @@
 
   tasks:
 
+    - name: Confirm pve-router before installing/mutating packages
+      ansible.builtin.include_tasks: ../tasks/confirm-pve-router.yml
+
     - name: Repair broken apt packages if needed
       ansible.builtin.command:
         cmd: apt-get -f install -y

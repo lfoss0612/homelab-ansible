@@ -1,0 +1,36 @@
+---
+# Backstop so pve-router -- hypervisor for the house's own router (OPNsense,
+# VM 106) and for cockpit (the Ansible control node) -- never gets mutated by
+# a broad/unscoped play without a deliberate, in-the-moment decision to
+# include it. See homelab-vault TODO.md, "Bring pve-router and OPNsense under
+# Ansible management", and docs/execution-model.md, "pve-router -- out-of-band
+# recovery path".
+#
+# Import as the first task (or first pre_task) of any write-capable play
+# whose host pattern can include pve-router.home.lan. Read-only/assertion-only
+# plays (e.g. validate-openclaw.yml) don't need it -- they mutate nothing.
+#
+# The weekly openclaw-fleet-update timer (update-openclaw.yml) deliberately
+# does NOT import this: pve-router's automatic weekly convergence is a
+# separate, already-made decision, not an accidental sweep. See TODO.md for
+# the planned ntfy-notification-with-approval-button replacement for that
+# path.
+#
+# Usage: ansible-playbook <playbook> -e confirm_pve_router=true
+
+- name: Report pve-router is being skipped without explicit confirmation
+  ansible.builtin.debug:
+    msg: >-
+      Skipping pve-router.home.lan -- pass -e confirm_pve_router=true to
+      include it. It is the hypervisor for OPNsense and cockpit; read
+      docs/execution-model.md, "pve-router -- out-of-band recovery path",
+      before doing so.
+  when:
+    - inventory_hostname == 'pve-router.home.lan'
+    - not (confirm_pve_router | default(false) | bool)
+
+- name: Skip pve-router unless explicitly confirmed for this run
+  ansible.builtin.meta: end_host
+  when:
+    - inventory_hostname == 'pve-router.home.lan'
+    - not (confirm_pve_router | default(false) | bool)

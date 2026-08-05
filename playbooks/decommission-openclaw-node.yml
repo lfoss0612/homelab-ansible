@@ -43,6 +43,16 @@
           gateway's source tree, not a node install — this playbook does not
           support decommissioning it.
 
+    - name: Require explicit confirmation to target pve-router
+      ansible.builtin.assert:
+        that:
+          - target_host != 'pve-router.home.lan' or (confirm_pve_router | default(false) | bool)
+        fail_msg: >-
+          '{{ target_host }}' is pve-router — the hypervisor for OPNsense and
+          cockpit. Pass -e confirm_pve_router=true to proceed, and read
+          docs/execution-model.md, "pve-router — out-of-band recovery path",
+          first.
+
 - name: Decommission OpenClaw node
   hosts: "{{ target_host }}"
   become: true
