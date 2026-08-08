@@ -1,6 +1,11 @@
 ---
 openclaw_user: openclaw
 openclaw_group: openclaw
+
+# Where the openclaw user's own systemd manager reads unit files from. Only
+# consumed by purge-legacy-user-units.yml, which deletes the pre-npm-rewrite
+# units that still live here; this role installs nothing into it.
+openclaw_user_unit_dir: "/home/{{ openclaw_user }}/.config/systemd/user"
 openclaw_version: "latest"
 openclaw_node_gateway_host: "10.0.5.7"
 openclaw_node_gateway_port: 18789

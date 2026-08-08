@@ -47,3 +47,9 @@
     name: openclaw-node
     enabled: true
     state: started
+
+# After the system unit above is confirmed running, so a host is never left
+# with neither the legacy user unit nor a working system one.
+- name: Purge pre-npm-rewrite units from the openclaw user manager
+  ansible.builtin.include_tasks: purge-legacy-user-units.yml
+  tags: [purge-legacy]

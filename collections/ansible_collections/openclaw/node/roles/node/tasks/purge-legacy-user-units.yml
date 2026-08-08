@@ -1,0 +1,106 @@
+---
+# Remove the pre-npm-rewrite OpenClaw units from the *openclaw user's* systemd
+# manager. They predate this role (unit files dated Apr/May 2026) and are fully
+# superseded by the root-owned /etc/systemd/system/openclaw-node.service that
+# tasks/main.yml installs — every host in the fleet has that system unit and it
+# is the one actually running the node.
+#
+# Left in place they are not merely dead, they are hot:
+#
+#   openclaw-node.service   carries `User=openclaw`. An unprivileged user
+#                           manager cannot setgroups, so it dies instantly with
+#                           "Failed to determine supplementary groups:
+#                           Operation not permitted" / status=216/GROUP. With
+#                           Restart=always + RestartSec=5 it respawns every 5
+#                           seconds, forever — 663k restarts on pve-ai, 622k on
+#                           k8s-worker-2 when this was found (2026-08-08).
+#   openclaw-agent.service  runs a hand-rolled /home/openclaw/agent/agent.js
+#                           that exits immediately and loops the same way.
+#
+# Both are enabled through ~/.config/systemd/user/default.target.wants, and the
+# openclaw user has linger on, so the loop runs on every host from boot with no
+# one logged in.
+#
+# Selection is by *file content*, not by hostname: a unit is only touched if it
+# carries one of the two markers above. Hosts that never had the old layout are
+# no-ops, and the gateway — whose user units are a different, working set with
+# no `User=` line — is left alone by construction. This is what makes the task
+# safe to leave in the weekly convergence path.
+
+- name: Find legacy pre-rewrite OpenClaw units in the openclaw user manager
+  # `contains` is a per-line regex search. The two alternatives are the exact
+  # failure signatures above; nothing a current unit file contains matches.
+  ansible.builtin.find:
+    paths: "{{ openclaw_user_unit_dir }}"
+    patterns: "openclaw-*.service"
+    file_type: file
+    contains: '^(User=|ExecStart=.*/agent/agent\.js)'
+  register: openclaw_legacy_user_units
+
+- name: Purge legacy user units
+  when: openclaw_legacy_user_units.matched | int > 0
+  block:
+    - name: Report what is about to be removed
+      # Cheap, but this is a destructive step gated on a regex — make the file
+      # list visible in the run output (and in --check) before it goes.
+      ansible.builtin.debug:
+        msg: >-
+          Removing {{ openclaw_legacy_user_units.matched }} legacy user unit(s):
+          {{ openclaw_legacy_user_units.files | map(attribute='path') | join(', ') }}
+
+    - name: Stop and disable legacy user units
+      # --machine=<user>@.host reaches the lingering user manager from root
+      # without needing become_user + XDG_RUNTIME_DIR plumbing. `disable --now`
+      # both stops the unit and drops its default.target.wants symlink, which
+      # must happen while the unit file still exists — hence before the removal
+      # below. Never fails the run: a unit already stopped/not-enabled, or a
+      # user manager that is not running, is a success for our purposes.
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - "--machine={{ openclaw_user }}@.host"
+          - "--user"
+          - disable
+          - "--now"
+          - "{{ item.path | basename }}"
+      loop: "{{ openclaw_legacy_user_units.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: openclaw_legacy_disable
+      changed_when: openclaw_legacy_disable.rc == 0
+      failed_when: false
+      check_mode: false
+
+    - name: Remove legacy user unit files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ openclaw_legacy_user_units.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Remove any orphaned default.target.wants symlinks
+      # Belt and braces: if the user manager was unreachable above, `disable`
+      # could not remove these and a dangling symlink would keep systemd
+      # warning on every daemon-reload.
+      ansible.builtin.file:
+        path: "{{ openclaw_user_unit_dir }}/default.target.wants/{{ item.path | basename }}"
+        state: absent
+      loop: "{{ openclaw_legacy_user_units.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Reload the openclaw user manager and clear failed state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - "--machine={{ openclaw_user }}@.host"
+          - "--user"
+          - "{{ item }}"
+      loop:
+        - daemon-reload
+        - reset-failed
+      register: openclaw_legacy_reload
+      changed_when: openclaw_legacy_reload.rc == 0
+      failed_when: false
+      check_mode: false
