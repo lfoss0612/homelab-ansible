@@ -1,0 +1,52 @@
+---
+# Download OPNsense's full config.xml to the control node.
+#
+# Thin wrapper around tasks/opnsense-backup-config.yml, which is also included
+# directly by playbooks/opnsense-unbound.yml as its pre-write rollback
+# artefact. Run this standalone to take an ad-hoc backup, or before any manual
+# change in the OPNsense UI.
+#
+# The backup contains the internal CA's PRIVATE KEY and every certificate's
+# private key — it is written to /var/backups/opnsense (0700 dir, 0600 files,
+# root-owned) on the control node and must never reach git.
+#
+# Usage:
+#   ansible-playbook playbooks/opnsense-backup-config.yml --check --diff
+#   ansible-playbook playbooks/opnsense-backup-config.yml
+
+- name: Back up the OPNsense configuration
+  hosts: network_appliances
+  # See group_vars/network_appliances.yml: ansible_connection is local, so the
+  # play must not become. Tasks needing root on the control node escalate
+  # individually.
+  become: false
+  gather_facts: true
+
+  tasks:
+    - name: Assert API credentials are present
+      ansible.builtin.assert:
+        that:
+          - opnsense_api_key | default('') | length > 0
+          - opnsense_api_secret | default('') | length > 0
+        fail_msg: >-
+          opnsense_api_key/opnsense_api_secret are empty in
+          group_vars/network_appliances.yml. See that file for the
+          ansible-vault encrypt_string instructions.
+        quiet: true
+
+    - name: Download and validate the config backup
+      ansible.builtin.include_tasks: tasks/opnsense-backup-config.yml
+
+    # Standalone runs SHOULD fail loudly on a bad backup — unlike the write
+    # path, where a bad backup merely skips the writes.
+    - name: Assert the backup succeeded
+      ansible.builtin.assert:
+        that:
+          - opnsense_backup_ok | bool
+        fail_msg: >-
+          The OPNsense config backup at {{ opnsense_backup_path }} is missing,
+          truncated, or not valid XML. Check that the API user holds the
+          "System: Configuration: Backups" privilege.
+        success_msg: "Backup written and validated: {{ opnsense_backup_path }}"
+        quiet: true
+      when: not ansible_check_mode

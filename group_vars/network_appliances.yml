@@ -1,0 +1,95 @@
+---
+# group_vars/network_appliances.yml
+#
+# Connection and API settings for appliances managed over HTTP rather than SSH.
+# Currently only OPNsense — see inventory.ini, [network_appliances].
+
+# OPNsense is reached over its REST API from the control node itself; there is
+# no SSH/Python transport on the appliance. `local` means every task in an
+# OPNsense play executes ON COCKPIT.
+#
+# become MUST therefore be off. ansible.cfg sets `[privilege_escalation]
+# become = True` globally, which would sudo every API call to root on the
+# control node for no reason — and root's Python may not see the httpx install.
+# Every OPNsense play ALSO carries the `become: false` play keyword; that is
+# the primary control (a play keyword beats both this var and the config
+# default). This var is the backstop for ad-hoc `ansible opnsense.home.lan -m
+# uri ...` runs, which have no play keyword.
+#
+# ansible_user / ansible_ssh_private_key_file are inherited from [all:vars] and
+# are simply ignored by the local connection plugin. Do not "fix" them.
+ansible_connection: local
+ansible_become: false
+
+# --- API endpoint ------------------------------------------------------------
+#
+# Reached through HAProxy at opnsense.home.lan (10.0.3.1:443), NOT directly at
+# 10.0.5.1:8443. This is the opposite of what it looks like it should be, so
+# the reason is recorded here:
+#
+# The GUI/API listener on 10.0.5.1:8443 presents the PUBLIC ACME wildcart cert
+# `*.fosshomelab.duckdns.org` (issuer: Let's Encrypt), whose only SAN is that
+# DNS name. It therefore cannot be validated when connecting by IP, nor
+# against the internal CA. Verified 2026-08-06:
+#   openssl s_client -connect 10.0.5.1:8443 ... -> CN=*.fosshomelab.duckdns.org
+#   curl --cacert home-lan-ca.crt https://10.0.5.1:8443/api/... -> ssl_verify=1
+# The duckdns name itself resolves to 74.140.34.13, the WAN address, so using
+# it would route API traffic out to the public interface.
+#
+# HAProxy's frontend serves the internal `*.home.lan` leaf issued by the Home
+# LAN Internal CA, which this repo already ships and installs fleet-wide. That
+# validates cleanly today with no OPNsense-side change:
+#   curl --cacert home-lan-ca.crt https://opnsense.home.lan/api/... -> ssl_verify=0
+#
+# ACCEPTED TRADEOFF: this routes API calls that manage the DNS resolver through
+# a hostname that same resolver answers for. If Unbound were broken badly
+# enough that `opnsense.home.lan` stopped resolving, these plays would lose
+# their path to the box. That is tolerable because the documented rollback for
+# any DNS change is the GUI at https://10.0.5.1:8443 BY IP — which needs no
+# DNS at all and is guaranteed reachable from the LAB VLAN by the OPNsense
+# anti-lockout firewall rule. The recovery path never depended on Ansible.
+#
+# To remove the circularity, issue a leaf from the internal CA with
+# `DNS:opnsense.home.lan` + `IP:10.0.5.1` SANs and select it under System >
+# Settings > Administration, then repoint opnsense_api_base at
+# https://10.0.5.1:8443/api. Nothing else here changes.
+opnsense_api_host: "opnsense.home.lan"
+opnsense_api_base: "https://{{ opnsense_api_host }}/api"
+
+# The internal root CA, shipped at
+# collections/ansible_collections/openclaw/node/roles/common/files/home-lan-ca.crt
+# and installed here by the common role. The vault's scripts/sync-opnsense.py
+# sets CERT_NONE; that is deliberately NOT copied — disabling verification
+# against the box that IS the CA is indefensible, and it would send the API
+# credential to whatever happens to answer on that address.
+opnsense_api_ca_file: /usr/local/share/ca-certificates/home-lan-ca.crt
+
+# --- Credentials -------------------------------------------------------------
+#
+# A dedicated `ansible-writer` API user, distinct from the one the vault's
+# scripts/sync-opnsense.py uses (VAULT_OPNSENSE_KEY/_SECRET). One credential
+# serving two callers means neither can be revoked or re-scoped without
+# breaking the other, and the OPNsense audit log cannot tell them apart.
+#
+# Create: System > Access > Users > (add ansible-writer) > Edit > add API key.
+# Grant ONLY:
+#   - System: Configuration: Backups   (required by /core/backup/download/this)
+#   - Services: Unbound DNS
+#
+# Then store both values here, encrypted. ansible.cfg already points at
+# /etc/ansible-vault-password, so no --vault-password-file is needed:
+#   ansible-vault encrypt_string --name opnsense_api_key    '<key>'
+#   ansible-vault encrypt_string --name opnsense_api_secret '<secret>'
+# and paste the resulting `!vault |` blocks below, replacing these lines.
+#
+# Named opnsense_api_* rather than a bare api_key/api_secret on purpose: bare
+# names get passed straight through as module args, and a generic name in
+# group_vars would leak into any other module that happens to accept one.
+# Reusing one variable for two meanings is exactly what caused the OpenClaw
+# gateway outage during the HAProxy migration.
+#
+# Until these are filled in, playbooks/opnsense-facts.yml fails its
+# credentials-present assert with instructions. Nothing writes to OPNsense
+# without them.
+opnsense_api_key: ""
+opnsense_api_secret: ""

@@ -1,0 +1,137 @@
+---
+# Download OPNsense's full config.xml to the control node.
+#
+# Included by playbooks/opnsense-backup-config.yml (standalone) and by
+# playbooks/opnsense-unbound.yml (as the pre-write rollback artefact).
+#
+# ############################################################################
+# # config.xml contains the Home LAN Internal CA's PRIVATE KEY, every         #
+# # certificate's private key, ACME account keys, and hashed local passwords. #
+# # It must NEVER be committed to git and never land inside /opt/ansible.     #
+# ############################################################################
+#
+# Sets, for the caller:
+#   opnsense_backup_path   the file written this run
+#   opnsense_backup_ok     true only when a validated backup exists on disk
+#
+# Callers that mutate OPNsense MUST gate their write tasks on
+# opnsense_backup_ok. A failed backup makes the writes skip — a safe no-op —
+# rather than proceeding without a rollback path. Performing the irreversible
+# step before proving the safety net exists is what turned the pdm config
+# issue into a live outage.
+#
+# Params (both optional, defaulted here):
+#   opnsense_backup_dir    default /var/backups/opnsense
+#   opnsense_backup_keep   default 14
+
+- name: Set backup defaults
+  ansible.builtin.set_fact:
+    opnsense_backup_dir: "{{ opnsense_backup_dir | default('/var/backups/opnsense') }}"
+    opnsense_backup_keep: "{{ opnsense_backup_keep | default(14) | int }}"
+    opnsense_backup_ok: false
+  changed_when: false
+
+# /var/backups is already this repo's backup convention (the gateway and common
+# roles both use it). Root-owned and 0700 because of what the contents are.
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ opnsense_backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+
+- name: Set the backup destination path
+  ansible.builtin.set_fact:
+    opnsense_backup_path: >-
+      {{ opnsense_backup_dir }}/config-{{ ansible_date_time.iso8601_basic_short }}.xml
+  changed_when: false
+
+- name: Report the intended backup destination
+  ansible.builtin.debug:
+    msg: >-
+      Would write {{ opnsense_backup_path }} (0600, root) from
+      {{ opnsense_api_base }}/core/backup/download/this
+  when: ansible_check_mode
+
+# Requires the API user to hold "System: Configuration: Backups".
+- name: Download the OPNsense config.xml
+  ansible.builtin.uri:
+    url: "{{ opnsense_api_base }}/core/backup/download/this"
+    method: GET
+    url_username: "{{ opnsense_api_key }}"
+    url_password: "{{ opnsense_api_secret }}"
+    force_basic_auth: true
+    validate_certs: true
+    ca_path: "{{ opnsense_api_ca_file }}"
+    dest: "{{ opnsense_backup_path }}"
+    mode: "0600"
+    owner: root
+    group: root
+    timeout: 60
+  register: opnsense_backup_result
+  become: true
+  no_log: true
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Stat the downloaded backup
+  ansible.builtin.stat:
+    path: "{{ opnsense_backup_path }}"
+  register: opnsense_backup_stat
+  become: true
+  when: not ansible_check_mode
+
+- name: Read the head of the downloaded backup
+  ansible.builtin.command: "head -c 4096 {{ opnsense_backup_path }}"
+  register: opnsense_backup_head
+  become: true
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: not ansible_check_mode
+
+# An HTTP error page or a truncated download will happily "succeed" as a 200
+# with a file on disk. That failure would be discovered only at the moment the
+# backup was actually needed, which is the worst possible time.
+- name: Record whether the backup is a plausible OPNsense config
+  ansible.builtin.set_fact:
+    opnsense_backup_ok: >-
+      {{ (opnsense_backup_stat.stat.exists | default(false))
+         and ((opnsense_backup_stat.stat.size | default(0)) > 10000)
+         and ('<opnsense>' in (opnsense_backup_head.stdout | default(''))) }}
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Report the backup result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'OK: ' ~ opnsense_backup_path ~ ' ('
+         ~ (opnsense_backup_stat.stat.size | default(0)) ~ ' bytes)'
+         if (opnsense_backup_ok | bool)
+         else 'FAILED: ' ~ opnsense_backup_path ~ ' is missing, truncated, or not
+              XML (exists=' ~ (opnsense_backup_stat.stat.exists | default(false))
+              ~ ', size=' ~ (opnsense_backup_stat.stat.size | default(0)) ~ ').
+              Any caller that writes to OPNsense will now SKIP its writes,
+              deliberately — there is no rollback artefact.' }}
+  when: not ansible_check_mode
+
+- name: Find existing backups
+  ansible.builtin.find:
+    paths: "{{ opnsense_backup_dir }}"
+    patterns: "config-*.xml"
+  register: opnsense_backup_existing
+  become: true
+  changed_when: false
+
+- name: Prune backups beyond the retention limit
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  become: true
+  loop: >-
+    {{ (opnsense_backup_existing.files
+        | sort(attribute='mtime', reverse=true))[opnsense_backup_keep | int:] }}
+  loop_control:
+    label: "{{ item.path }}"

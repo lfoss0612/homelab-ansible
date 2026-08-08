@@ -307,7 +307,7 @@ pve-router and OPNsense under Ansible management" item requires a documented,
 network-independent recovery path *before* any write-capable play is allowed to target
 this host — that's now written up in the vault, not duplicated here: see
 `Proxmox/ops/pve-router-recovery.md` (direct Proxmox-UI-over-a-patched-cable as primary,
-physical console as fallback; documented 2026-08-04, not yet rehearsed end-to-end).
+physical console as fallback; documented 2026-08-04 and since rehearsed end-to-end).
 
 With that documented, the precondition the TODO called for is met for the *access* half of
 the risk.
@@ -338,8 +338,97 @@ path to a procedural + technical gate (2026-08-04):**
 **LXC/pct config automation is now implemented** (2026-08-05): `playbooks/proxmox-config.yml`
 reads current config, compares against declared state in `host_vars`, and runs `pct set` only
 for settings that differ — idempotent and safe with `--check --diff`. The concrete forcing
-case (cockpit/pdm nameserver fixing DNS resolution) is covered. VM lifecycle, storage, and
-OPNsense's own config remain unstarted; see `TODO.md`.
+case (cockpit/pdm nameserver fixing DNS resolution) is covered.
+
+**`qm` config, a denylist, and a per-guest gate followed** (2026-08-07). Three things
+changed:
+
+- The comparison in `tasks/proxmox-apply-config.yml` was rewritten from `when`-driven to
+  data-driven. The old form compared a regex-extracted first line against `value | string`
+  inside the apply task's `when:`, which had four failure modes — all latent only because
+  the single consumer was a one-token `nameserver`. A boolean (`onboot: true` → `"True"`
+  vs. Proxmox's `1`) never compared equal and would have re-applied on every run forever;
+  a space-separated value was split into separate argv elements so it could never land;
+  property strings compared unequal on ordering alone; and multi-line `description`
+  continuation lines could be mis-read as config keys. The rewrite parses into a map,
+  canonicalises (booleans → `1`/`0`, property strings sorted, whitespace collapsed but
+  **order preserved**, since `nameserver` is an ordered preference list), builds an explicit
+  diff list, reports it under `--check`, and applies with `argv`. Idempotence is now a
+  property of the diff list being empty. There is no regex, so the injection surface is
+  gone too.
+- `tasks/proxmox-assert-safe-keys.yml` refuses any declared key matching a
+  hardware/boot/storage prefix denylist — `hostpci*` (OPNsense's igc0/igc1/igc2
+  passthrough), `scsi*`/`sata*`/`ide*`/`virtio*`/`nvme*`/`rootfs`/`mp*`/`unused*`/`efidisk*`,
+  `net*` (which for `pct` would sever cockpit from itself), `boot*`/`bios`/`machine`/
+  `ostype`/`arch` (VM 106 is OVMF/q35 — a flip there bricks boot silently until next
+  start), plus `args`, `tpmstate*`, `smbios*`, `vmgenid`, `cipassword`, `template`, and
+  `description` (which cannot be safely compared, so it must not be declarable). These are
+  `assert` tasks specifically because `assert` is pure-Python and fires identically under
+  `--check`; a `fail` guarded by a `command` probe would be skipped in check mode and the
+  gate would silently pass. `protection` is deliberately *not* on the denylist — declaring
+  `protection: 1` gives drift detection on the most important safety flag on VM 106 — but a
+  companion assert refuses any attempt to set it to a false value. Ansible may turn
+  protection on, never off.
+- `proxmox_protected_vmids` adds a second, narrower gate: `confirm_pve_router=true` unlocks
+  the *host*, `confirm_protected_vmids=true` unlocks the listed *guests* on it. Report-then-
+  skip, matching `confirm-pve-router.yml`, so a default run still converges everything else
+  and simply reports what was held back.
+
+The first `proxmox_qm_config` consumer (VM 106) is deliberately a **no-op**: every declared
+value is already true on the live VM, so a correct run reports zero changes. It exercises
+the read/parse/compare path with no write risk while converting four facts that lived only
+in the Proxmox UI into git-tracked declared state.
+
+VM lifecycle, storage, and PBS/backup-job configuration remain unstarted; see `TODO.md`.
+
+## OPNsense — write plane is the REST API, not SSH
+
+Recorded here so the decision is not relitigated. Classic SSH+Python Ansible — the pattern
+every `openclaw/node` role uses — **does not fit OPNsense**:
+
+- SSH lands in a locked-down console menu. A root shell is reachable via option 8, but
+- it is a FreeBSD appliance with **no Python**, and
+- config lives in a single XML file managed by OPNsense's own backend, not in the
+  individual files the standard modules edit.
+
+Manually `pkg install`-ing Python to force the standard modules to work fights the appliance
+model and risks being wiped by a firmware upgrade — the same objection that keeps `haos`
+out of the inventory entirely. The write plane is therefore its **REST API**, called from
+the control node with a dedicated API key.
+
+Staged read-only first, deliberately:
+
+1. **Connectivity + drift detection** (`opnsense-facts.yml`) and **config backup**
+   (`opnsense-backup-config.yml`) use `ansible.builtin.uri` and depend on no third-party
+   collection at all. All of the read-only value therefore survives even if the collection
+   turns out to be unsuitable.
+2. **Exactly one object type is writable** (`opnsense-unbound.yml`: Unbound host overrides,
+   create and update only). Everything else — firewall rules, aliases, NAT, interfaces,
+   HAProxy, VPN, the internal CA, ACME — stays manual. There is **no delete path** in the
+   repo, and the ~43 overrides that are not declared are reported and never touched, because
+   five of the six pages of them have never been reviewed by a human.
+
+Two endpoint facts worth recording, both verified 2026-08-06 rather than assumed:
+
+- **The API is reached through HAProxy at `opnsense.home.lan`, not directly at
+  `10.0.5.1:8443`.** That direct listener presents the *public* ACME wildcard
+  `*.fosshomelab.duckdns.org` (issuer: Let's Encrypt), whose only SAN is that DNS name — so
+  it cannot be validated by IP nor against the internal CA, and the duckdns name itself
+  resolves to the WAN address. HAProxy's frontend serves the internal `*.home.lan` leaf,
+  which validates against the CA this repo already ships. The accepted tradeoff is that API
+  calls managing the resolver route through a name that resolver answers for; that is
+  tolerable because the documented rollback is the GUI **by IP**, which needs no DNS and is
+  guaranteed reachable from the LAB VLAN by OPNsense's own anti-lockout rule. The recovery
+  path never depended on Ansible.
+- **There is no dry-run/validate endpoint for Unbound**, unlike `openclaw config patch
+  --dry-run` which the models role leans on. That is a real gap in the safety model. What
+  compensates for it: a validated `config.xml` backup is taken before the first write and
+  **the writes skip entirely if that backup fails**, and after the change a real `dig`
+  proves DNS still resolves — because `reconfigure` can return 200 and still leave Unbound
+  dead. On failure the play fails loudly naming the restore path rather than attempting an
+  automatic rollback; pushing a whole config.xml back through an appliance whose state is
+  now unknown is under-specified, and a half-applied restore is worse than a clean manual
+  one.
 
 ## TODO — gateway security, next up
 

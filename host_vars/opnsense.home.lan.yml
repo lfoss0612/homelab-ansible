@@ -1,0 +1,61 @@
+---
+# host_vars/opnsense.home.lan.yml
+#
+# OPNsense (VM 106 on pve-router). Managed over the REST API only — see
+# inventory.ini [network_appliances] and group_vars/network_appliances.yml.
+
+# --- Unbound host overrides --------------------------------------------------
+#
+# Pre-migration audit 2026-08-06: the live Unbound config carries roughly 46
+# host overrides across 6 pages of the OPNsense UI. ONLY PAGE 4 HAS EVER BEEN
+# REVIEWED by a human. `pdm.home.lan` and `pbs.home.lan` both resolve to
+# 10.0.3.1 (the HAProxy frontend) and nobody currently knows whether that is
+# intentional or a stray copy from the gateway HAProxy migration — that
+# question is open in homelab-vault TODO.md and this file does NOT answer it.
+#
+# Consequently the list below is a MANAGED SUBSET, never an authoritative
+# mirror of the box:
+#   * entries listed here are converged (once the gates below are opened)
+#   * entries on the box that are absent here are REPORTED and never touched
+#   * there is NO delete path in this repo at all — no call to
+#     /unbound/settings/delHostOverride exists anywhere, deliberately
+#
+# Same one-host-at-a-time rollout philosophy as openclaw_resolved_standardize:
+# start with the entries whose correctness is independently verifiable, and
+# grow the subset only as the remaining UI pages are actually reviewed.
+#
+# The three starting entries are the Proxmox hypervisors. Each is checkable
+# against inventory.ini, and pve-router.home.lan -> 10.0.5.2 is specifically
+# the record that BYPASSES HAProxy — Ansible's own reachability to the
+# hypervisor depends on it, so drift in it should be visible rather than
+# discovered as an outage.
+#
+# Deliberately NOT included yet: pdm, pbs, opnsense, proxmox (all -> 10.0.3.1,
+# the open question above), and everything on the five unreviewed pages.
+
+# Opt-in gate, defaulted off. Flipping this to true only makes the write play
+# eligible to run; it still also requires -e confirm_opnsense_write=true and
+# opnsense_unbound_overrides_enforce: converge. Drift detection via
+# playbooks/opnsense-facts.yml works regardless and is always safe.
+opnsense_unbound_overrides_manage: false
+
+# report  -> classify and print, change nothing (the safe default)
+# converge -> allow create/update of the managed subset above
+opnsense_unbound_overrides_enforce: report
+
+opnsense_unbound_host_overrides:
+  - hostname: pve
+    domain: home.lan
+    rr: A
+    server: 10.0.5.4
+    description: "PVE Proxmox Server"
+  - hostname: pve-ai
+    domain: home.lan
+    rr: A
+    server: 10.0.5.3
+    description: "PVE-AI Proxmox Server"
+  - hostname: pve-router
+    domain: home.lan
+    rr: A
+    server: 10.0.5.2
+    description: "PVE-Router Proxmox Server (bypasses HAProxy)"

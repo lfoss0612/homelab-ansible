@@ -1,0 +1,32 @@
+---
+# Third-party collections used by this repo. A manifest only — the collections
+# themselves are NOT vendored into git.
+#
+# Install on the control node (cockpit), into the SECOND entry of
+# ansible.cfg's collections_path:
+#
+#   ansible-galaxy collection install -r collections/requirements.yml \
+#     -p ~/.ansible/collections
+#
+# Never install into the first entry, /opt/ansible/collections — that is this
+# git checkout, and installing there vendors third-party code into the repo.
+# (The locally-authored openclaw.node collection lives there because it is
+# ours and is built by scripts/build-collection.sh.)
+#
+# NOTE: ansible.cfg uses `collections_path` (singular). ansible-core 2.19.4
+# silently ignores the plural `collections_paths` and falls back to a stale
+# galaxy copy. Verify resolution with `ansible-galaxy collection list` after
+# installing, not by assuming.
+
+collections:
+  # OPNsense REST API modules. Upstream is github.com/O-X-L/ansible-opnsense,
+  # published as ansibleguy.opnsense and renamed oxlorg.opnsense on Galaxy.
+  # Used ONLY by playbooks/opnsense-unbound.yml (the write path). Every
+  # read/drift-detection play uses ansible.builtin.uri instead, deliberately,
+  # so the read-only value of this repo does not depend on a third-party
+  # collection at all.
+  #
+  # Also requires httpx on the control node — installed by
+  # playbooks/bootstrap/opnsense-api-deps.yml.
+  - name: oxlorg.opnsense
+    version: ">=1.0.0"

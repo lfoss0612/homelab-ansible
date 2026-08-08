@@ -10,6 +10,19 @@ vault_pass.txt
 *.p12
 # Public CA cert (no private key), distributed fleet-wide by the common role.
 !collections/ansible_collections/openclaw/node/roles/common/files/home-lan-ca.crt
+# Third-party collections installed from collections/requirements.yml. They
+# belong in ~/.ansible/collections on the control node, not vendored here;
+# this is a backstop in case someone runs ansible-galaxy without -p.
+collections/ansible_collections/oxlorg/
+
+# OPNsense config backups. These contain the internal CA's PRIVATE KEY, every
+# certificate's private key, ACME account keys and hashed local passwords.
+# playbooks/opnsense-backup-config.yml writes them to /var/backups/opnsense
+# (0600, root) on the control node — never inside the repo. This is a backstop
+# in case a destination is ever mistyped.
+opnsense-config*.xml
+config-*.xml
+
 *.kubeconfig
 inventory/*/hosts.ini
 inventory/*/group_vars/all/secrets.yml

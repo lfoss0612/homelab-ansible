@@ -1,0 +1,170 @@
+---
+# Read the live Unbound host overrides and classify them against the managed
+# subset declared in host_vars/opnsense.home.lan.yml.
+#
+# READ AND COMPARE ONLY — nothing here writes. Included by:
+#   playbooks/opnsense-facts.yml   (report-only)
+#   playbooks/opnsense-unbound.yml (before the write path)
+#
+# Sets, for the caller:
+#   opnsense_unbound_live       map of hostname|domain -> {rr, server, enabled, uuid}
+#   opnsense_unbound_to_create  declared entries absent from the box
+#   opnsense_unbound_to_update  declared entries present but differing/disabled
+#   opnsense_unbound_unmanaged  entries on the box that are NOT declared here
+#   opnsense_unbound_converged  true when to_create and to_update are both empty
+
+- name: Read the live Unbound host overrides
+  ansible.builtin.uri:
+    url: "{{ opnsense_api_base }}/unbound/settings/searchHostOverride?rowCount=1000&current=1"
+    method: GET
+    url_username: "{{ opnsense_api_key }}"
+    url_password: "{{ opnsense_api_secret }}"
+    force_basic_auth: true
+    validate_certs: true
+    ca_path: "{{ opnsense_api_ca_file }}"
+    return_content: true
+    timeout: 15
+  register: opnsense_unbound_read
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  no_log: true
+
+# This assert is the whole point of the read half. Without it, a failed or
+# check-mode-fabricated read returns zero rows, every declared entry classifies
+# as "missing", and a converge run would propose CREATING all of them —
+# turning drift detection into mass recreation. Zero rows on a box with ~46
+# known overrides means the read failed, not that the list is empty.
+- name: Assert the Unbound read actually returned rows
+  ansible.builtin.assert:
+    that:
+      - not (opnsense_unbound_read.skipped | default(false))
+      - (opnsense_unbound_read.status | default(0)) == 200
+      - (opnsense_unbound_read.json.rows | default([]) | length) > 0
+    fail_msg: >-
+      The Unbound host-override read returned
+      {{ opnsense_unbound_read.json.rows | default([]) | length }} row(s)
+      with status {{ opnsense_unbound_read.status | default('(none)') }}.
+      Every comparison below would then compare against nothing, and a
+      converge run would try to create all
+      {{ opnsense_unbound_host_overrides | default([]) | length }} managed
+      entries. Check that check_mode: false is still on the read above and
+      that the API user holds the "Services: Unbound DNS" privilege.
+    quiet: true
+
+# Normalise the stored form before comparing — OPNsense does not hand back
+# what you sent it (booleans become "0"/"1" strings, rr comes back uppercased
+# or not depending on version). Same reason and same shape as the models role's
+# "normalise the stored catalogue for comparison" step.
+#
+# Keyed on hostname|domain, lowercased, because that pair is the identity of an
+# override. uuid is carried so the write path can address an existing row.
+#
+# DISABLED rows are included here on purpose. A disabled row whose key matches
+# a managed entry would otherwise look "missing" and provoke a create, which
+# would either fail as a duplicate or leave two rows for one name. Including
+# them means such an entry classifies as to_update instead, which is correct.
+- name: Normalise the live overrides into a comparable map
+  ansible.builtin.set_fact:
+    opnsense_unbound_live: >-
+      {%- set out = {} -%}
+      {%- for r in opnsense_unbound_read.json.rows -%}
+        {%- set key = (r.hostname | default('') | lower | trim) ~ '|'
+                      ~ (r.domain | default('') | lower | trim) -%}
+        {%- set _ = out.update({key: {
+              'rr': (r.rr | default('A') | string | trim | upper),
+              'server': (r.server | default('') | string | trim),
+              'enabled': (r.enabled | default('1') | string | trim),
+              'uuid': (r.uuid | default(''))}}) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+- name: Classify declared overrides against the live state
+  ansible.builtin.set_fact:
+    opnsense_unbound_to_create: >-
+      {%- set out = [] -%}
+      {%- for e in (opnsense_unbound_host_overrides | default([])) -%}
+        {%- set key = (e.hostname | lower | trim) ~ '|' ~ (e.domain | lower | trim) -%}
+        {%- if key not in opnsense_unbound_live -%}
+          {%- set _ = out.append(e | combine({'fqdn': e.hostname ~ '.' ~ e.domain})) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    opnsense_unbound_to_update: >-
+      {%- set out = [] -%}
+      {%- for e in (opnsense_unbound_host_overrides | default([])) -%}
+        {%- set key = (e.hostname | lower | trim) ~ '|' ~ (e.domain | lower | trim) -%}
+        {%- if key in opnsense_unbound_live -%}
+          {%- set cur = opnsense_unbound_live[key] -%}
+          {%- set want_rr = (e.rr | default('A') | string | trim | upper) -%}
+          {%- set want_server = (e.server | string | trim) -%}
+          {%- if cur.rr != want_rr
+                 or cur.server != want_server
+                 or cur.enabled != '1' -%}
+            {%- set _ = out.append(e | combine({
+                  'fqdn': e.hostname ~ '.' ~ e.domain,
+                  'uuid': cur.uuid,
+                  'have': cur.server ~ ' (' ~ cur.rr ~ ')'
+                          ~ ('' if cur.enabled == '1' else ' DISABLED'),
+                  'want': want_server ~ ' (' ~ want_rr ~ ')'})) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    opnsense_unbound_unmanaged: >-
+      {%- set declared = [] -%}
+      {%- for e in (opnsense_unbound_host_overrides | default([])) -%}
+        {%- set _ = declared.append((e.hostname | lower | trim) ~ '|'
+                                    ~ (e.domain | lower | trim)) -%}
+      {%- endfor -%}
+      {%- set out = [] -%}
+      {%- for key, v in (opnsense_unbound_live | dictsort) -%}
+        {%- if key not in declared -%}
+          {%- set _ = out.append(key | replace('|', '.') ~ ' -> ' ~ v.server) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+- name: Determine whether the managed overrides are converged
+  ansible.builtin.set_fact:
+    opnsense_unbound_converged: >-
+      {{ (opnsense_unbound_to_create | length == 0)
+         and (opnsense_unbound_to_update | length == 0) }}
+  changed_when: false
+
+# Under --check the uri/collection write tasks are skipped outright rather than
+# reporting "would change", so this debug is the entire useful output of a dry
+# run. Same reason as the models role's pending-change report.
+- name: Report the pending Unbound host-override change
+  ansible.builtin.debug:
+    msg: >-
+      {{ opnsense_api_host }}:
+      create [{{ opnsense_unbound_to_create | map(attribute='fqdn') | join(', ') | default('none', true) }}];
+      update [{{ opnsense_unbound_to_update
+                 | map(attribute='fqdn') | join(', ') | default('none', true) }}];
+      unmanaged on box, NOT touched
+      ({{ opnsense_unbound_unmanaged | length }}):
+      {{ opnsense_unbound_unmanaged | join(', ') | default('none', true) }}
+
+# Drift in the UNMANAGED entries is reported and never acted on, and never
+# fails the play. Five of the six pages of overrides on this box have never
+# been reviewed by a human, and the pdm/pbs -> 10.0.3.1 entries are an open
+# question in homelab-vault TODO.md — benign and broken are not reliably
+# distinguishable here, so this is a human judgment call, exactly like the
+# /etc/hosts self-mapping case in the common role.
+#
+# A play that goes red because someone legitimately added an override in the
+# UI trains people to ignore it. Failure is reserved for "the read did not
+# work" (asserted above) and "the write did not land" (asserted in
+# opnsense-unbound.yml).
+- name: Note that unmanaged overrides are reported only
+  ansible.builtin.debug:
+    msg: >-
+      {{ opnsense_unbound_unmanaged | length }} override(s) exist on the box
+      that are not declared in host_vars/opnsense.home.lan.yml. They are
+      reported for review and are never created, updated or deleted by this
+      repo. Grow the managed subset deliberately, after reviewing the
+      remaining pages in the OPNsense UI.
+  when: opnsense_unbound_unmanaged | length > 0

@@ -59,8 +59,30 @@ ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook 
   excluded. It had been running an independently-managed node this repo never touched; now
   it converges normally via `deploy-openclaw.yml`/`update-openclaw.yml`/`validate-openclaw.yml`,
   including the weekly timer. It hosts the OPNsense VM for the whole house network, so treat
-  it carefully — see README.md and `homelab-vault` TODO.md for the fuller writeup (that TODO
-  item is about managing the hypervisor/OPNsense itself, which is still out of scope here).
+  it carefully — see README.md and `homelab-vault` TODO.md for the fuller writeup.
+- **`opnsense.home.lan` IS in the inventory but has no SSH.** It is API-managed
+  (`ansible_connection: local` + REST calls from cockpit). **Every `hosts: all` play must be
+  `hosts: all:!api_managed`.** This is not cosmetic: because the connection is `local`, an
+  `apt`/`useradd` task aimed at it does not fail — it *succeeds against the control node*,
+  silently. Use a host pattern, never an `include_tasks` guard, since a pattern is evaluated
+  before task selection and cannot be bypassed by `--tags`.
+- **OPNsense plays need `become: false`.** `ansible.cfg` sets `become = True` globally, and
+  with `ansible_connection: local` that sudos every API call to root on cockpit for no
+  reason. It is set both as a play keyword (primary — beats vars and config) and in
+  `group_vars/network_appliances.yml` (backstop for ad-hoc runs).
+- **The OPNsense API goes through HAProxy at `opnsense.home.lan`, not `10.0.5.1:8443`.**
+  The direct listener serves the *public* Let's Encrypt wildcard, so it validates neither by
+  IP nor against the internal CA. Do not "fix" a TLS error there with
+  `validate_certs: false`. Verified 2026-08-06; reasoning is in
+  `group_vars/network_appliances.yml`.
+- **OPNsense's `config.xml` contains the internal CA's private key**, every certificate's
+  private key, ACME account keys and hashed passwords. Backups go to `/var/backups/opnsense`
+  (0700/0600, root) on cockpit — never into git, never into `/opt/ansible`. `.gitignore` has
+  a backstop pattern, but don't rely on it.
+- **`oxlorg.opnsense.unbound_host` needs `match_fields: [hostname, domain]`.** Its default
+  is `[hostname, domain, record_type, value, prio]`, which means a *changed* value makes the
+  module treat the record as brand-new and **create a duplicate** instead of updating it.
+  Verified against the module source, not the docs.
 - **`haos` is not in the inventory at all, on purpose.** It is Home Assistant OS — immutable,
   no apt, read-only `/usr`, no persistent `useradd`, no sshd — so the openclaw roles cannot
   run on it and adding it would only break every `hosts: all` play. Don't "fix" its absence.

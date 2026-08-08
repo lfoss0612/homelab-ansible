@@ -65,6 +65,41 @@ comment where it would otherwise go, and
 `playbooks/bootstrap/bootstrap-vm-guest-agent.yml` refuses any guest whose agent reports
 an OS id outside `debian`/`ubuntu` — HAOS reports `haos`.
 
+### Appliances managed over an API
+
+**`opnsense`** (VM 106 on `pve-router`, LAB address `10.0.5.1`) is a third category,
+distinct from both the SSH-managed fleet above and from `haos` immediately preceding: it
+**is** in `inventory.ini`, but it has no SSH/Python transport at all.
+
+SSH into OPNsense lands in a locked-down console menu, and it is a FreeBSD appliance with
+no Python — `pkg install python` to force the standard modules to work fights the appliance
+model and gets wiped by firmware upgrades, the same objection that excludes `haos`
+entirely. Its write plane is instead its **REST API**, which is already proven (the traffic
+shaper was reconfigured through it on 2026-07-13).
+
+It is listed because a named inventory host is the only way to get `host_vars` auto-loading
+— see `host_vars/opnsense.home.lan.yml`. Two groups carry it:
+
+- **`[network_appliances]`** — the topology group. `group_vars/network_appliances.yml`
+  sets `ansible_connection: local` (every task runs on cockpit and talks HTTP) and
+  `ansible_become: false`.
+- **`[api_managed]`** — a behavioural overlay. **Every `hosts: all` play must subtract it**
+  (`hosts: all:!api_managed`). Because the connection is `local`, an `apt`/`useradd` task
+  aimed at this host does not fail — it *succeeds*, silently, against the control node.
+  The four affected plays (`users/ansible-user.yml`, `users/lfoss-user.yml`,
+  `users/disable-requiretty.yml`, `bootstrap/install-acl.yml`) already do this.
+
+`become: false` is set both as a play keyword on every OPNsense play and as a group var,
+deliberately redundantly: `ansible.cfg` sets `become = True` globally, which would otherwise
+sudo every API call to root on cockpit.
+
+Scope is deliberately narrow. Reads (`opnsense-facts.yml`, `opnsense-backup-config.yml`)
+use `ansible.builtin.uri` and depend on **no third-party collection**, so all read-only
+value survives even if the collection proves unsuitable. Only the single write play uses
+`oxlorg.opnsense`. Firewall rules, aliases, NAT, interfaces, HAProxy, VPN, the internal CA
+and ACME are all **out of scope and stay manual**, and there is **no delete path** for
+Unbound overrides anywhere in this repo.
+
 Roles live in `collections/ansible_collections/openclaw/node/roles/`:
 
 - **`common`** — shared install surface: Node.js floor (`openclaw_node_min_version`,
@@ -95,7 +130,11 @@ root-equivalent sudo on all 12 hosts, how the roles revoke it, and the unattende
 
 | File | Purpose |
 |---|---|
-| `playbooks/proxmox-config.yml` | Apply declarative Proxmox `pct`/`qm` config to LXC containers and VMs. Compares current vs. declared settings and runs `pct set`/`qm set` only if they differ. Idempotent; safe with `--check --diff`. **Skips `pve-router` unless `-e confirm_pve_router=true`.** Config declared per-host in `host_vars` as `proxmox_lxc_config`/`proxmox_qm_config` lists. Currently used to fix cockpit/pdm's DNS resolution (see Topology, LXC bullet, and homelab-vault TODO.md). |
+| `playbooks/proxmox-config.yml` | Apply declarative Proxmox `pct`/`qm` config to LXC containers and VMs. Reads current config, parses and canonicalises it, and applies only the settings that actually differ — booleans, property-string ordering and multi-valued settings all compare correctly, and the apply uses `argv` so values containing spaces are passed as one argument. Idempotent; safe with `--check --diff`, which reports the pending diff rather than staying silent. **Skips `pve-router` unless `-e confirm_pve_router=true`**, and additionally skips any VMID in `proxmox_protected_vmids` (VM 106 / OPNsense) unless `-e confirm_protected_vmids=true`. Every declared key is checked against a hardware/boot/storage **denylist** (`tasks/proxmox-assert-safe-keys.yml`) which refuses `hostpci*`, `scsi*`, `net*`, `boot*`, `efidisk*` and more, and refuses any attempt to set `protection` to a false value. Config declared per-host in `host_vars` as `proxmox_lxc_config`/`proxmox_qm_config` lists. |
+| `playbooks/opnsense-facts.yml` | **Read-only.** Probes the OPNsense API, then reports Unbound host-override drift against the managed subset in `host_vars/opnsense.home.lan.yml`. Writes nothing, and is not gated on any confirm flag. Entries on the box that are not declared are reported and never touched. |
+| `playbooks/opnsense-backup-config.yml` | Download OPNsense's full `config.xml` to `/var/backups/opnsense` on cockpit (0700 dir, 0600 root-owned files), validate it is real XML, and prune to the newest 14. **The file contains the internal CA's private key** — it must never reach git. Also included by the write play as its pre-write rollback artefact. |
+| `playbooks/opnsense-unbound.yml` | The **only** play that writes to OPNsense. Converges the managed subset of Unbound host overrides (create/update only — no deletes). Requires all three gates: `opnsense_unbound_overrides_manage: true`, `opnsense_unbound_overrides_enforce: converge`, and `-e confirm_opnsense_write=true`; a closed gate reports and skips. Takes a validated `config.xml` backup first and **skips every write if that backup fails**. Reconfigures Unbound once via a handler, then re-reads to assert the writes landed and runs a real `dig` to prove DNS still resolves — failing loudly with the restore path rather than attempting an automatic rollback. |
+| `playbooks/bootstrap/opnsense-api-deps.yml` | Install `python3-httpx` on the control node for the `oxlorg.opnsense` collection. Uses the distro package, not pip — Debian 13 is PEP-668 externally-managed. |
 | `playbooks/deploy-openclaw.yml` | Gateway first (`serial: 1`), then all of `openclaw_nodes` in full — no gateway subtraction, since the gateway is deliberately a node too. `openclaw_optional` hosts get the same role in a trailing `ignore_unreachable` play. **Skips `pve-router` unless `-e confirm_pve_router=true`.** |
 | `playbooks/update-openclaw.yml` | Fleet convergence: verify-before-mutate (compares `openclaw --version` against the `openclaw_version` pin, not a build hash — there's no build any more), gateway first, nodes serialized with a per-host health gate, skipping any host already converged. Phase 4 repeats phase 3 for `openclaw_optional`; both share `playbooks/tasks/converge-openclaw-node.yml`. **Not gated on `confirm_pve_router`** — this is the weekly-timer path, and `pve-router`'s automatic weekly convergence is a deliberate, already-made decision (2026-08-04), not an accidental sweep. See `homelab-vault` `TODO.md` for the planned ntfy-notification-with-approval-button replacement. |
 | `playbooks/validate-openclaw.yml` | Version pin fleet-wide, gateway `/health`, both gateway-host services active, `openclaw nodes status`/`openclaw doctor` clean, now including `pve-router` like any other node. `openclaw_optional` hosts are asserted when up and reported when off. Read-only — not gated. |
@@ -236,6 +275,22 @@ The Ansible Vault password lives at `/etc/ansible-vault-password` on cockpit
 `--vault-password-file` no longer needs to be passed by hand. Holds `openclaw_gateway_token`
 in `group_vars/openclaw.yml`, the real `gateway.auth.token` value — required on every remote
 node for token-mode auth, not a placeholder.
+
+Also holds `opnsense_api_key` / `opnsense_api_secret` in
+`group_vars/network_appliances.yml`. These belong to a **dedicated `ansible-writer` API
+user**, deliberately separate from the credential the vault repo's `scripts/sync-opnsense.py`
+uses: one credential serving two callers could not be revoked or re-scoped independently,
+and the OPNsense audit log could not tell them apart. Grant it only *System: Configuration:
+Backups* and *Services: Unbound DNS*. Create with:
+
+```bash
+ansible-vault encrypt_string --name opnsense_api_key    '<key>'
+ansible-vault encrypt_string --name opnsense_api_secret '<secret>'
+```
+
+Until they are filled in, the OPNsense plays fail their credentials assert with
+instructions and write nothing. Note that reverting these out of git does **not** revoke the
+key — delete it in the OPNsense UI as well.
 
 ## Claude Code access
 

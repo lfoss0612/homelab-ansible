@@ -1,0 +1,91 @@
+---
+# Read-only OPNsense inspection: proves the API path works, then reports
+# Unbound host-override drift against the managed subset declared in
+# host_vars/opnsense.home.lan.yml.
+#
+# This play NEVER writes. It is deliberately not gated on confirm_pve_router —
+# read-only plays don't need it (validate-openclaw.yml is the precedent, and
+# tasks/confirm-pve-router.yml says so in its header).
+#
+# Usage:
+#   ansible-playbook playbooks/opnsense-facts.yml --check --diff
+#   ansible-playbook playbooks/opnsense-facts.yml
+#
+# Every task here follows the same standing rule: reads carry
+# `changed_when: false` + `check_mode: false` + `failed_when: false`, and each
+# is followed by an assert that it actually returned content. Without
+# `check_mode: false` a task is skipped under --check and reports a fabricated
+# empty result, which silently corrupts every comparison downstream — that bug
+# cost real time in 2026-08 (three read-only probes in the common role).
+
+- name: Inspect OPNsense (read-only)
+  hosts: network_appliances
+  # See group_vars/network_appliances.yml: ansible_connection is local, so
+  # without this every API call would sudo to root on the control node.
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Assert API credentials are present
+      ansible.builtin.assert:
+        that:
+          - opnsense_api_key | default('') | length > 0
+          - opnsense_api_secret | default('') | length > 0
+        fail_msg: >-
+          opnsense_api_key/opnsense_api_secret are empty in
+          group_vars/network_appliances.yml. Create a dedicated `ansible-writer`
+          API user in OPNsense (System > Access > Users > Edit > add API key)
+          with ONLY "System: Configuration: Backups" and "Services: Unbound DNS"
+          privileges, then store both values with:
+          ansible-vault encrypt_string --name opnsense_api_key '<key>'
+        quiet: true
+
+    - name: Probe the OPNsense API
+      ansible.builtin.uri:
+        url: "{{ opnsense_api_base }}/core/firmware/status"
+        method: GET
+        url_username: "{{ opnsense_api_key }}"
+        url_password: "{{ opnsense_api_secret }}"
+        force_basic_auth: true
+        validate_certs: true
+        ca_path: "{{ opnsense_api_ca_file }}"
+        return_content: true
+        timeout: 15
+      register: opnsense_probe
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      # Without this, -vvv (which anyone debugging reaches for first) prints
+      # the API secret into the transcript.
+      no_log: true
+
+    - name: Assert the API probe actually executed
+      ansible.builtin.assert:
+        that:
+          - opnsense_probe is defined
+          - not (opnsense_probe.skipped | default(false))
+          - (opnsense_probe.status | default(0)) == 200
+        fail_msg: >-
+          OPNsense API probe returned status
+          {{ opnsense_probe.status | default('(none)') }} for
+          {{ opnsense_api_base }}.
+          401/403 -> the ansible-writer API key lacks a required privilege.
+          -1 or a TLS error -> the endpoint's certificate does not validate
+          against {{ opnsense_api_ca_file }}; note that 10.0.5.1:8443 serves the
+          PUBLIC ACME wildcard, not the internal CA, which is exactly why
+          opnsense_api_base goes through HAProxy at opnsense.home.lan (see
+          group_vars/network_appliances.yml). Do NOT "fix" this by setting
+          validate_certs: false.
+          `skipped` -> check_mode: false was dropped from the probe, which
+          would fabricate every comparison below.
+        quiet: true
+
+    - name: Report the OPNsense firmware status
+      ansible.builtin.debug:
+        msg: >-
+          {{ opnsense_api_host }}:
+          {{ opnsense_probe.json.product_version | default('(version unknown)') }}
+          ({{ opnsense_probe.json.product_name | default('opnsense') }})
+
+    - name: Report Unbound host-override drift
+      ansible.builtin.include_tasks: tasks/opnsense-unbound-diff.yml

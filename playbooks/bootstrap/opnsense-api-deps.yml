@@ -1,0 +1,56 @@
+---
+# Install the control node's dependencies for talking to the OPNsense REST API.
+#
+# Read-only plays (opnsense-facts.yml, opnsense-backup-config.yml) need nothing
+# beyond ansible.builtin.uri and are unaffected by this. Only the write path
+# (opnsense-unbound.yml, via the oxlorg.opnsense collection) needs httpx.
+#
+# Usage:
+#   ansible-playbook playbooks/bootstrap/opnsense-api-deps.yml --check --diff
+#   ansible-playbook playbooks/bootstrap/opnsense-api-deps.yml
+
+- name: Install OPNsense API dependencies on the control node
+  hosts: openclaw_control
+  become: true
+
+  tasks:
+    # Debian 13 is PEP-668 externally-managed, so `pip install --user httpx`
+    # refuses outright and `--break-system-packages` is exactly the kind of
+    # fighting-the-platform move this repo avoids elsewhere. The distro package
+    # is the correct answer. If the collection ever needs a newer httpx than
+    # Debian ships, the fix is a dedicated venv plus ansible_python_interpreter
+    # for this host — not --break-system-packages.
+    - name: Install python3-httpx
+      ansible.builtin.apt:
+        name: python3-httpx
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Verify httpx imports
+      ansible.builtin.command: python3 -c "import httpx; print(httpx.__version__)"
+      register: opnsense_httpx_check
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Assert httpx is importable
+      ansible.builtin.assert:
+        that:
+          - opnsense_httpx_check.rc == 0
+        fail_msg: >-
+          python3-httpx is installed but `import httpx` failed
+          (rc={{ opnsense_httpx_check.rc }}):
+          {{ opnsense_httpx_check.stderr | default('') | trim }}.
+          The oxlorg.opnsense collection cannot run without it.
+        success_msg: "httpx {{ opnsense_httpx_check.stdout | trim }} is importable."
+        quiet: true
+
+    - name: Report the collection install step
+      ansible.builtin.debug:
+        msg: >-
+          Dependencies are in place. The oxlorg.opnsense collection itself is
+          NOT installed by this play — it is a per-user Galaxy install, not a
+          system package. Run, as the ansible user:
+          ansible-galaxy collection install -r collections/requirements.yml -p ~/.ansible/collections
+          then confirm with: ansible-galaxy collection list oxlorg.opnsense

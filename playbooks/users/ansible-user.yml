@@ -1,5 +1,8 @@
 - name: Bootstrap ansible user on all nodes
-  hosts: all
+  # Excludes [api_managed] (OPNsense): those hosts use
+  # ansible_connection: local, so tasks aimed at them would silently
+  # succeed against the CONTROL NODE instead of failing. See inventory.ini.
+  hosts: all:!api_managed
   become: yes
   remote_user: lfoss
 
