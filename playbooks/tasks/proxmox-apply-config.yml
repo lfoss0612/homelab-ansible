@@ -8,29 +8,178 @@
 #     - vmid: 107
 #       settings:
 #         nameserver: "10.0.5.1"
+#
+# Idempotence is DATA-DRIVEN, not `when`-driven: the config is read, parsed and
+# canonicalised into a pending-diff list, and the apply task simply loops over
+# that list. An empty list is a no-op. The earlier design compared inside a
+# `when:` on the apply task itself, which had four failure modes -- all latent
+# only because the sole consumer was a single-token `nameserver`:
+#   1. `onboot: true` renders as "True" but `qm config` prints `onboot: 1`, so
+#      it never compared equal and re-applied on every run, forever.
+#   2. The command was a space-split string, so a multi-valued setting like
+#      `nameserver: "10.0.5.1 8.8.8.8"` became separate argv elements and pct
+#      received garbage positionals -- the value never landed, so it also
+#      re-ran forever. The argv form below fixes this.
+#   3. `features: keyctl=1,nesting=1` vs `nesting=1,keyctl=1` are identical to
+#      Proxmox but never compared equal.
+#   4. `description:` emits continuation lines with no `key:` prefix, so only
+#      the first line was ever seen.
+# It also interpolated setting.key into a regex unescaped. There is no regex
+# here at all now.
 
 - name: "Read current {{ proxmox_binary }} config for {{ pve_item.vmid }}"
   ansible.builtin.command: "{{ proxmox_binary }} config {{ pve_item.vmid }}"
   register: proxmox_current_config
   changed_when: false
   check_mode: false
+  failed_when: false
 
-# Parse each setting from the current config and compare with declared value.
-# Only run `pct set` / `qm set` if the declared value differs from current.
-#
-# Regex only matches against the key (static, known-safe); the desired value
-# is compared with plain string equality, avoiding regex-injection issues.
-- name: "Apply declared {{ proxmox_binary }} settings for {{ pve_item.vmid }}"
-  ansible.builtin.command: "{{ proxmox_binary }} set {{ pve_item.vmid }} --{{ setting.key }} {{ setting.value }}"
-  loop: "{{ pve_item.settings | dict2items }}"
+# Guards both the missing-guest case and the --check fabrication bug: a command
+# task without `check_mode: false` is skipped under --check and reports rc=0
+# with empty stdout, which silently corrupts every comparison downstream. That
+# exact bug cost real time in 2026-08 (three read-only probes in the common
+# role), so the read is asserted rather than trusted.
+- name: "Assert the {{ proxmox_binary }} read actually returned config"
+  ansible.builtin.assert:
+    that:
+      - proxmox_current_config.rc == 0
+      - (proxmox_current_config.stdout_lines | default([]) | length) > 0
+    fail_msg: >-
+      `{{ proxmox_binary }} config {{ pve_item.vmid }}` returned rc={{
+      proxmox_current_config.rc | default('(none)') }} with {{
+      proxmox_current_config.stdout_lines | default([]) | length }} lines on
+      {{ inventory_hostname }}. Either the guest is not on this host (is this
+      declared in the right host_vars file? host_vars/pve.yml silently never
+      applied at all for an unknown period because the inventory uses FQDNs),
+      or `check_mode: false` has been dropped from the read above.
+    quiet: true
+
+# Only lines starting with a real config key open a new entry. That is what
+# makes multi-line values (description) safe to SKIP rather than mis-parse --
+# a continuation line containing "foo: bar" would otherwise be read as a key.
+# split(':', 1) keeps colons inside values intact (MAC addresses in net0).
+- name: "Parse the {{ proxmox_binary }} config for {{ pve_item.vmid }}"
+  ansible.builtin.set_fact:
+    proxmox_current_map: >-
+      {%- set out = {} -%}
+      {%- for line in proxmox_current_config.stdout_lines -%}
+        {%- if line is match('^[a-z][a-z0-9_]*:') -%}
+          {%- set parts = line.split(':', 1) -%}
+          {%- set _ = out.update({parts[0] | trim: parts[1] | trim}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# Canonicalisation is done in Jinja rather than a filter plugin to stay
+# dependency-free, same reasoning as the models role.
+#   * booleans      -> Proxmox's 1/0, so `onboot: true` stops re-applying
+#   * property sets -> comma-split, sorted, rejoined, because Proxmox treats
+#                      `keyctl=1,nesting=1` and `nesting=1,keyctl=1` as equal
+#   * everything else -> internal whitespace collapsed, ORDER PRESERVED.
+#     `nameserver: "10.0.5.1 8.8.8.8"` is an ordered preference list; sorting
+#     it would silently reorder the host's resolvers.
+- name: "Compute the pending {{ proxmox_binary }} diff for {{ pve_item.vmid }}"
+  ansible.builtin.set_fact:
+    proxmox_diff: >-
+      {%- set out = [] -%}
+      {%- for k, v in (pve_item.settings | dictsort) -%}
+        {%- set want = ('1' if v else '0') if (v is boolean) else (v | string | trim) -%}
+        {%- set have = (proxmox_current_map.get(k, '')) | string | trim -%}
+        {%- set wn = (want.split(',') | map('trim') | sort | join(','))
+                     if '=' in want else (want.split() | join(' ')) -%}
+        {%- set hn = (have.split(',') | map('trim') | sort | join(','))
+                     if '=' in have else (have.split() | join(' ')) -%}
+        {%- if wn != hn -%}
+          {%- set _ = out.append({'key': k, 'want': want,
+                                  'have': have if have else '(unset)'}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# The command module is skipped outright under --check rather than reporting
+# "would change", so under --check this debug is the entire useful output.
+# Same shape and same reason as the models role's pending-change report.
+- name: "Report pending {{ proxmox_binary }} changes for {{ pve_item.vmid }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} {{ proxmox_binary }} {{ pve_item.vmid }}:
+      {{ proxmox_diff | map('to_json') | join('; ') }}
+  when: proxmox_diff | length > 0
+
+# argv form, not a command string -- this is what kills the word-splitting bug;
+# `--nameserver` now receives "10.0.5.1 8.8.8.8" as ONE argument. No `when:`
+# here: idempotence is a property of the loop being empty, which is both
+# simpler and impossible to get subtly wrong.
+- name: "Apply pending {{ proxmox_binary }} settings for {{ pve_item.vmid }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ proxmox_binary }}"
+      - set
+      - "{{ pve_item.vmid | string }}"
+      - "--{{ setting.key }}"
+      - "{{ setting.want }}"
+  loop: "{{ proxmox_diff }}"
   loop_control:
     loop_var: setting
-  when: >-
-    (proxmox_current_config.stdout_lines
-      | select('match', '^' + setting.key + ':')
-      | map('regex_replace', '^' + setting.key + ':\s*', '')
-      | map('trim')
-      | first | default(''))
-    != (setting.value | string)
+    label: "{{ pve_item.vmid }} {{ setting.key }}: {{ setting.have }} -> {{ setting.want }}"
   register: proxmox_set_result
   changed_when: proxmox_set_result.rc == 0
+
+# --- Verify ------------------------------------------------------------------
+# `pct set`/`qm set` exiting 0 does not prove the value landed -- some keys are
+# rejected while the guest is running, and some are silently normalised.
+
+- name: "Re-read {{ proxmox_binary }} config for {{ pve_item.vmid }} to confirm"
+  ansible.builtin.command: "{{ proxmox_binary }} config {{ pve_item.vmid }}"
+  register: proxmox_verify_config
+  changed_when: false
+  check_mode: false
+  when:
+    - proxmox_diff | length > 0
+    - not ansible_check_mode
+
+- name: "Recompute the {{ proxmox_binary }} diff for {{ pve_item.vmid }}"
+  ansible.builtin.set_fact:
+    proxmox_diff_after: >-
+      {%- set cur = {} -%}
+      {%- for line in proxmox_verify_config.stdout_lines -%}
+        {%- if line is match('^[a-z][a-z0-9_]*:') -%}
+          {%- set parts = line.split(':', 1) -%}
+          {%- set _ = cur.update({parts[0] | trim: parts[1] | trim}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set out = [] -%}
+      {%- for k, v in (pve_item.settings | dictsort) -%}
+        {%- set want = ('1' if v else '0') if (v is boolean) else (v | string | trim) -%}
+        {%- set have = (cur.get(k, '')) | string | trim -%}
+        {%- set wn = (want.split(',') | map('trim') | sort | join(','))
+                     if '=' in want else (want.split() | join(' ')) -%}
+        {%- set hn = (have.split(',') | map('trim') | sort | join(','))
+                     if '=' in have else (have.split() | join(' ')) -%}
+        {%- if wn != hn -%}
+          {%- set _ = out.append({'key': k, 'want': want,
+                                  'have': have if have else '(unset)'}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  when:
+    - proxmox_diff | length > 0
+    - not ansible_check_mode
+
+- name: "Assert the {{ proxmox_binary }} settings landed for {{ pve_item.vmid }}"
+  ansible.builtin.assert:
+    that:
+      - proxmox_diff_after | length == 0
+    fail_msg: >-
+      `{{ proxmox_binary }} set` exited 0 but {{ proxmox_diff_after | length }}
+      setting(s) did not land on {{ pve_item.vmid }}:
+      {{ proxmox_diff_after | map('to_json') | join('; ') }}.
+      Some keys are rejected or silently normalised while the guest is running
+      -- check whether this one requires the guest to be stopped.
+    quiet: true
+  when:
+    - proxmox_diff | length > 0
+    - not ansible_check_mode

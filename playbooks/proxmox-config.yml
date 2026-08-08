@@ -9,6 +9,16 @@
 #   ansible-playbook playbooks/proxmox-config.yml --check --diff
 #   ansible-playbook playbooks/proxmox-config.yml --check --diff -e confirm_pve_router=true
 #   ansible-playbook playbooks/proxmox-config.yml -e confirm_pve_router=true
+#
+# VMIDs listed in proxmox_protected_vmids (see host_vars) need a SECOND,
+# narrower confirmation on top of confirm_pve_router:
+#   ansible-playbook playbooks/proxmox-config.yml --check --diff \
+#     -e confirm_pve_router=true -e confirm_protected_vmids=true
+#
+# Corosync: pve-router carries 3 of 5 votes and is quorate alone; pve + pve-ai
+# together are NOT quorate without it. Do not run this play against any host
+# while pve-router's corosync is down -- guest config changes will be refused
+# cluster-wide. See homelab-vault Proxmox/ops/corosync-recovery.md.
 
 - name: Apply declarative Proxmox pct/qm config
   hosts: openclaw_proxmox
@@ -17,6 +27,42 @@
   pre_tasks:
     - name: Confirm pve-router before any write-capable role runs
       ansible.builtin.include_tasks: tasks/confirm-pve-router.yml
+      tags: always
+
+    - name: Refuse declared settings that touch hardware, boot, or storage
+      ansible.builtin.include_tasks: tasks/proxmox-assert-safe-keys.yml
+      tags: always
+
+    # confirm_pve_router unlocks the HOST; this unlocks individual guests on it.
+    # Report-then-skip rather than assert-then-fail, matching the shape of
+    # confirm-pve-router.yml -- a default run still converges every other guest
+    # and simply reports which ones were held back.
+    - name: Hold back protected VMIDs unless separately confirmed
+      ansible.builtin.set_fact:
+        proxmox_qm_config_effective: >-
+          {{ proxmox_qm_config | default([])
+             if (confirm_protected_vmids | default(false) | bool)
+             else (proxmox_qm_config | default([]))
+                  | rejectattr('vmid', 'in', proxmox_protected_vmids | default([]))
+                  | list }}
+      tags: always
+
+    - name: Report protected VMIDs held back from this run
+      ansible.builtin.debug:
+        msg: >-
+          Skipping VMID(s)
+          {{ (proxmox_qm_config | default([]))
+             | selectattr('vmid', 'in', proxmox_protected_vmids | default([]))
+             | map(attribute='vmid') | join(', ') }}
+          on {{ inventory_hostname }} -- pass -e confirm_protected_vmids=true to
+          include them. VM 106 is OPNsense, the router the whole house depends
+          on; read docs/execution-model.md, "pve-router -- out-of-band recovery
+          path", before doing so.
+      when: >-
+        not (confirm_protected_vmids | default(false) | bool)
+        and ((proxmox_qm_config | default([]))
+             | selectattr('vmid', 'in', proxmox_protected_vmids | default([]))
+             | list | length) > 0
       tags: always
 
   tasks:
@@ -30,7 +76,7 @@
 
     - name: Apply declared VM (qm) config
       ansible.builtin.include_tasks: tasks/proxmox-apply-config.yml
-      loop: "{{ proxmox_qm_config | default([]) }}"
+      loop: "{{ proxmox_qm_config_effective | default([]) }}"
       loop_control:
         loop_var: pve_item
       vars:

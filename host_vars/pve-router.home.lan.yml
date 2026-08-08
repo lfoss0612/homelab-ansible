@@ -30,3 +30,35 @@ proxmox_lxc_config:
   - vmid: 108   # pdm (Proxmox Datacenter Manager)
     settings:
       nameserver: "{{ ansible_default_ipv4.gateway }}"
+
+# Guests needing a second confirmation on top of confirm_pve_router. That flag
+# unlocks the host; this unlocks the guest. VM 106 is OPNsense -- it owns
+# igc0/igc1/igc2 by PCIe passthrough, routes every VLAN in the house, serves
+# DHCP and DNS, terminates HAProxy for all .home.lan services, and is the
+# internal CA. It is also `protection: yes` in Proxmox itself. Nothing should
+# reach it without someone typing the flag on purpose.
+proxmox_protected_vmids: [106]
+
+# First consumer of proxmox_qm_config -- the qm code path has existed since
+# 2026-08-05 with none at all.
+#
+# Deliberately a NO-OP: every value below is already true on the live VM, so a
+# correct run must report ZERO changes. That makes this a test of the
+# read/parse/compare path carrying no write risk, while converting four facts
+# that currently live only in the Proxmox UI into git-tracked declared state
+# with drift detection on them.
+#
+# Every key here sits outside the protected-key denylist by design. The
+# passthrough (hostpci0/1/2), disks, NICs and the OVMF/q35 boot chain are
+# refused by playbooks/tasks/proxmox-assert-safe-keys.yml and stay manual,
+# permanently. `protection` may be declared as 1 but never as 0 -- the same
+# task file refuses a value that would disable it.
+#
+# Requires BOTH -e confirm_pve_router=true AND -e confirm_protected_vmids=true.
+proxmox_qm_config:
+  - vmid: 106   # OPNsense — the house router
+    settings:
+      onboot: 1
+      startup: "order=1"
+      protection: 1
+      tags: "opnsense"

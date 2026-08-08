@@ -1,0 +1,107 @@
+---
+# Refuse declared pct/qm settings that touch hardware, boot chain, or storage.
+#
+# Imported as a pre_task of playbooks/proxmox-config.yml, immediately after
+# tasks/confirm-pve-router.yml. It runs ONCE PER HOST over every declared
+# setting, deliberately -- not inside the per-item loop. If it lived in
+# proxmox-apply-config.yml, item 1 could already be applied before item 2's
+# bad key was caught.
+#
+# These are all `assert` tasks on purpose: assert is pure-Python with full
+# check-mode support, so it fires identically under --check and live. A `fail`
+# guarded by a `command` probe would not -- the probe would be skipped under
+# --check and the gate would silently pass.
+#
+# See homelab-vault TODO.md, "Bring pve-router and OPNsense under Ansible
+# management", and docs/execution-model.md.
+
+- name: Refuse declared Proxmox settings that touch hardware, boot, or storage
+  ansible.builtin.assert:
+    that:
+      - proxmox_denied_keys | length == 0
+    fail_msg: >-
+      Refusing to run. Declared settings match the protected-key denylist:
+      {{ proxmox_denied_keys | unique | join(', ') }}.
+      These keys carry OPNsense's PCIe passthrough (hostpci0/1/2 =
+      igc0/igc1/igc2, the physical NICs the house routes through), its OVMF/q35
+      boot chain, and every guest's disks and NICs -- including cockpit's own
+      net0, which is the control path this play runs over. They are managed by
+      hand in the Proxmox UI, deliberately.
+    success_msg: >-
+      No protected keys declared ({{ proxmox_declared_keys | length }} settings
+      checked on {{ inventory_hostname }}).
+    quiet: true
+  vars:
+    # Declared as task-scoped vars rather than in group_vars/proxmox_hosts.yml:
+    # task vars outrank host_vars and group_vars, so a per-host typo cannot
+    # widen the denylist. Only -e can, and the tamper-check below catches that.
+    #
+    # select('match', ...) anchors at the start, so every entry is a PREFIX:
+    # `hostpci` covers hostpci0..N, `net` covers net0..N, `mp` covers mp0..N,
+    # `scsi` covers scsi0..N and scsihw, `boot` covers boot and bootdisk.
+    #
+    # Beyond the obvious hardware/storage keys:
+    #   bios/machine/ostype/arch -- VM 106 is OVMF/q35; flipping either bricks
+    #     boot at the next start, and the breakage is silent until then
+    #   args                     -- raw QEMU args, arbitrary
+    #   tpmstate/smbios/vmgenid  -- identity and state, not config
+    #   cipassword               -- a secret
+    #   template                 -- one-way conversion
+    #   description              -- emits multi-line values that cannot be
+    #     safely compared (see proxmox-apply-config.yml), so it must not be
+    #     declarable at all
+    #
+    # `net*` deliberately applies to pct as well as qm: declaring net0 for
+    # CT 107 would sever cockpit from itself at its next start.
+    #
+    # No benign key collides -- nameserver, searchdomain, onboot, startup,
+    # cores, memory, swap, tags, agent, hostname, features, balloon, cpulimit,
+    # protection and lock all pass. The success_msg count makes a regression
+    # here visible rather than silent.
+    proxmox_protected_key_regex: >-
+      ^(hostpci|efidisk|tpmstate|scsi|sata|ide|virtio|nvme|unused|rootfs|mp|net|boot|bios|machine|ostype|arch|args|smbios|vmgenid|description|cipassword|template)
+    proxmox_declared_keys: >-
+      {{ ((proxmox_lxc_config | default([])) + (proxmox_qm_config | default([])))
+         | map(attribute='settings') | map('dict2items') | flatten
+         | map(attribute='key') | list }}
+    proxmox_denied_keys: >-
+      {{ proxmox_declared_keys | select('match', proxmox_protected_key_regex) | list }}
+
+# -e outranks task vars, so that is the one remaining way to narrow the
+# denylist. Make narrowing it fail loudly rather than silently permit
+# `qm set 106 --hostpci0 ...`.
+- name: Assert the protected-key denylist has not been narrowed
+  ansible.builtin.assert:
+    that:
+      - "'hostpci' in proxmox_protected_key_regex"
+      - "'efidisk' in proxmox_protected_key_regex"
+      - "'scsi' in proxmox_protected_key_regex"
+      - "'net' in proxmox_protected_key_regex"
+      - "'boot' in proxmox_protected_key_regex"
+    fail_msg: >-
+      The protected-key denylist has been overridden and no longer covers the
+      mandatory five (hostpci, efidisk, scsi, net, boot). Nothing in this repo
+      should ever do that.
+    quiet: true
+  vars:
+    proxmox_protected_key_regex: >-
+      ^(hostpci|efidisk|tpmstate|scsi|sata|ide|virtio|nvme|unused|rootfs|mp|net|boot|bios|machine|ostype|arch|args|smbios|vmgenid|description|cipassword|template)
+
+# `protection` stays OFF the denylist on purpose: declaring `protection: 1` as
+# desired state is protective and gives drift detection on the single most
+# important safety flag on VM 106. Only the VALUE is dangerous -- Ansible may
+# turn protection on, never off.
+- name: Refuse any declaration that would disable guest protection
+  ansible.builtin.assert:
+    that:
+      - proxmox_protection_disabled | length == 0
+    fail_msg: >-
+      VMIDs {{ proxmox_protection_disabled | join(', ') }} declare `protection`
+      as a false value. This play may turn guest protection ON, never off.
+    quiet: true
+  vars:
+    proxmox_protection_disabled: >-
+      {{ ((proxmox_lxc_config | default([])) + (proxmox_qm_config | default([])))
+         | selectattr('settings.protection', 'defined')
+         | selectattr('settings.protection', 'in', [0, '0', false, 'false', 'no', 'off'])
+         | map(attribute='vmid') | list }}
