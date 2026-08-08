@@ -50,6 +50,15 @@
 
 # After the system unit above is confirmed running, so a host is never left
 # with neither the legacy user unit nor a working system one.
+#
+# `apply` is load-bearing, not decoration: tags on a dynamic include select the
+# include statement alone, so without it `--tags purge-legacy` runs the include
+# and then filters out every task inside it — the run reports "included: ..."
+# and does nothing. Same include/--tags interaction as the `privileges`/`dns`
+# tags above, in its other direction.
 - name: Purge pre-npm-rewrite units from the openclaw user manager
-  ansible.builtin.include_tasks: purge-legacy-user-units.yml
+  ansible.builtin.include_tasks:
+    file: purge-legacy-user-units.yml
+    apply:
+      tags: [purge-legacy]
   tags: [purge-legacy]
