@@ -55,6 +55,11 @@
       # must happen while the unit file still exists — hence before the removal
       # below. Never fails the run: a unit already stopped/not-enabled, or a
       # user manager that is not running, is a success for our purposes.
+      #
+      # No `check_mode: false` here, unlike the read-only probes elsewhere in
+      # this repo. `command` is skipped under --check, and for a task that
+      # stops services that is exactly right — a dry run must not mutate. The
+      # find above still reports what would be purged.
       ansible.builtin.command:
         argv:
           - systemctl
@@ -69,7 +74,6 @@
       register: openclaw_legacy_disable
       changed_when: openclaw_legacy_disable.rc == 0
       failed_when: false
-      check_mode: false
 
     - name: Remove legacy user unit files
       ansible.builtin.file:
@@ -103,4 +107,3 @@
       register: openclaw_legacy_reload
       changed_when: openclaw_legacy_reload.rc == 0
       failed_when: false
-      check_mode: false
