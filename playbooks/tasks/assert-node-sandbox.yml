@@ -59,10 +59,23 @@
 # outside the sandbox, so a live zpool call would succeed no matter what the
 # unit does and the check would pass vacuously. Both directives are asserted
 # because each is individually useless — verified on pve 2026-08-08.
-- name: Check whether this host has ZFS
+- name: Check whether this host has a ZFS control device
   ansible.builtin.stat:
     path: /dev/zfs
   register: openclaw_sandbox_zfs
+  when:
+    - openclaw_node_hardening | default(false) | bool
+    - openclaw_sandbox_host_reachable | default(true) | bool
+
+# Mirrors the role's own two-part detection. The device alone is not enough:
+# zabbix has /dev/zfs with no zpool binary, and asserting on the device alone
+# would demand a hand-back the role correctly declines to make there.
+- name: Check whether a ZFS userspace tool is installed
+  ansible.builtin.shell: command -v zpool
+  register: openclaw_sandbox_zfs_cli
+  changed_when: false
+  failed_when: false
+  check_mode: false
   when:
     - openclaw_node_hardening | default(false) | bool
     - openclaw_sandbox_host_reachable | default(true) | bool
@@ -83,3 +96,4 @@
     - openclaw_node_hardening | default(false) | bool
     - openclaw_sandbox_host_reachable | default(true) | bool
     - openclaw_sandbox_zfs.stat.exists | default(false)
+    - (openclaw_sandbox_zfs_cli.rc | default(1)) == 0

@@ -42,16 +42,31 @@
 # Detected rather than listed in group_vars deliberately -- the ZFS hosts span
 # proxmox_hosts, bare_metal and qemu_vms, so there is no group that means "has
 # ZFS", and a host that gains or loses ZFS later self-corrects on the next run.
+#
+# Both the device AND a userspace tool are required, because the device alone
+# does not mean the host has ZFS: zabbix has /dev/zfs (the module is loaded)
+# but no zpool binary at all, so handing the device back there would punch a
+# hole in the sandbox that nothing on the host could ever use. Caught on the
+# first live canary run, 2026-08-08.
 - name: Check for a ZFS control device
   ansible.builtin.stat:
     path: /dev/zfs
   register: openclaw_node_zfs_dev
 
+- name: Check whether a ZFS userspace tool is actually installed
+  ansible.builtin.shell: command -v zpool
+  register: openclaw_node_zfs_cli
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
 - name: Resolve the device nodes the sandbox must keep available
   ansible.builtin.set_fact:
     openclaw_node_sandbox_devices: >-
       {{ (openclaw_node_hardening_devices
-          + (['/dev/zfs'] if openclaw_node_zfs_dev.stat.exists else []))
+          + (['/dev/zfs']
+             if (openclaw_node_zfs_dev.stat.exists and openclaw_node_zfs_cli.rc == 0)
+             else []))
          | unique }}
 
 - name: Install systemd unit
