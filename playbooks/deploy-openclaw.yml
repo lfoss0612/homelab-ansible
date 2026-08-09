@@ -57,3 +57,18 @@
     - role: openclaw.node.node
       when: not (openclaw_optional_probe.unreachable | default(false))
       tags: node
+
+# Post-deployment validation gate. The three deployment plays above are
+# required to succeed, and if they do, validation runs. If any validation check
+# fails, deploy-openclaw.yml exits non-zero, which blocks the weekly timer from
+# writing last-success. See playbooks/openclaw-automation.yml for the timer
+# entry point and how it gates the success marker.
+#
+# This imports validate-openclaw.yml in full (all its plays), so both
+# deploy-then-validate and the standalone validate-openclaw run identical
+# checks. Validation failure is treated as a deployment failure.
+#
+# import_playbook is static (parsed at load time), which means --check, --limit,
+# and --tags all apply to the imported plays. The validation runs under the same
+# conditions as the deploy that triggered it.
+- import_playbook: validate-openclaw.yml
