@@ -1,0 +1,85 @@
+---
+# Assert the openclaw-node.service read-plane sandbox is live.
+#
+# Deliberately read from `systemctl show`, not from the unit file on disk: the
+# unit file is what Ansible wrote, the properties are what the kernel is
+# actually enforcing on the running service. Those diverge whenever a unit has
+# been rewritten but not restarted, which is precisely the failure this check
+# exists to catch -- a host that looks converged in git and in /etc/systemd but
+# is still running an unsandboxed process from before the last deploy.
+#
+# Skipped, not failed, on a host with openclaw_node_hardening still false, so
+# this can be imported before the fleet-wide flip is complete.
+#
+# Imported by validate-openclaw.yml for both the strict and the
+# intermittently-powered host plays; `openclaw_sandbox_host_reachable` lets the
+# latter pass in its own unreachable-probe result. Defaults to true so the
+# strict play does not have to set anything.
+
+- name: Read the live sandbox properties of openclaw-node.service
+  ansible.builtin.command: >-
+    systemctl show openclaw-node.service
+    -p ProtectSystem -p ProtectHome -p ProtectKernelTunables
+    -p PrivateDevices -p ReadWritePaths -p DeviceAllow -p BindReadOnlyPaths
+  register: openclaw_sandbox_props
+  changed_when: false
+  check_mode: false
+  when:
+    - openclaw_node_hardening | default(false) | bool
+    - openclaw_sandbox_host_reachable | default(true) | bool
+
+- name: Assert the read-plane sandbox is enforced on the running node
+  ansible.builtin.assert:
+    that:
+      - "'ProtectSystem=strict' in openclaw_sandbox_props.stdout"
+      - "'ProtectHome=read-only' in openclaw_sandbox_props.stdout"
+      - "'ProtectKernelTunables=yes' in openclaw_sandbox_props.stdout"
+      - "'PrivateDevices=yes' in openclaw_sandbox_props.stdout"
+      - "'/home/' ~ openclaw_user ~ '/.openclaw' in openclaw_sandbox_props.stdout"
+    fail_msg: >-
+      {{ inventory_hostname }} has openclaw_node_hardening enabled but the
+      running openclaw-node.service is not sandboxed —
+      {{ openclaw_sandbox_props.stdout_lines | join(', ') }}.
+      Usually means the unit was rewritten without a restart; re-run
+      deploy-openclaw.yml against this host.
+    success_msg: "{{ inventory_hostname }}: read-plane sandbox is enforced."
+  when:
+    - openclaw_node_hardening | default(false) | bool
+    - openclaw_sandbox_host_reachable | default(true) | bool
+
+# A host with ZFS must keep /dev/zfs reachable through the sandbox, or
+# `zpool status` — a genuine read-plane capability, and the storage health
+# signal on the backup server and all three hypervisors — silently regresses to
+# "/dev/zfs and /proc/self/mounts are required". The role auto-detects this, so
+# a failure here means the detection did not fire, not that someone forgot a
+# group_vars entry.
+#
+# Asserted against the unit's own properties rather than by running `zpool` and
+# checking it works: anything this play executes runs as the ansible user
+# outside the sandbox, so a live zpool call would succeed no matter what the
+# unit does and the check would pass vacuously. Both directives are asserted
+# because each is individually useless — verified on pve 2026-08-08.
+- name: Check whether this host has ZFS
+  ansible.builtin.stat:
+    path: /dev/zfs
+  register: openclaw_sandbox_zfs
+  when:
+    - openclaw_node_hardening | default(false) | bool
+    - openclaw_sandbox_host_reachable | default(true) | bool
+
+- name: Assert the sandbox did not cost this host its ZFS visibility
+  ansible.builtin.assert:
+    that:
+      - "'DeviceAllow=/dev/zfs' in openclaw_sandbox_props.stdout"
+      - "'BindReadOnlyPaths=/dev/zfs' in openclaw_sandbox_props.stdout"
+    fail_msg: >-
+      {{ inventory_hostname }} has /dev/zfs but the running openclaw-node.service
+      does not hand it back through the sandbox —
+      {{ openclaw_sandbox_props.stdout_lines | join(', ') }}.
+      Both DeviceAllow= and BindReadOnlyPaths= are required; neither works
+      without the other, and without them `zpool status` fails inside the unit.
+    success_msg: "{{ inventory_hostname }}: ZFS still visible inside the sandbox."
+  when:
+    - openclaw_node_hardening | default(false) | bool
+    - openclaw_sandbox_host_reachable | default(true) | bool
+    - openclaw_sandbox_zfs.stat.exists | default(false)

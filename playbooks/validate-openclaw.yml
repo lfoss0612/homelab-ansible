@@ -77,6 +77,9 @@
           (run deploy-openclaw.yml --tags dns).
         success_msg: "{{ inventory_hostname }} resolves openclaw.home.lan correctly."
 
+    - name: Assert the openclaw-node read-plane sandbox is enforced
+      ansible.builtin.import_tasks: tasks/assert-node-sandbox.yml
+
 - name: Validate OpenClaw version pin on intermittently-powered hosts
   # Same assertion, but reaching the host is not itself required. If it answers
   # it must be at the pin; if it is switched off the play moves on.
@@ -140,6 +143,14 @@
           (run deploy-openclaw.yml --tags dns).
         success_msg: "{{ inventory_hostname }} resolves openclaw.home.lan correctly."
       when: not (openclaw_optional_probe.unreachable | default(false))
+
+    # Same import as the strict play; the reachability probe is passed in so a
+    # powered-off host skips it instead of erroring on a task that never ran.
+    - name: Assert the openclaw-node read-plane sandbox is enforced
+      ansible.builtin.import_tasks: tasks/assert-node-sandbox.yml
+      vars:
+        openclaw_sandbox_host_reachable: >-
+          {{ not (openclaw_optional_probe.unreachable | default(false)) }}
 
 - name: Validate the gateway service, its own node, and fleet-wide pairing
   hosts: openclaw_gateway

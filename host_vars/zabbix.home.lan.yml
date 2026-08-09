@@ -1,0 +1,21 @@
+---
+# host_vars/zabbix.home.lan.yml
+
+# First host in the openclaw-node.service read-plane sandbox rollout
+# (homelab-vault TODO.md, "Harden openclaw-node.service"). Same opt-in-per-host
+# philosophy as openclaw_resolved_standardize and openclaw_networkd_standardize:
+# a canary that goes through validate-openclaw.yml before the flag becomes the
+# fleet-wide default.
+#
+# Picked as the canary because it is the least entangled node in the fleet: a
+# plain VM, no ZFS (so it does not exercise the /dev/zfs hand-back path -- pbs
+# is the canary for that), not a hypervisor, and not the Ansible control node.
+# Its pre-flight audit on 2026-08-08 ran the full read-plane command battery
+# inside a transient unit carrying these exact properties: every command that
+# worked unsandboxed still worked, and every write outside ~/.openclaw,
+# /var/log/openclaw and the private /tmp was refused.
+#
+# The sandbox itself lives in the node role's unit template; see
+# collections/ansible_collections/openclaw/node/roles/node/templates/openclaw-node.service.j2
+# and docs/execution-model.md, "Sandboxing openclaw-node.service".
+openclaw_node_hardening: true

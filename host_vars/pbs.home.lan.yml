@@ -11,3 +11,12 @@
 # the "systemd-resolved standardization" section, for the actual cutover logic
 # and its safety gate.
 openclaw_resolved_standardize: true
+
+# Second host in the openclaw-node.service read-plane sandbox rollout, paired
+# with zabbix (homelab-vault TODO.md, "Harden openclaw-node.service"). zabbix
+# canaries the plain path; pbs is here to canary the other one -- it has ZFS, so
+# it exercises the /dev/zfs hand-back that PrivateDevices=true would otherwise
+# take away, and `zpool status` is real storage-health observability on the
+# backup server specifically. See docs/execution-model.md, "Sandboxing
+# openclaw-node.service".
+openclaw_node_hardening: true

@@ -29,6 +29,47 @@ NoNewPrivileges=true
 PrivateTmp=true
 LockPersonality=true
 RestrictSUIDSGID=true
+{% if openclaw_node_hardening %}
+
+# --- read-plane sandbox (openclaw_node_hardening) ---------------------------
+# The agent observes; Ansible changes things. Without this block that split is
+# only enforced by the openclaw user lacking sudo, which stops it becoming root
+# but not writing to anything it owns. Nodes hold system.run at the gateway, so
+# these limits apply to whatever the agent is asked to execute, not just to the
+# node process itself.
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+PrivateDevices=true
+
+# The complete set of paths a node actually writes, enumerated 2026-08-08 from
+# the live open write FDs of every running openclaw-node in the fleet: the
+# Memory Core SQLite plus its -wal/-shm under .openclaw/state/, and nothing
+# else. Node's compile cache goes to /tmp, already private via PrivateTmp.
+#
+# The log directory is '-' prefixed (tolerate absent) only because nothing has
+# been observed writing to it -- output goes to the journal. The state
+# directory deliberately is not: if it is ever missing the unit should fail
+# loudly at start rather than run with an unwritable Memory Core.
+ReadWritePaths=/home/{{ openclaw_user }}/.openclaw
+ReadWritePaths=-/var/log/openclaw
+{% for path in openclaw_node_hardening_extra_rw %}
+ReadWritePaths={{ path }}
+{% endfor %}
+{% if openclaw_node_sandbox_devices | length > 0 %}
+
+# Device nodes handed back through the sandbox. BOTH directives are required
+# per device and neither works alone: DeviceAllow satisfies the cgroup device
+# filter that PrivateDevices switches to closed, but does not create the node
+# in the private /dev; a bind mount creates the node but is still refused by
+# that filter. Verified on pve 2026-08-08 -- each alone fails, together they
+# restore `zpool status`.
+{% for device in openclaw_node_sandbox_devices %}
+DeviceAllow={{ device }} rw
+BindReadOnlyPaths={{ device }}
+{% endfor %}
+{% endif %}
+{% endif %}
 
 StandardOutput=journal
 StandardError=journal

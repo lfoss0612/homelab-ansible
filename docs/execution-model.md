@@ -282,6 +282,78 @@ notification: the unit carries `OnFailure=`/`OnSuccess=` into
 1/0 to a Zabbix trapper and optionally POSTs to a webhook. See the README for the
 mechanism and the one-time Zabbix item that still has to be created server-side.
 
+## Sandboxing openclaw-node.service
+
+Removing the sudo grant stopped the agent becoming root. It did **not** make it
+read-only: as the `openclaw` user it could still write its own `$HOME`, its
+`~/.config/systemd/user` manager (the exact directory the 2026-08-08 legacy-unit
+purge had to clean out), and any world-writable path on the box. The read plane was a
+property of what the identity happened to lack, not something the kernel enforced.
+`openclaw_node_hardening` closes that gap in the unit itself:
+
+```
+ProtectSystem=strict     ProtectHome=read-only
+ProtectKernelTunables=true    PrivateDevices=true
+ReadWritePaths=/home/openclaw/.openclaw
+ReadWritePaths=-/var/log/openclaw
+```
+
+This binds whatever the *agent* is told to run, not just the node process — nodes hold
+`system.run` at the gateway, so every command the gateway dispatches inherits it.
+
+**The writable set was measured, not guessed.** The blocker on this item was always
+that nobody had enumerated what a node actually writes. Read live on 2026-08-08 from
+the open write file descriptors of every running `openclaw-node` in the fleet, the
+answer was identical on all 14 hosts and shorter than expected: the Memory Core SQLite
+and its `-wal`/`-shm` siblings under `.openclaw/state/`, and nothing else. Node's
+compile cache lands in `/tmp`, which `PrivateTmp=true` already made private. So two
+`ReadWritePaths` entries cover the fleet, and `openclaw_node_hardening_extra_rw` exists
+for a host that ever needs a third rather than as something to populate now.
+
+`/var/log/openclaw` is `-` prefixed (tolerate-if-absent) because nothing was observed
+writing to it — output goes to the journal. The state directory deliberately is not: a
+missing Memory Core should fail the unit at start, not run unwritable.
+
+**`PrivateDevices=true` costs one real capability, and it is handed back explicitly.**
+It replaces `/dev` with API pseudo-devices only, which breaks `zpool status` / `zfs
+list` — genuine storage observability on `pve`, `pve-ai`, `pve-router`, `pbs` and
+`omv`, and today's only in-agent health signal on the backup server. Restoring it
+needs **both** of these, and neither works alone (verified on `pve` 2026-08-08 — each
+by itself still fails `/dev/zfs and /proc/self/mounts are required`):
+
+```
+DeviceAllow=/dev/zfs rw          # satisfies the cgroup device filter
+BindReadOnlyPaths=/dev/zfs       # creates the node inside the private /dev
+```
+
+`DeviceAllow` alone is not enough on cgroup v2: the BPF device filter permits the
+device, but systemd does not populate a node for it in the private `/dev`. A bind
+mount alone creates the node and is then refused by the filter. The role **detects**
+`/dev/zfs` per host rather than reading a group_vars list, because the ZFS hosts span
+`proxmox_hosts`, `bare_metal` and `qemu_vms` — there is no group that means "has ZFS" —
+and a host that gains or loses ZFS later self-corrects on the next run.
+
+Worth being explicit about what this is not: `/dev/zfs` is `crw-rw-rw-`, so any
+unprivileged user on those hosts can already issue read-only ZFS ioctls. Handing it
+back keeps the status quo; it does not grant the agent anything it lacked.
+
+**Rollout is opt-in per host**, the same shape as `openclaw_resolved_standardize` and
+`openclaw_networkd_standardize` — `zabbix` canaries the plain path and `pbs` the ZFS
+one, then the default flips. Before either was touched, the full read-plane command
+battery (`journalctl`, `systemctl`, `ss`, `ps`, `lsblk`, `ip`, `df`, `free`, `smartctl
+--scan`, `zpool`, `crictl`, `qm`/`pct`/`pvesm`) was run inside a transient unit
+carrying these exact properties on `zabbix`, `pve`, `pve-ai` and `k8s-worker`, against
+an unsandboxed control run of the same battery. Only `zpool` regressed. Everything else
+that failed, failed identically both ways — `qm`/`pct`/`pvesm` want root and have not
+had it since the sudo grant was removed, which is the point.
+
+`validate-openclaw.yml` asserts the sandbox from `systemctl show`, not from the unit
+file, so it catches the specific drift a file check cannot: a unit rewritten but never
+restarted, still running unsandboxed. It asserts the two ZFS directives as properties
+too rather than running `zpool` and checking it works — anything the play executes runs
+as `ansible`, outside the sandbox, so a live call would pass no matter what the unit
+says.
+
 ## What this does not cover
 
 The OS boundary is enforced here; the **capability** boundary is not, and Ansible does not

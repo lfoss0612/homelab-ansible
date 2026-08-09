@@ -10,3 +10,26 @@ openclaw_version: "latest"
 openclaw_node_gateway_host: "10.0.5.7"
 openclaw_node_gateway_port: 18789
 openclaw_gateway_token: "REQUIRED_SET_IN_GROUP_VARS"
+
+# --- openclaw-node.service sandbox -------------------------------------------
+# Make the read plane kernel-enforced rather than a side effect of the openclaw
+# user lacking sudo. Without this the node cannot become root, but nothing stops
+# it writing anywhere the openclaw user owns -- including its own $HOME, its
+# ~/.config/systemd/user manager, and every world-writable path on the box.
+# See docs/execution-model.md, "Sandboxing openclaw-node.service".
+#
+# Opt-in per host during rollout (same philosophy as openclaw_resolved_standardize
+# and openclaw_networkd_standardize), then flipped on fleet-wide once a canary
+# has been through validate-openclaw.yml.
+openclaw_node_hardening: false
+
+# Extra writable paths for a host whose node legitimately needs one. Empty is
+# correct for the whole fleet as audited 2026-08-08: the only write FDs any node
+# held open were the Memory Core SQLite and its -wal/-shm under
+# ~openclaw/.openclaw/state/, which the template grants unconditionally.
+openclaw_node_hardening_extra_rw: []
+
+# Device nodes to keep reachable inside the sandbox, beyond what is
+# auto-detected (currently /dev/zfs). Each entry costs a DeviceAllow plus a bind
+# mount -- add one only for a device a real read-plane command needs.
+openclaw_node_hardening_devices: []

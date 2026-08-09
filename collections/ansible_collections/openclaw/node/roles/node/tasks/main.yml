@@ -31,6 +31,29 @@
     mode: "0640"
   notify: restart openclaw-node
 
+# --- sandbox device detection ------------------------------------------------
+# PrivateDevices=true replaces /dev with a minimal set of API pseudo-devices, so
+# any real device node a read-plane command needs has to be handed back
+# explicitly. /dev/zfs is the only one on this fleet: `zpool status` / `zfs list`
+# work today for the unprivileged openclaw user (the node is crw-rw-rw-) and
+# would silently start failing with "/dev/zfs and /proc/self/mounts are
+# required" on pve, pve-ai, pve-router, pbs and omv.
+#
+# Detected rather than listed in group_vars deliberately -- the ZFS hosts span
+# proxmox_hosts, bare_metal and qemu_vms, so there is no group that means "has
+# ZFS", and a host that gains or loses ZFS later self-corrects on the next run.
+- name: Check for a ZFS control device
+  ansible.builtin.stat:
+    path: /dev/zfs
+  register: openclaw_node_zfs_dev
+
+- name: Resolve the device nodes the sandbox must keep available
+  ansible.builtin.set_fact:
+    openclaw_node_sandbox_devices: >-
+      {{ (openclaw_node_hardening_devices
+          + (['/dev/zfs'] if openclaw_node_zfs_dev.stat.exists else []))
+         | unique }}
+
 - name: Install systemd unit
   ansible.builtin.template:
     src: openclaw-node.service.j2
