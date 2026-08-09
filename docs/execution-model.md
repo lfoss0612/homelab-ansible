@@ -337,9 +337,19 @@ Worth being explicit about what this is not: `/dev/zfs` is `crw-rw-rw-`, so any
 unprivileged user on those hosts can already issue read-only ZFS ioctls. Handing it
 back keeps the status quo; it does not grant the agent anything it lacked.
 
-**Rollout is opt-in per host**, the same shape as `openclaw_resolved_standardize` and
-`openclaw_networkd_standardize` — `zabbix` canaries the plain path and `pbs` the ZFS
-one, then the default flips. Before either was touched, the full read-plane command
+**Rolled out opt-in per host, then defaulted on** (2026-08-08), the same shape as
+`openclaw_resolved_standardize` and `openclaw_networkd_standardize` — `zabbix` canaried
+the plain path, `pbs` the ZFS one, both went through a clean `validate-openclaw.yml`,
+and `openclaw_node_hardening` then became the default. The variable stays so a host
+that ever needs the sandbox off can say so in `host_vars` rather than by hand-editing a
+unit that self-heals on the next deploy.
+
+The canary run corrected the detection: `zabbix` has `/dev/zfs` because the ZFS module
+is loaded, but no `zpool` binary at all, so the first version handed the device back
+into a sandbox where nothing on the host could use it. Detection now requires the
+device **and** a userspace tool.
+
+Before either canary was touched, the full read-plane command
 battery (`journalctl`, `systemctl`, `ss`, `ps`, `lsblk`, `ip`, `df`, `free`, `smartctl
 --scan`, `zpool`, `crictl`, `qm`/`pct`/`pvesm`) was run inside a transient unit
 carrying these exact properties on `zabbix`, `pve`, `pve-ai` and `k8s-worker`, against
@@ -541,8 +551,9 @@ its two triggers must be created on host `cockpit.home.lan` (spec in the README)
 then the server accepts each value and discards it, and only the `last-failure` file
 and the optional webhook do anything.
 
-The four remaining items — harden `openclaw-node.service`, audit the other identities,
-decide on the capability layer, and create the Zabbix trapper — are tracked in the
+`openclaw-node.service` is now sandboxed — see "Sandboxing openclaw-node.service"
+above, done 2026-08-08. The three remaining items — audit the other identities, decide
+on the capability layer, and create the Zabbix trapper — are tracked in the
 homelab-vault `TODO.md`, under "OpenClaw — read plane". These are write-plane changes:
 they belong in the roles, applied by playbook, never hand-edited on the hosts.
 

@@ -18,10 +18,13 @@ openclaw_gateway_token: "REQUIRED_SET_IN_GROUP_VARS"
 # ~/.config/systemd/user manager, and every world-writable path on the box.
 # See docs/execution-model.md, "Sandboxing openclaw-node.service".
 #
-# Opt-in per host during rollout (same philosophy as openclaw_resolved_standardize
-# and openclaw_networkd_standardize), then flipped on fleet-wide once a canary
-# has been through validate-openclaw.yml.
-openclaw_node_hardening: false
+# Rolled out opt-in per host (same philosophy as openclaw_resolved_standardize
+# and openclaw_networkd_standardize) and defaulted on 2026-08-08 once both
+# canaries -- zabbix for the plain path, pbs for the ZFS hand-back -- had been
+# through a clean validate-openclaw.yml. Left as a variable so a host that ever
+# needs the sandbox off can say so in host_vars rather than by hand-editing a
+# unit that self-heals on the next deploy.
+openclaw_node_hardening: true
 
 # Extra writable paths for a host whose node legitimately needs one. Empty is
 # correct for the whole fleet as audited 2026-08-08: the only write FDs any node
