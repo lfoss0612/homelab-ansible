@@ -59,7 +59,7 @@
     # the weekly convergence, so this is what catches drift or a rebuilt host
     # in between manual runs.
     - name: Resolve the gateway hostname from this host
-      ansible.builtin.command: getent hosts openclaw.home.lan
+      ansible.builtin.command: getent hosts {{ openclaw_node_gateway_host }}
       register: openclaw_gateway_resolution
       changed_when: false
       failed_when: false
@@ -68,14 +68,17 @@
       ansible.builtin.assert:
         that:
           - openclaw_gateway_resolution.rc == 0
-          - openclaw_gateway_resolution.stdout.split()[0] == hostvars[groups['openclaw_gateway'][0]].ansible_host
+          - openclaw_gateway_resolution.stdout.split()[0] == openclaw_node_gateway_address
         fail_msg: >-
-          {{ inventory_hostname }} resolves openclaw.home.lan to
+          {{ inventory_hostname }} resolves {{ openclaw_node_gateway_host }} to
           '{{ openclaw_gateway_resolution.stdout.split()[0] | default("nothing") }}',
-          expected '{{ hostvars[groups['openclaw_gateway'][0]].ansible_host }}' —
-          check for a local /etc/hosts override or resolver misconfiguration
+          expected '{{ openclaw_node_gateway_address }}' (the OPNsense HAProxy
+          frontend) — check for a local /etc/hosts override pointing straight at
+          the gateway, or resolver misconfiguration
           (run deploy-openclaw.yml --tags dns).
-        success_msg: "{{ inventory_hostname }} resolves openclaw.home.lan correctly."
+        success_msg: >-
+          {{ inventory_hostname }} resolves {{ openclaw_node_gateway_host }}
+          through HAProxy correctly.
 
     - name: Assert the openclaw-node read-plane sandbox is enforced
       ansible.builtin.import_tasks: tasks/assert-node-sandbox.yml
@@ -124,7 +127,7 @@
       when: not (openclaw_optional_probe.unreachable | default(false))
 
     - name: Resolve the gateway hostname from this host
-      ansible.builtin.command: getent hosts openclaw.home.lan
+      ansible.builtin.command: getent hosts {{ openclaw_node_gateway_host }}
       register: openclaw_gateway_resolution
       changed_when: false
       failed_when: false
@@ -134,14 +137,17 @@
       ansible.builtin.assert:
         that:
           - openclaw_gateway_resolution.rc == 0
-          - openclaw_gateway_resolution.stdout.split()[0] == hostvars[groups['openclaw_gateway'][0]].ansible_host
+          - openclaw_gateway_resolution.stdout.split()[0] == openclaw_node_gateway_address
         fail_msg: >-
-          {{ inventory_hostname }} resolves openclaw.home.lan to
+          {{ inventory_hostname }} resolves {{ openclaw_node_gateway_host }} to
           '{{ openclaw_gateway_resolution.stdout.split()[0] | default("nothing") }}',
-          expected '{{ hostvars[groups['openclaw_gateway'][0]].ansible_host }}' —
-          check for a local /etc/hosts override or resolver misconfiguration
+          expected '{{ openclaw_node_gateway_address }}' (the OPNsense HAProxy
+          frontend) — check for a local /etc/hosts override pointing straight at
+          the gateway, or resolver misconfiguration
           (run deploy-openclaw.yml --tags dns).
-        success_msg: "{{ inventory_hostname }} resolves openclaw.home.lan correctly."
+        success_msg: >-
+          {{ inventory_hostname }} resolves {{ openclaw_node_gateway_host }}
+          through HAProxy correctly.
       when: not (openclaw_optional_probe.unreachable | default(false))
 
     # Same import as the strict play; the reachability probe is passed in so a

@@ -28,6 +28,14 @@ openclaw_node_min_version: "22.22.3"
 openclaw_node_gateway_host: "openclaw.home.lan"
 openclaw_node_gateway_port: 443
 
+# The address openclaw_node_gateway_host is SUPPOSED to resolve to: the OPNsense
+# HAProxy frontend, not the gateway host itself. Only consumed by
+# validate-openclaw.yml, to catch the specific drift that has actually bitten
+# here — a local /etc/hosts entry pointing openclaw.home.lan straight at
+# 10.0.5.7, which bypasses HAProxy entirely and silently un-does the TLS
+# migration for that host (exactly the gateway's own bug on 2026-08-03).
+openclaw_node_gateway_address: "10.0.3.1"
+
 # Shared gateway auth token. This is the real token gateway.auth.token uses
 # for token-mode auth (verified by digest comparison 2026-07-29) — required
 # on every remote node, not a placeholder.
