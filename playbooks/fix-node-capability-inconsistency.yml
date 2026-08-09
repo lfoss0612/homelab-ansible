@@ -56,23 +56,25 @@
         msg: "Dry-run only. Pass -e confirm=true to actually approve capabilities."
       when: not (confirm | bool)
 
-    - name: Approve system.execApprovals.get on target nodes
-      ansible.builtin.command: |
-        bash -c 'echo "{{ openclaw_gateway_token }}" | openclaw nodes approve-capability {{ node_ids[item] }} system.execApprovals.get'
-      become_user: "{{ openclaw_user }}"
-      loop: "{{ target_nodes }}"
-      register: approve_get_result
-      changed_when: "'approved' in approve_get_result.stdout or 'already' in approve_get_result.stdout"
-      when: item in node_ids
+    - name: Display node IDs for manual approval
+      ansible.builtin.debug:
+        msg: |
+          Node ID mapping:
+          {% for name, node_id in node_ids.items() %}
+          {{ name }}: {{ node_id }}
+          {% endfor %}
 
-    - name: Approve system.execApprovals.set on target nodes
-      ansible.builtin.command: |
-        bash -c 'echo "{{ openclaw_gateway_token }}" | openclaw nodes approve-capability {{ node_ids[item] }} system.execApprovals.set'
-      become_user: "{{ openclaw_user }}"
-      loop: "{{ target_nodes }}"
-      register: approve_set_result
-      changed_when: "'approved' in approve_set_result.stdout or 'already' in approve_set_result.stdout"
-      when: item in node_ids
+          To approve capabilities, run on the gateway:
+          {% for name in target_nodes %}
+          {% if name in node_ids %}
+          openclaw nodes approve-capability {{ node_ids[name] }} system.execApprovals.get
+          openclaw nodes approve-capability {{ node_ids[name] }} system.execApprovals.set
+          {% endif %}
+          {% endfor %}
+
+    - name: Manual approval notice
+      ansible.builtin.debug:
+        msg: "MANUAL STEP: Execute the commands shown above on the gateway to approve the capabilities. The exact command syntax should be verified with 'openclaw --help'."
 
     - name: Query final state
       ansible.builtin.command: openclaw nodes status --json
