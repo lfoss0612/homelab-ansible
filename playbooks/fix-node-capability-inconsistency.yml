@@ -1,0 +1,94 @@
+---
+# Fix the node capability approval inconsistency.
+# pdm.home.lan has system.execApprovals.get/set approved, but omv/pve/zabbix don't.
+# This playbook approves the missing capabilities on those three nodes.
+#
+# Run with: ansible-playbook playbooks/fix-node-capability-inconsistency.yml -e confirm=true
+
+- name: Approve missing system.execApprovals capabilities on nodes
+  hosts: openclaw_gateway
+  gather_facts: false
+  become: true
+
+  vars:
+    confirm: false
+    target_nodes:
+      - omv.home.lan
+      - pve.home.lan
+      - zabbix.home.lan
+    target_capabilities:
+      - system.execApprovals.get
+      - system.execApprovals.set
+
+  environment:
+    OPENCLAW_GATEWAY_AUTH_TOKEN: "{{ openclaw_gateway_token }}"
+
+  tasks:
+    - name: Query node status from the gateway
+      ansible.builtin.command: openclaw nodes status --json
+      become_user: "{{ openclaw_user }}"
+      register: openclaw_nodes_status_raw
+      changed_when: false
+
+    - name: Parse node status
+      ansible.builtin.set_fact:
+        openclaw_nodes_status: "{{ (openclaw_nodes_status_raw.stdout | from_json).nodes }}"
+
+    - name: Build node ID map
+      ansible.builtin.set_fact:
+        node_ids: "{{ node_ids | default({}) | combine({item.displayName: item.id}) }}"
+      loop: "{{ openclaw_nodes_status }}"
+      when: item.displayName in target_nodes and item.id is defined
+
+    - name: Display current capability state
+      ansible.builtin.debug:
+        msg: |
+          Node: {{ item.displayName }}
+          ID: {{ item.id }}
+          Current caps: {{ item.caps | default([]) | join(', ') }}
+          Missing: {{ target_capabilities | difference(item.caps | default([])) | join(', ') }}
+      loop: "{{ openclaw_nodes_status | selectattr('displayName', 'in', target_nodes) }}"
+      loop_control:
+        label: "{{ item.displayName }}"
+
+    - name: Fail if not confirmed
+      ansible.builtin.fail:
+        msg: "Dry-run only. Pass -e confirm=true to actually approve capabilities."
+      when: not (confirm | bool)
+
+    - name: Approve system.execApprovals.get on target nodes
+      ansible.builtin.command: |
+        bash -c 'echo "{{ openclaw_gateway_token }}" | openclaw nodes approve-capability {{ node_ids[item] }} system.execApprovals.get'
+      become_user: "{{ openclaw_user }}"
+      loop: "{{ target_nodes }}"
+      register: approve_get_result
+      changed_when: "'approved' in approve_get_result.stdout or 'already' in approve_get_result.stdout"
+      when: item in node_ids
+
+    - name: Approve system.execApprovals.set on target nodes
+      ansible.builtin.command: |
+        bash -c 'echo "{{ openclaw_gateway_token }}" | openclaw nodes approve-capability {{ node_ids[item] }} system.execApprovals.set'
+      become_user: "{{ openclaw_user }}"
+      loop: "{{ target_nodes }}"
+      register: approve_set_result
+      changed_when: "'approved' in approve_set_result.stdout or 'already' in approve_set_result.stdout"
+      when: item in node_ids
+
+    - name: Query final state
+      ansible.builtin.command: openclaw nodes status --json
+      become_user: "{{ openclaw_user }}"
+      register: final_state_raw
+      changed_when: false
+
+    - name: Display final capability state
+      ansible.builtin.set_fact:
+        final_state: "{{ (final_state_raw.stdout | from_json).nodes }}"
+
+    - name: Verify capabilities were approved
+      ansible.builtin.debug:
+        msg: |
+          Node: {{ item.displayName }}
+          Final caps: {{ item.caps | default([]) | join(', ') }}
+      loop: "{{ final_state | selectattr('displayName', 'in', target_nodes) }}"
+      loop_control:
+        label: "{{ item.displayName }}"
