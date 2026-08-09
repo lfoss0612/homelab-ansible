@@ -9,3 +9,21 @@
 # Masking is a no-op on live behavior -- it only prevents the already-dormant
 # ifupdown unit from ever being started again, matching pve/pve-ai/pve-router/pbs.
 openclaw_networkd_standardize: true
+
+# 2026-08-09 outage: the pre-migration check above confirmed networkd owned
+# ens18 and reported State: routable, but never verified the Address= prefix
+# length. /etc/systemd/network/10-ens18.network had Address=10.0.5.7 with no
+# /24, which networkd silently treats as /32 -- no route to the local subnet
+# or gateway, so the host was unreachable over SSH and the reverse proxy in
+# front of it returned 503 with no route back to the backend. A same-day
+# fleet-wide audit found no other host affected. Corrected by hand on the
+# console; asserted here the same way as pdm's directive fix, so drift back
+# to a bad Address= is caught on the next run instead of only at reboot.
+openclaw_networkd_static_network:
+  iface: ens18
+  address: "10.0.5.7/24"
+  gateway: "10.0.5.1"
+  dns:
+    - "10.0.5.1"
+    - "8.8.8.8"
+  domains: "home.lan"
