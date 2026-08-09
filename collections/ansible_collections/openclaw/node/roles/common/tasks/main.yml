@@ -131,13 +131,22 @@
     group: "{{ openclaw_group }}"
     mode: "0755"
 
+# The openclaw node process chmods this directory back to 0755 within
+# seconds of every start (writing the Memory Core sqlite db there) — a
+# fight the role always loses. Declaring 0700 produced a permanent
+# changed=1 on every deploy --check across the fleet with no real security
+# benefit: everything sensitive inside (openclaw.json, node.json,
+# exec-approvals.json, and the identity/state/plugins/cache/flows
+# subdirs) already carries its own restrictive mode independent of this
+# parent. See homelab-vault TODO.md ("OpenClaw .openclaw permission
+# fight", closed 2026-08-09) for the full investigation.
 - name: Ensure openclaw home state directory exists
   ansible.builtin.file:
     path: "/home/{{ openclaw_user }}/.openclaw"
     state: directory
     owner: "{{ openclaw_user }}"
     group: "{{ openclaw_group }}"
-    mode: "0700"
+    mode: "0755"
 
 - name: Resolve global npm prefix
   ansible.builtin.command: npm prefix -g
