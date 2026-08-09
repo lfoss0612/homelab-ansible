@@ -40,6 +40,14 @@
   become: true
 
   tasks:
+    - name: Assert this playbook's variables are in scope
+      ansible.builtin.import_tasks: tasks/assert-var-scope.yml
+      vars:
+        openclaw_required_vars:
+          - openclaw_version
+          - openclaw_node_gateway_host
+          - openclaw_node_gateway_address
+          - openclaw_node_hardening
     - name: Check installed openclaw CLI version
       ansible.builtin.command: openclaw --version
       register: openclaw_validate_version
@@ -98,6 +106,14 @@
   ignore_unreachable: true
 
   tasks:
+    - name: Assert this playbook's variables are in scope
+      ansible.builtin.import_tasks: tasks/assert-var-scope.yml
+      vars:
+        openclaw_required_vars:
+          - openclaw_version
+          - openclaw_node_gateway_host
+          - openclaw_node_gateway_address
+          - openclaw_node_hardening
     - name: Probe reachability — this host is allowed to be powered off
       ansible.builtin.ping:
       register: openclaw_optional_probe
@@ -175,6 +191,13 @@
     openclaw_validate_timeout: 60
 
   tasks:
+    - name: Assert this playbook's variables are in scope
+      ansible.builtin.import_tasks: tasks/assert-var-scope.yml
+      vars:
+        openclaw_required_vars:
+          - openclaw_version
+          - openclaw_gateway_port
+
     - name: Check gateway health endpoint
       ansible.builtin.uri:
         url: "http://127.0.0.1:{{ openclaw_gateway_port }}/health"

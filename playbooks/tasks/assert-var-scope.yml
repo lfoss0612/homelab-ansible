@@ -1,0 +1,40 @@
+---
+# Fail a playbook immediately when a variable it depends on is not in its scope.
+#
+# The problem this exists for: a variable defined only in a role's
+# defaults/main.yml is invisible to a playbook that includes no role. Referenced
+# in a template it dies with a cryptic "'x' is undefined" halfway through a run;
+# referenced in a `when:` guard behind `| default(...)` it does something worse
+# -- the task silently skips, the recap still says failed=0, and the check
+# reports green while asserting nothing. That happened here on 2026-08-08 to
+# every sandbox assertion in validate-openclaw.yml, on all 14 hosts, and was
+# caught only because someone remembered two task counts from the previous run.
+#
+# So: each playbook declares the config variables it needs, and this asserts them
+# up front with a message that names the fix. Cheap (one task), runs on every
+# real execution including the weekly timer, and cannot itself go quiet -- it has
+# no condition to skip on.
+#
+# Usage, as the first task of a play:
+#
+#   - name: Assert this playbook's variables are in scope
+#     ansible.builtin.import_tasks: tasks/assert-var-scope.yml
+#     vars:
+#       openclaw_required_vars: [openclaw_version, openclaw_node_hardening]
+#
+# The `vars` lookup resolves against the full play scope for this host, which is
+# the same scope the playbook's own tasks see -- so it agrees with reality rather
+# than approximating it. Role defaults do not appear there, which is the point.
+
+- name: Assert this playbook's config variables are in scope
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', item, default='__MISSING__') != '__MISSING__'
+    fail_msg: >-
+      '{{ item }}' is not in scope for {{ inventory_hostname }} in this playbook.
+      If it is defined in a role's defaults/main.yml, that is why: role defaults
+      only apply to plays that include the role, and this playbook does not.
+      Declare it in group_vars/ (keeping the role default as the fallback is
+      fine, and is what openclaw_gateway_port and openclaw_node_hardening do).
+    quiet: true
+  loop: "{{ openclaw_required_vars }}"
