@@ -36,6 +36,18 @@ openclaw_node_gateway_port: 443
 # migration for that host (exactly the gateway's own bug on 2026-08-03).
 openclaw_node_gateway_address: "10.0.3.1"
 
+# Kernel-enforced read-plane sandbox on openclaw-node.service. See
+# docs/execution-model.md, "Sandboxing openclaw-node.service".
+#
+# Declared here as well as in the node role's defaults, for the same reason
+# openclaw_gateway_port is declared in group_vars/openclaw_gateway.yml: role
+# defaults are only in scope for plays that include the role, and
+# validate-openclaw.yml is a bare task list. With it only in role defaults, every
+# sandbox assertion there resolved its `| default(false)` guard and skipped —
+# the check reported green while testing nothing. Caught 2026-08-08 by noticing
+# the assertions had gone from ok=9/ok=8 on the canaries to skipped everywhere.
+openclaw_node_hardening: true
+
 # Shared gateway auth token. This is the real token gateway.auth.token uses
 # for token-mode auth (verified by digest comparison 2026-07-29) — required
 # on every remote node, not a placeholder.
