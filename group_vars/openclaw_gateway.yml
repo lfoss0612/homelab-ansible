@@ -3,5 +3,17 @@ openclaw_group: openclaw
 
 openclaw_install_dir: /opt/openclaw
 
+# The gateway's OWN bind port and health-check port — NOT what nodes dial, which
+# is openclaw_node_gateway_host/_port in group_vars/openclaw.yml and goes through
+# HAProxy on 443. Conflating the two took the gateway down on 2026-08-03; see the
+# comment above openclaw_node_gateway_host for that story.
+#
+# Duplicated from the gateway role's defaults deliberately, with the same value.
+# Role defaults are only in scope for plays that include the role, and
+# validate-openclaw.yml's gateway play is a bare task list — so it referenced
+# openclaw_gateway_port and got "is undefined". Defining it at group scope makes
+# it visible to both.
+openclaw_gateway_port: 18789
+
 
 openclaw_force_reinstall: false
