@@ -9,6 +9,10 @@
   vars:
     ansible_user_name: ansible
     ansible_pubkey: "{{ lookup('file', '/opt/ansible/keys/ansible.pub') }}"
+    # Restricts the key to connections that actually originate from the
+    # control node, so a copy of the private key stolen from anywhere else
+    # is useless even though the sudo grant below is NOPASSWD:ALL.
+    ansible_control_node_ip: "{{ hostvars['cockpit.home.lan']['ansible_host'] }}"
 
   tasks:
 
@@ -43,6 +47,7 @@
         user: "{{ ansible_user_name }}"
         state: present
         key: "{{ ansible_pubkey }}"
+        key_options: 'from="{{ ansible_control_node_ip }}"'
 
     - name: Ensure ansible temp directory exists
       ansible.builtin.file:
