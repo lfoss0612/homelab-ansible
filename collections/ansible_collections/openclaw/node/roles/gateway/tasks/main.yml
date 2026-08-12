@@ -42,13 +42,22 @@
 # debugging on trusted networks, then turn it off immediately" — it was
 # never turned back off. Read/compare/patch/verify, same shape as the models
 # role, for the same reason: `config set`'s exit code doesn't prove the
-# write landed in the right file (see the become_user note there — running
+# write landed in the right file (see the runuser note there — running
 # as root silently edits /root/.openclaw/openclaw.json instead).
+#
+# The three tasks below use `runuser -u {{ openclaw_user }}` rather than
+# `become_user:`, because the ansible user's sudoers runas spec excludes openclaw
+# (see playbooks/users/ansible-user.yml). They run from root, which is still
+# permitted, and runuser sets HOME to the openclaw user's home — which is exactly
+# the property the paragraph above depends on. runuser resets PATH, hence the
+# absolute path from common's resolved npm prefix (common ran at line 34, so
+# openclaw_npm_prefix is in scope).
 - name: Read the current Control UI device-auth bypass setting
   ansible.builtin.command:
-    cmd: openclaw config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
-  become: true
-  become_user: "{{ openclaw_user }}"
+    cmd: >-
+      runuser -u {{ openclaw_user }} --
+      {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
+      config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
   register: openclaw_device_auth_bypass
   changed_when: false
   check_mode: false
@@ -57,9 +66,10 @@
 
 - name: Harden the Control UI device-auth bypass setting
   ansible.builtin.command:
-    cmd: openclaw config set gateway.controlUi.dangerouslyDisableDeviceAuth false --strict-json
-  become: true
-  become_user: "{{ openclaw_user }}"
+    cmd: >-
+      runuser -u {{ openclaw_user }} --
+      {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
+      config set gateway.controlUi.dangerouslyDisableDeviceAuth false --strict-json
   register: openclaw_device_auth_bypass_fix
   changed_when: openclaw_device_auth_bypass_fix.rc == 0
   when:
@@ -70,9 +80,10 @@
 
 - name: Re-read the Control UI device-auth setting to confirm the write landed
   ansible.builtin.command:
-    cmd: openclaw config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
-  become: true
-  become_user: "{{ openclaw_user }}"
+    cmd: >-
+      runuser -u {{ openclaw_user }} --
+      {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
+      config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
   register: openclaw_device_auth_bypass_verify
   changed_when: false
   when:

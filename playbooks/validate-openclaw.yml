@@ -230,9 +230,26 @@
       loop_control:
         label: "{{ item.item }}"
 
+    # The two openclaw-CLI tasks below use `runuser -u {{ openclaw_user }}` rather
+    # than `become_user:`, because the ansible user's sudoers runas spec excludes
+    # openclaw (see playbooks/users/ansible-user.yml). The play is become:true, so
+    # they run from root, which is still permitted. runuser resets PATH, hence the
+    # resolved absolute paths — resolved rather than hardcoded because the
+    # gateway's global npm prefix is /usr/local and every other node's is /usr.
+    - name: Resolve global npm prefix
+      ansible.builtin.command: npm prefix -g
+      register: openclaw_npm_prefix
+      changed_when: false
+
+    - name: Set the openclaw CLI path
+      ansible.builtin.set_fact:
+        openclaw_cli: "{{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw"
+
     - name: Query node status from the gateway
-      ansible.builtin.command: timeout -s KILL {{ openclaw_validate_timeout }} openclaw nodes status --json
-      become_user: "{{ openclaw_user }}"
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        /usr/bin/timeout -s KILL {{ openclaw_validate_timeout }}
+        {{ openclaw_cli }} nodes status --json
       register: openclaw_nodes_status_raw
       changed_when: false
 
@@ -316,9 +333,9 @@
     - name: Run openclaw doctor (read-only lint)
       ansible.builtin.command:
         cmd: >-
-          timeout -s KILL {{ openclaw_validate_timeout }}
-          openclaw doctor --lint --json --non-interactive
-      become_user: "{{ openclaw_user }}"
+          runuser -u {{ openclaw_user }} --
+          /usr/bin/timeout -s KILL {{ openclaw_validate_timeout }}
+          {{ openclaw_cli }} doctor --lint --json --non-interactive
       register: openclaw_doctor
       changed_when: false
       failed_when: false

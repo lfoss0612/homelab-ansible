@@ -39,8 +39,13 @@
           Defaults:lfoss !requiretty
         validate: "visudo -cf %s"
 
-    - name: Validate sudo access
-      ansible.builtin.command: whoami
-      become: true
-      become_user: lfoss
+    # runuser rather than `become_user: lfoss`: the ansible user's sudoers runas
+    # spec excludes lfoss (see ansible-user.yml). The play is already become:yes,
+    # so this runs from root, which is still permitted. Asserting on stdout makes
+    # it a real check — the old form only proved escalation itself worked.
+    # Absolute path: runuser resets PATH to login.defs ENV_SUPATH.
+    - name: Validate the lfoss account is usable
+      ansible.builtin.command: runuser -u lfoss -- /usr/bin/whoami
       changed_when: false
+      register: lfoss_whoami
+      failed_when: (lfoss_whoami.stdout | trim) != 'lfoss'

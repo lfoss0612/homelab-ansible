@@ -30,12 +30,26 @@
   delegate_to: "{{ item }}"
   loop: "{{ groups['openclaw_nodes'] }}"
 
+# This is the one openclaw-user task in the collection that is a module rather
+# than a command, so it cannot be wrapped in runuser the way the others are
+# (see playbooks/users/ansible-user.yml for why become_user: openclaw is no
+# longer available). It runs as root and writes to an explicit path instead —
+# which is safe here only because `path:` is absolute and does not depend on
+# HOME. The ownership fixup below is not optional: openclaw's own ssh appends to
+# this file on first contact with an unknown host, and a root-owned known_hosts
+# makes that fail silently.
 - name: Pre-seed the gateway's known_hosts with every node's host key
   ansible.builtin.known_hosts:
     name: "{{ hostvars[item].ansible_host | default(item) }}"
     key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' ~ (hostvars[item].ansible_host | default(item))) }}"
     path: "/home/{{ openclaw_user }}/.ssh/known_hosts"
-  become: true
-  become_user: "{{ openclaw_user }}"
   loop: "{{ groups['openclaw_nodes'] }}"
   when: hostvars[item].ansible_host is defined
+
+- name: Hand the pre-seeded known_hosts back to the openclaw user
+  ansible.builtin.file:
+    path: "/home/{{ openclaw_user }}/.ssh/known_hosts"
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_user }}"
+    mode: "0644"
+    state: file

@@ -57,11 +57,20 @@
         group: "{{ ansible_user_name }}"
         mode: "0700"
 
+    # The runas spec excludes openclaw and lfoss so a playbook cannot quietly
+    # acquire either account with `become_user:`. This is a guardrail, not a
+    # security boundary: the grant is still NOPASSWD:ALL for root, and root can
+    # reach any account by other means. What it buys is that every such access
+    # has to be written down explicitly (as `runuser -u <user>`, the pattern in
+    # claude-user.yml) instead of being ambient — which makes it greppable, and
+    # makes an accidental `become_user: openclaw` fail loudly rather than work.
+    # Backs up the "never grant the openclaw user sudo" corollary in CLAUDE.md
+    # from the other direction: nothing routes *into* openclaw either.
     - name: Allow passwordless sudo for ansible user
       ansible.builtin.copy:
         dest: /etc/sudoers.d/ansible
         content: |
-          ansible ALL=(ALL) NOPASSWD:ALL
+          ansible ALL=(ALL,!openclaw,!lfoss) NOPASSWD:ALL
         mode: "0440"
         validate: /usr/sbin/visudo -cf %s
 

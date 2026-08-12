@@ -75,9 +75,33 @@
     OPENCLAW_GATEWAY_AUTH_TOKEN: "{{ openclaw_gateway_token }}"
 
   tasks:
+    # Every openclaw-CLI task below uses `runuser -u {{ openclaw_user }}` rather
+    # than `become_user:`, because the ansible user's sudoers runas spec excludes
+    # openclaw (see playbooks/users/ansible-user.yml). The play is become:true, so
+    # these run from root, which is still permitted.
+    #
+    # The play-level environment: block survives this — verified 2026-08-09 that
+    # runuser preserves inherited env vars (it resets only HOME/SHELL/USER/
+    # LOGNAME/PATH), so OPENCLAW_GATEWAY_AUTH_TOKEN still reaches the CLI. That
+    # matters: without it every approve call fails on the secret-reference error
+    # described above.
+    #
+    # PATH is reset, hence the resolved absolute path below rather than a bare
+    # `openclaw` — and resolved, not hardcoded, because the gateway's global npm
+    # prefix is /usr/local while every other node's is /usr.
+    - name: Resolve global npm prefix
+      ansible.builtin.command: npm prefix -g
+      register: openclaw_npm_prefix
+      changed_when: false
+
+    - name: Set the openclaw CLI path
+      ansible.builtin.set_fact:
+        openclaw_cli: "{{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw"
+
     - name: Query node status from the gateway
-      ansible.builtin.command: openclaw nodes status --json
-      become_user: "{{ openclaw_user }}"
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        {{ openclaw_cli }} nodes status --json
       register: openclaw_nodes_status_raw
       changed_when: false
 
@@ -126,8 +150,9 @@
         label: "{{ item.displayName }}"
 
     - name: Approve matched pending node requests
-      ansible.builtin.command: "openclaw nodes approve {{ item.pendingRequestId }}"
-      become_user: "{{ openclaw_user }}"
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        {{ openclaw_cli }} nodes approve {{ item.pendingRequestId }}
       loop: "{{ openclaw_pending_matched }}"
       loop_control:
         label: "{{ item.displayName }}"
@@ -139,8 +164,9 @@
     # `devices approve`, not `nodes approve` — the CLI rejects the wrong pairing
     # of subcommand and queue.
     - name: Query the device pairing queue from the gateway
-      ansible.builtin.command: openclaw devices list --json
-      become_user: "{{ openclaw_user }}"
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        {{ openclaw_cli }} devices list --json
       register: openclaw_devices_raw
       changed_when: false
 
@@ -184,8 +210,9 @@
         label: "{{ item.displayName }}"
 
     - name: Approve matched first-time device pairings
-      ansible.builtin.command: "openclaw devices approve {{ item.requestId }}"
-      become_user: "{{ openclaw_user }}"
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        {{ openclaw_cli }} devices approve {{ item.requestId }}
       loop: "{{ openclaw_devices_matched }}"
       loop_control:
         label: "{{ item.displayName }}"

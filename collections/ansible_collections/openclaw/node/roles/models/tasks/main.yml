@@ -90,17 +90,44 @@
 # /root/.openclaw/openclaw.json — a different, near-empty config. It prints
 # `~/.openclaw/openclaw.json`, exits 0, and changes nothing that matters.
 #
-# become from root to an unprivileged user needs ACLs on the temp dir; see
-# playbooks/bootstrap/install-acl.yml, already a fleet prerequisite.
+# These used `become_user:` until 2026-08-09, which needed ACLs on the temp dir
+# (playbooks/bootstrap/install-acl.yml). runuser does not — it execs directly
+# from root and writes no temp files as the target user. install-acl.yml is
+# still a fleet prerequisite for other roles; it is just no longer load-bearing
+# for this one.
 #
 # `check_mode: false` on the reads for the usual command-module reason: they
 # must run under --check or the comparison below has nothing to compare.
 
+# Every openclaw-CLI task below uses `runuser -u {{ openclaw_models_user }}`
+# rather than `become_user:`, because the ansible user's sudoers runas spec
+# excludes openclaw (see playbooks/users/ansible-user.yml). The plays that use
+# this role are become:true, so these run from root, which is still permitted.
+#
+# runuser sets HOME to the target user's home, which is the property that
+# actually matters here: running these as root writes /root/.openclaw/
+# openclaw.json instead — the same trap the gateway role warns about. It resets
+# PATH too, hence the resolved absolute path below.
+#
+# Resolved locally rather than reusing common's openclaw_npm_prefix: this role
+# is invoked standalone by playbooks/openclaw-models.yml, which does not run
+# common, so that variable is not in scope.
+- name: Resolve global npm prefix
+  ansible.builtin.command: npm prefix -g
+  register: openclaw_models_npm_prefix
+  changed_when: false
+  check_mode: false
+
+- name: Set the openclaw CLI path
+  ansible.builtin.set_fact:
+    openclaw_models_cli: "{{ openclaw_models_npm_prefix.stdout | trim }}/bin/openclaw"
+
 - name: Read the current provider model catalogue
   ansible.builtin.command:
-    cmd: openclaw config get models.providers.{{ openclaw_models_provider }}.models --json
-  become: true
-  become_user: "{{ openclaw_models_user }}"
+    cmd: >-
+      runuser -u {{ openclaw_models_user }} --
+      {{ openclaw_models_cli }} config get
+      models.providers.{{ openclaw_models_provider }}.models --json
   register: openclaw_models_current_provider
   changed_when: false
   check_mode: false
@@ -108,9 +135,9 @@
 
 - name: Read the current agent alias map and primary
   ansible.builtin.command:
-    cmd: openclaw config get {{ item }} --json
-  become: true
-  become_user: "{{ openclaw_models_user }}"
+    cmd: >-
+      runuser -u {{ openclaw_models_user }} --
+      {{ openclaw_models_cli }} config get {{ item }} --json
   register: openclaw_models_current_agents
   changed_when: false
   check_mode: false
@@ -198,20 +225,22 @@
 
 - name: Validate the patch against the config schema
   ansible.builtin.command:
-    cmd: openclaw config patch --stdin --dry-run {{ openclaw_models_patch_flags }}
+    cmd: >-
+      runuser -u {{ openclaw_models_user }} --
+      {{ openclaw_models_cli }} config patch --stdin --dry-run
+      {{ openclaw_models_patch_flags }}
     stdin: "{{ openclaw_models_patch | to_json }}"
-  become: true
-  become_user: "{{ openclaw_models_user }}"
   changed_when: false
   check_mode: false
   when: not openclaw_models_converged
 
 - name: Apply the model catalogue
   ansible.builtin.command:
-    cmd: openclaw config patch --stdin {{ openclaw_models_patch_flags }}
+    cmd: >-
+      runuser -u {{ openclaw_models_user }} --
+      {{ openclaw_models_cli }} config patch --stdin
+      {{ openclaw_models_patch_flags }}
     stdin: "{{ openclaw_models_patch | to_json }}"
-  become: true
-  become_user: "{{ openclaw_models_user }}"
   register: openclaw_models_patch_result
   changed_when: openclaw_models_patch_result.rc == 0
   when: not openclaw_models_converged
@@ -223,9 +252,9 @@
 # the write succeeded but landed somewhere unexpected.
 - name: Re-read the catalogue to confirm the write landed
   ansible.builtin.command:
-    cmd: openclaw config get agents.defaults.model.primary --json
-  become: true
-  become_user: "{{ openclaw_models_user }}"
+    cmd: >-
+      runuser -u {{ openclaw_models_user }} --
+      {{ openclaw_models_cli }} config get agents.defaults.model.primary --json
   register: openclaw_models_verify
   changed_when: false
   when:
