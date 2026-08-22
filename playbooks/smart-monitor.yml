@@ -34,7 +34,7 @@
       ansible.builtin.command: grep -E '^Server=|^Hostname=' /etc/zabbix/zabbix_agentd.conf
       changed_when: false
       register: zabbix_config
-      failed_when: zabbix_config.rc != 0
+      failed_when: false
       check_mode: false
 
     - name: Report Zabbix configuration
@@ -42,16 +42,25 @@
         msg: |
           Zabbix agent configuration:
           {{ zabbix_config.stdout }}
+      when: zabbix_config.rc == 0
+
+    - name: Skip host if Zabbix agent not configured
+      ansible.builtin.debug:
+        msg: "Skipping SMART monitoring setup: Zabbix agent not found on {{ inventory_hostname }}"
+      when: zabbix_config.rc != 0
 
     - name: Include SMART monitoring setup tasks
       ansible.builtin.include_tasks: tasks/smart-monitor-setup.yml
+      when: zabbix_config.rc == 0
 
     - name: Run initial SMART check
       ansible.builtin.command: /usr/local/bin/smart-monitor
       register: smart_check_result
       changed_when: false
       failed_when: smart_check_result.rc > 1
+      when: zabbix_config.rc == 0
 
     - name: Show SMART check results
       ansible.builtin.debug:
         msg: "{{ smart_check_result.stdout_lines }}"
+      when: zabbix_config.rc == 0 and smart_check_result is defined
