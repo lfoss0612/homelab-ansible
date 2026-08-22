@@ -1,0 +1,57 @@
+---
+# Deploy SMART monitoring to Proxmox hosts
+#
+# Usage:
+#   ansible-playbook playbooks/smart-monitor.yml --check --diff
+#   ansible-playbook playbooks/smart-monitor.yml
+#
+# The script runs every 30 minutes and reports drive health to Zabbix.
+# Requires Zabbix agent to be configured on the target hosts.
+#
+# Optional: Enable smartd to execute the script on errors
+#   ansible-playbook playbooks/smart-monitor.yml -e smart_monitor_exec_on_error=true
+
+- name: Deploy SMART monitoring to Proxmox hosts
+  hosts: proxmox_hosts
+  become: true
+
+  handlers:
+    - name: systemd_daemon_reload
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: restart_smartd
+      ansible.builtin.systemd_service:
+        name: smartmontools
+        state: restarted
+
+    - name: smart_monitor_deployed
+      ansible.builtin.debug:
+        msg: "SMART monitoring script deployed"
+
+  tasks:
+    - name: Verify Zabbix agent is configured
+      ansible.builtin.command: grep -E '^Server=|^Hostname=' /etc/zabbix/zabbix_agentd.conf
+      changed_when: false
+      register: zabbix_config
+      failed_when: zabbix_config.rc != 0
+      check_mode: false
+
+    - name: Report Zabbix configuration
+      ansible.builtin.debug:
+        msg: |
+          Zabbix agent configuration:
+          {{ zabbix_config.stdout }}
+
+    - name: Include SMART monitoring setup tasks
+      ansible.builtin.include_tasks: tasks/smart-monitor-setup.yml
+
+    - name: Run initial SMART check
+      ansible.builtin.command: /usr/local/bin/smart-monitor
+      register: smart_check_result
+      changed_when: false
+      failed_when: smart_check_result.rc > 1
+
+    - name: Show SMART check results
+      ansible.builtin.debug:
+        msg: "{{ smart_check_result.stdout_lines }}"

@@ -1,0 +1,74 @@
+---
+# Deploy SMART monitoring to send alerts to Zabbix
+# Usage: include_tasks tasks/smart-monitor-setup.yml
+# or in a playbook: - include_tasks: tasks/smart-monitor-setup.yml
+
+- name: Deploy SMART monitoring script
+  ansible.builtin.copy:
+    src: ../scripts/smart-monitor.sh
+    dest: /usr/local/bin/smart-monitor
+    mode: '0755'
+    owner: root
+    group: root
+  notify: smart_monitor_deployed
+
+- name: Create SMART monitoring timer
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=Run SMART monitoring check
+      Documentation=man:systemd.timer(5)
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=30min
+      AccuracySec=1s
+
+      [Install]
+      WantedBy=timers.target
+    dest: /etc/systemd/system/smart-monitor.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: systemd_daemon_reload
+
+- name: Create SMART monitoring service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=SMART monitoring and Zabbix reporting
+      Documentation=file:///usr/local/bin/smart-monitor
+      After=smartmontools.service
+
+      [Service]
+      Type=oneshot
+      Environment="ZABBIX_SERVER=10.0.5.9"
+      Environment="ZABBIX_PORT=10051"
+      ExecStart=/usr/local/bin/smart-monitor
+      StandardOutput=journal
+      StandardError=journal
+    dest: /etc/systemd/system/smart-monitor.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: systemd_daemon_reload
+
+- name: Enable and start SMART monitoring timer
+  ansible.builtin.systemd_service:
+    name: smart-monitor.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Configure smartd to execute on errors (optional)
+  ansible.builtin.lineinfile:
+    path: /etc/smartmontools/smartd.conf
+    regexp: '^#-m'
+    line: '-m root@localhost -M exec /usr/local/bin/smart-monitor'
+    insertbefore: '^# DEVICESCAN'
+    state: present
+  notify: restart_smartd
+  when: smart_monitor_exec_on_error | default(false) | bool
+
+- name: Flush handlers to ensure smartd is restarted if configured
+  ansible.builtin.meta: flush_handlers
