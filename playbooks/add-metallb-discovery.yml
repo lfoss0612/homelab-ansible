@@ -1,0 +1,74 @@
+---
+# Add lightweight ICMP-only discovery for the MetalLB LoadBalancer IP range
+# (10.2.6.0/24). These are virtual/floating Service IPs MetalLB announces
+# via ARP to Kubernetes pod backends, not real hosts - no Zabbix agent runs
+# there, and each service exposes a different port (80, 443, 6379, 7000,
+# 8188, ...), so the "Zabbix agent" check used for the other subnets
+# doesn't apply. ICMP-only mirrors "LAN Device Discovery" (dcheck type 12)
+# and just gives visibility into which addresses are alive, without
+# pretending they're full hosts. Actual service health is already covered
+# by the cluster's own Rancher/Prometheus/Grafana stack in
+# cattle-monitoring-system.
+#
+# Range starts at .0, not .1: `kubectl get svc -A` showed comfyui actually
+# assigned 10.2.6.0 by the MetalLB pool, so .0-254 is used to make sure
+# every assigned IP is covered.
+#
+# Usage:
+#   ansible-playbook playbooks/add-metallb-discovery.yml
+
+- name: Add MetalLB discovery rule
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    rule_name: "MetalLB network"
+    rule_iprange: "10.2.6.0-254"
+
+  tasks:
+    - name: Check if rule already exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: drule.get
+          params:
+            output: ["druleid", "name"]
+            filter:
+              name: ["{{ rule_name }}"]
+          id: 1
+      register: existing_rule
+
+    - name: Create ICMP-only discovery rule for MetalLB range
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: drule.create
+          params:
+            name: "{{ rule_name }}"
+            iprange: "{{ rule_iprange }}"
+            delay: "1h"
+            dchecks:
+              - type: 12
+                ports: "0"
+                host_source: 1
+                name_source: 0
+                uniq: 0
+          id: 1
+      when: existing_rule.json.result | length == 0
+      register: create_result
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ 'Created: ' + rule_name + ' (' + rule_iprange + ')' if not create_result.skipped | default(false) else 'Already exists: ' + rule_name }}"
