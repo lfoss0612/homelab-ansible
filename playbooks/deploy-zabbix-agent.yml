@@ -14,50 +14,37 @@
     zabbix_server_port: "10051"
 
   handlers:
-    - name: restart_zabbix_agent2
+    - name: restart_zabbix_agent
       ansible.builtin.systemd_service:
-        name: zabbix-agent2
+        name: zabbix-agent
         state: restarted
-        daemon_reload: true
 
   tasks:
-    - name: Install Zabbix Agent 2 repository key
-      ansible.builtin.apt_key:
-        url: https://repo.zabbix.com/zabbix-official-repo.key
-        state: present
-      register: zabbix_repo_key
-      failed_when: false
-
-    - name: Add Zabbix Agent 2 repository
-      ansible.builtin.shell: |
-        echo "deb https://repo.zabbix.com/zabbix/7.4/$(lsb_release -cs)/ main" > /etc/apt/sources.list.d/zabbix.list
-      register: zabbix_repo
-      changed_when: true
+    - name: Clean up malformed Zabbix repository entries
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/repo_zabbix_com_zabbix_7_4_trixie.list
+        - /etc/apt/sources.list.d/repo_zabbix_com_zabbix_7_4_bookworm.list
+        - /etc/apt/sources.list.d/repo_zabbix_com_zabbix_7_4_noble.list
+        - /etc/apt/sources.list.d/zabbix.list
       failed_when: false
 
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
-      when: zabbix_repo.changed or zabbix_repo_key.changed
       changed_when: false
 
-    - name: Install Zabbix Agent 2
+    - name: Install Zabbix Agent
       ansible.builtin.apt:
-        name: zabbix-agent2
+        name: zabbix-agent
         state: present
       register: zabbix_agent_install
 
-    - name: Create Zabbix Agent 2 configuration directory
-      ansible.builtin.file:
-        path: /etc/zabbix/zabbix_agent2.d/plugins.d
-        state: directory
-        owner: root
-        group: root
-        mode: '0755'
-
-    - name: Configure Zabbix Agent 2
+    - name: Configure Zabbix Agent
       ansible.builtin.lineinfile:
-        path: /etc/zabbix/zabbix_agent2.conf
+        path: /etc/zabbix/zabbix_agentd.conf
         regexp: "{{ item.regexp }}"
         line: "{{ item.line }}"
         state: present
@@ -74,25 +61,24 @@
           line: "ServerActive={{ zabbix_server }}:{{ zabbix_server_port }}"
         - regexp: "^ServerActive="
           line: "ServerActive={{ zabbix_server }}:{{ zabbix_server_port }}"
-      notify: restart_zabbix_agent2
+      notify: restart_zabbix_agent
 
-    - name: Enable and start Zabbix Agent 2
+    - name: Enable and start Zabbix Agent
       ansible.builtin.systemd_service:
-        name: zabbix-agent2
+        name: zabbix-agent
         enabled: true
         state: started
-        daemon_reload: true
 
-    - name: Verify Zabbix Agent 2 is running
+    - name: Verify Zabbix Agent is running
       ansible.builtin.systemd_service:
-        name: zabbix-agent2
+        name: zabbix-agent
         state: started
       register: zabbix_agent_status
 
-    - name: Show Zabbix Agent 2 status
+    - name: Show Zabbix Agent status
       ansible.builtin.debug:
         msg: |
-          Zabbix Agent 2 deployed on {{ inventory_hostname }}
+          Zabbix Agent deployed on {{ inventory_hostname }}
           Server: {{ zabbix_server }}
           Port: {{ zabbix_server_port }}
           Hostname: {{ inventory_hostname }}
