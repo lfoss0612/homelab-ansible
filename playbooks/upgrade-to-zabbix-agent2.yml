@@ -78,9 +78,9 @@
         state: present
       loop:
         - regexp: "^# Server="
-          line: "Server={{ zabbix_server }}"
+          line: "Server={{ zabbix_server_allowed_ips }}"
         - regexp: "^Server="
-          line: "Server={{ zabbix_server }}"
+          line: "Server={{ zabbix_server_allowed_ips }}"
         - regexp: "^# Hostname="
           line: "Hostname={{ inventory_hostname }}"
         - regexp: "^Hostname="
@@ -90,6 +90,16 @@
         - regexp: "^ServerActive="
           line: "ServerActive={{ zabbix_server }}:{{ zabbix_server_port }}"
       notify: restart_zabbix_agent2
+      vars:
+        # zabbix.home.lan is monitored via a 127.0.0.1 interface in Zabbix
+        # itself (self-monitoring convention), not its real IP like every
+        # other host - the server therefore connects to its own agent from
+        # 127.0.0.1, not 10.0.5.9, and needs both in the allow-list. Getting
+        # this wrong shows as "ZBX_NOTSUPPORTED: ... dropped connection
+        # because of access permissions" in zabbix_get, discovered
+        # 2026-08-23 when zabbix.home.lan was the only host still red after
+        # every other host's Server= fix took effect.
+        zabbix_server_allowed_ips: "{{ zabbix_server + ',127.0.0.1' if inventory_hostname == 'zabbix.home.lan' else zabbix_server }}"
 
     - name: Enable and start Zabbix Agent 2
       ansible.builtin.systemd_service:
