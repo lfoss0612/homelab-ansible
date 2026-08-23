@@ -37,7 +37,11 @@
           auth: "{{ zabbix_api_token }}"
           id: 1
       register: hostgroup_result
-      failed_when: false
+
+    - name: Debug hostgroup_result
+      ansible.builtin.debug:
+        var: hostgroup_result
+        verbosity: 1
 
     - name: Create Proxmox host group if not exists
       ansible.builtin.uri:
@@ -51,7 +55,7 @@
             name: Proxmox
           auth: "{{ zabbix_api_token }}"
           id: 1
-      when: (hostgroup_result.content | from_json).result | length == 0
+      when: "hostgroup_result.get('json', {}).get('result', []) | length == 0"
 
     - name: Get Proxmox host group ID
       ansible.builtin.uri:
