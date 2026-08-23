@@ -1,0 +1,52 @@
+---
+# Unblock dpkg on k8s-worker-2.home.lan
+#
+# An automatic kernel update pulled in linux-image-7.0.0-28-generic, but
+# nvidia-dkms 580.105.08 doesn't build against its headers (kernel API
+# changes: backlight_device_get_by_name renamed, drm_gem_object_put_unlocked
+# removed, etc - see /var/lib/dkms/nvidia/580.105.08/build/make.log). That
+# left 4 packages half-configured, which blocks ALL subsequent dpkg/apt
+# operations on the host - discovered 2026-08-23 when this host was the
+# only one left red in Zabbix, because zabbix-agent2's config task couldn't
+# even reach a clean apt state to run.
+#
+# The host was still running the OLDER kernel (6.17.0-40-generic) with a
+# working nvidia driver (RTX 5090 confirmed via nvidia-smi) when this was
+# discovered - it never booted into 7.0.0-28-generic, so purging these
+# packages doesn't touch anything currently running. A newer kernel can be
+# reinstalled later once nvidia-dkms supports it.
+#
+# Usage:
+#   ansible-playbook playbooks/fix-k8s-worker-2-dpkg.yml
+
+- name: Unblock dpkg on k8s-worker-2
+  hosts: k8s-worker-2.home.lan
+  become: true
+
+  tasks:
+    - name: Purge the broken half-configured kernel packages
+      ansible.builtin.apt:
+        name:
+          - linux-image-7.0.0-28-generic
+          - linux-headers-7.0.0-28-generic
+          - linux-headers-generic-hwe-24.04
+          - linux-generic-hwe-24.04
+        state: absent
+        purge: true
+        force: true
+
+    - name: Finish configuring any remaining packages
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_configure
+      changed_when: "'Setting up' in dpkg_configure.stdout"
+      failed_when: false
+
+    - name: Verify dpkg is clean
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: dpkg_audit.stdout | trim != ''
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "dpkg is clean on {{ inventory_hostname }}"
