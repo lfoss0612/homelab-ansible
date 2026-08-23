@@ -1,0 +1,101 @@
+---
+# Create a "Kubernetes Nodes" host group in Zabbix and move the k8s hosts
+# into it, matching the existing convention where Proxmox hosts sit in their
+# own "Proxmox Servers" group instead of the generic "Linux servers" group.
+#
+# Usage:
+#   ansible-playbook playbooks/create-k8s-hostgroup.yml
+
+- name: Create Kubernetes Nodes host group and assign hosts
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    k8s_hostgroup_name: "Kubernetes Nodes"
+    k8s_hosts:
+      - k8s-master.home.lan
+      - k8s-worker.home.lan
+      - k8s-worker-2.home.lan
+
+  tasks:
+    - name: Check if Kubernetes Nodes host group exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ k8s_hostgroup_name }}"]
+          id: 1
+      register: existing_group
+
+    - name: Create Kubernetes Nodes host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.create
+          params:
+            name: "{{ k8s_hostgroup_name }}"
+          id: 1
+      register: create_group_result
+      when: existing_group.json.result | length == 0
+
+    - name: Set group ID fact
+      ansible.builtin.set_fact:
+        k8s_groupid: "{{ existing_group.json.result[0].groupid if existing_group.json.result | length > 0 else create_group_result.json.result.groupids[0] }}"
+
+    - name: Get Zabbix host IDs
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ k8s_hosts }}"
+          id: 1
+      register: zabbix_hosts
+
+    - name: Move hosts into Kubernetes Nodes group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ item.hostid }}"
+            groups:
+              - groupid: "{{ k8s_groupid }}"
+          id: 1
+      loop: "{{ zabbix_hosts.json.result }}"
+      register: host_update_results
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: |
+          Kubernetes Nodes group (id {{ k8s_groupid }}) ready.
+          {% for item in host_update_results.results %}
+          ✓ {{ item.item.host }}
+          {% endfor %}
