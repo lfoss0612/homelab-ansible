@@ -1,0 +1,71 @@
+---
+# Link Zabbix's "Kubernetes nodes by HTTP" template to k8s-master.home.lan
+#
+# Uses the read-only zbx_kube_api_token (host_vars/k8s-master.home.lan.yml),
+# authenticating against the ServiceAccount defined in homelab-gitops
+# (argocd/cattle-monitoring-system/zabbix-monitoring-rbac.yaml). See that
+# host_vars file for the token generation and verification commands.
+#
+# Usage:
+#   ansible-playbook playbooks/configure-kubernetes-monitoring.yml
+
+- name: Link Kubernetes template and configure macros in Zabbix
+  hosts: k8s-master.home.lan
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    linux_template_id: "10001"
+    kube_nodes_template_id: "10507"
+    target_host: "k8s-master.home.lan"
+
+  tasks:
+    - name: Get Zabbix host ID
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: ["{{ target_host }}"]
+          id: 1
+      register: zabbix_host_lookup
+      delegate_to: localhost
+
+    - name: Link Linux + Kubernetes nodes templates and set Kubernetes macros
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ zabbix_host_lookup.json.result[0].hostid }}"
+            templates:
+              - templateid: "{{ linux_template_id }}"
+              - templateid: "{{ kube_nodes_template_id }}"
+            macros:
+              - macro: "{$KUBE.API.URL}"
+                value: "{{ zbx_kube_api_url }}"
+              - macro: "{$KUBE.API.TOKEN}"
+                value: "{{ zbx_kube_api_token }}"
+                type: "1"
+          id: 1
+      register: template_link_result
+      delegate_to: localhost
+      no_log: true
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ 'Kubernetes nodes template linked to ' + target_host if template_link_result.json.result is defined else 'FAILED: ' + (template_link_result.json.error.data | default('unknown error')) }}"
+      delegate_to: localhost
