@@ -51,7 +51,7 @@
             name: Proxmox
           auth: "{{ zabbix_api_token }}"
           id: 1
-      when: hostgroup_result.json.result | length == 0
+      when: (hostgroup_result.content | from_json).result | length == 0
 
     - name: Get Proxmox host group ID
       ansible.builtin.uri:
@@ -67,7 +67,7 @@
           auth: "{{ zabbix_api_token }}"
           id: 1
       register: hostgroup_get
-      until: hostgroup_get.json.result | length > 0
+      until: (hostgroup_get.content | from_json).result | length > 0
       retries: 3
       delay: 1
 
@@ -83,7 +83,7 @@
             host: "{{ pve_host.name }}"
             visible_name: "{{ pve_host.visible_name }}"
             groups:
-              - groupid: "{{ hostgroup_get.json.result[0].groupid }}"
+              - groupid: "{{ (hostgroup_get.content | from_json).result[0].groupid }}"
             interfaces:
               - type: 1
                 main: 1
@@ -102,9 +102,9 @@
 
     - name: Extract host IDs
       set_fact:
-        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.json.result.hostids[0]}) }}"
+        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: (item.content | from_json).result.hostids[0]}) }}"
       loop: "{{ host_create_result.results }}"
-      when: "'result' in item.json and 'hostids' in item.json.result"
+      when: "item.content and ('result' in (item.content | from_json)) and ('hostids' in (item.content | from_json).result)"
 
     - name: Get existing host IDs if create failed
       ansible.builtin.uri:
@@ -127,9 +127,9 @@
 
     - name: Update host_ids with existing hosts
       set_fact:
-        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.json.result[0].hostid}) }}"
+        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: (item.content | from_json).result[0].hostid}) }}"
       loop: "{{ existing_hosts_result.results }}"
-      when: "item.json.result | length > 0"
+      when: "item.content and ((item.content | from_json).result | length > 0)"
 
     - name: Create SMART status items
       ansible.builtin.uri:
