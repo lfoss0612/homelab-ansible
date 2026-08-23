@@ -1,0 +1,85 @@
+---
+# Add network discovery rules for the three subnets with Ansible-managed
+# infrastructure but no discovery coverage: omv (10.1.5.x), the k8s nodes
+# (10.2.5.x), and vscode/desktop (10.10.5.x). Mirrors the existing "Local
+# network" rule exactly (Zabbix agent check via system.uname on port 10050,
+# 1h interval) - see drule.get output for the source config.
+#
+# All 14 hosts already exist as manually-configured Zabbix host objects
+# with agent2 running; this discovery is for catching any NEW/unexpected
+# device that shows up on these subnets later, not for finding the
+# existing fleet.
+#
+# Usage:
+#   ansible-playbook playbooks/add-zabbix-discovery-rules.yml
+
+- name: Add Zabbix discovery rules for uncovered subnets
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    discovery_rules:
+      - name: "omv network"
+        iprange: "10.1.5.1-254"
+      - name: "Kubernetes network"
+        iprange: "10.2.5.1-254"
+      - name: "vscode/desktop network"
+        iprange: "10.10.5.1-254"
+
+  tasks:
+    - name: Check for existing rules with these names
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: drule.get
+          params:
+            output: ["druleid", "name"]
+            filter:
+              name: "{{ discovery_rules | map(attribute='name') | list }}"
+          id: 1
+      register: existing_rules
+
+    - name: Create discovery rule for each uncovered subnet
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: drule.create
+          params:
+            name: "{{ item.name }}"
+            iprange: "{{ item.iprange }}"
+            delay: "1h"
+            dchecks:
+              - type: 9
+                key_: "system.uname"
+                ports: "10050"
+                host_source: 1
+                name_source: 0
+                uniq: 0
+          id: 1
+      loop: "{{ discovery_rules }}"
+      when: item.name not in (existing_rules.json.result | map(attribute='name') | list)
+      register: create_results
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: |
+          {% for item in create_results.results %}
+          {% if item.skipped is not defined %}
+          ✓ Created: {{ item.item.name }} ({{ item.item.iprange }})
+          {% else %}
+          - Already exists: {{ item.item.name }}
+          {% endif %}
+          {% endfor %}
