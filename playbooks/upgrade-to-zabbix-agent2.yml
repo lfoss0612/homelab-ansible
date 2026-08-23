@@ -1,0 +1,105 @@
+---
+# Upgrade from Zabbix Agent to Zabbix Agent 2
+#
+# Usage:
+#   ansible-playbook playbooks/upgrade-to-zabbix-agent2.yml --check --diff
+#   ansible-playbook playbooks/upgrade-to-zabbix-agent2.yml
+
+- name: Upgrade to Zabbix Agent 2
+  hosts: all:!api_managed
+  become: true
+
+  vars:
+    zabbix_server: "10.0.5.9"
+    zabbix_server_port: "10051"
+
+  handlers:
+    - name: restart_zabbix_agent2
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: restarted
+        enabled: true
+
+  tasks:
+    - name: Stop and disable zabbix-agent
+      ansible.builtin.systemd_service:
+        name: zabbix-agent
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove zabbix-agent package
+      ansible.builtin.apt:
+        name: zabbix-agent
+        state: absent
+        purge: true
+      failed_when: false
+
+    - name: Add Zabbix official repository (Debian/Trixie)
+      ansible.builtin.shell: |
+        curl -fsSL https://repo.zabbix.com/zabbix-official-repo.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/zabbix.gpg
+        echo "deb https://repo.zabbix.com/zabbix/7.4/debian {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
+      when: ansible_distribution == 'Debian'
+      changed_when: true
+      failed_when: false
+
+    - name: Add Zabbix official repository (Ubuntu)
+      ansible.builtin.shell: |
+        curl -fsSL https://repo.zabbix.com/zabbix-official-repo.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/zabbix.gpg
+        echo "deb https://repo.zabbix.com/zabbix/7.4/ubuntu {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
+      when: ansible_distribution == 'Ubuntu'
+      changed_when: true
+      failed_when: false
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      changed_when: false
+
+    - name: Install zabbix-agent2
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: present
+
+    - name: Configure Zabbix Agent 2
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - regexp: "^# Server="
+          line: "Server={{ zabbix_server }}"
+        - regexp: "^Server="
+          line: "Server={{ zabbix_server }}"
+        - regexp: "^# Hostname="
+          line: "Hostname={{ inventory_hostname }}"
+        - regexp: "^Hostname="
+          line: "Hostname={{ inventory_hostname }}"
+        - regexp: "^# ServerActive="
+          line: "ServerActive={{ zabbix_server }}:{{ zabbix_server_port }}"
+        - regexp: "^ServerActive="
+          line: "ServerActive={{ zabbix_server }}:{{ zabbix_server_port }}"
+      notify: restart_zabbix_agent2
+
+    - name: Enable and start Zabbix Agent 2
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        enabled: true
+        state: started
+
+    - name: Verify Zabbix Agent 2 is running
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: started
+      register: zabbix_agent2_status
+
+    - name: Show Zabbix Agent 2 status
+      ansible.builtin.debug:
+        msg: |
+          Zabbix Agent 2 configured on {{ inventory_hostname }}
+          Server: {{ zabbix_server }}
+          Port: {{ zabbix_server_port }}
+          Hostname: {{ inventory_hostname }}
+          Status: {{ zabbix_agent2_status.status.ActiveState | default('unknown') }}
