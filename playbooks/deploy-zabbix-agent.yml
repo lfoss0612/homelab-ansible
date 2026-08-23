@@ -29,10 +29,10 @@
       failed_when: false
 
     - name: Add Zabbix Agent 2 repository
-      ansible.builtin.apt_repository:
-        repo: "deb https://repo.zabbix.com/zabbix/7.4/{{ ansible_distribution_release }}/ main"
-        state: present
+      ansible.builtin.shell: |
+        echo "deb https://repo.zabbix.com/zabbix/7.4/$(lsb_release -cs)/ main" > /etc/apt/sources.list.d/zabbix.list
       register: zabbix_repo
+      changed_when: true
       failed_when: false
 
     - name: Update apt cache
