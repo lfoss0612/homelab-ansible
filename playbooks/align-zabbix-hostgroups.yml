@@ -1,0 +1,161 @@
+---
+# Align Zabbix host groups with the actual inventory.ini topology.
+#
+# Before this ran, hostgroup membership didn't match the real topology:
+#   - cockpit.home.lan sat in "Virtual machines" despite being an LXC
+#     container, not a QEMU VM (README.md explicitly calls out the
+#     distinction - that's why `lxc` was split out of `vms` on 2026-08-03).
+#   - omv.home.lan (qemu_vms) was correctly in "Virtual machines", but its
+#     qemu_vms siblings (vscode, openclaw, desktop) sat in the generic
+#     "Linux servers" instead - same topology tier, inconsistent grouping.
+#   - pdm.home.lan (lxc) was also in "Linux servers", not matching cockpit.
+#
+# This moves every qemu_vms host into "Virtual machines" and every lxc host
+# into "LXC Containers" (must be created manually first - hostgroup.create
+# needs Admin/Super Admin role type, unavailable to this API token's role;
+# see playbooks/create-k8s-hostgroup.yml for the same constraint hit
+# earlier). pbs.home.lan (bare_metal) and zabbix.home.lan (self-hosting the
+# monitoring stack) are left as-is - see the group-selection conversation
+# for why those two are reasonable exceptions.
+#
+# Usage:
+#   ansible-playbook playbooks/align-zabbix-hostgroups.yml
+
+- name: Align Zabbix host groups with inventory topology
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    # qemu_vms per inventory.ini - all should be in "Virtual machines"
+    qemu_vm_hosts:
+      - omv.home.lan
+      - vscode.home.lan
+      - openclaw.home.lan
+      - desktop.home.lan
+
+    # lxc per inventory.ini - all should be in "LXC Containers"
+    lxc_hosts:
+      - cockpit.home.lan
+      - pdm.home.lan
+
+  tasks:
+    - name: Get Virtual machines group ID
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["Virtual machines"]
+          id: 1
+      register: vm_group_lookup
+      failed_when: vm_group_lookup.json.result | length == 0
+
+    - name: Get LXC Containers group ID
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["LXC Containers"]
+          id: 1
+      register: lxc_group_lookup
+      failed_when: lxc_group_lookup.json.result | length == 0
+
+    - name: Get Zabbix host IDs for qemu_vms hosts
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ qemu_vm_hosts }}"
+          id: 1
+      register: qemu_vm_host_ids
+
+    - name: Get Zabbix host IDs for lxc hosts
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ lxc_hosts }}"
+          id: 1
+      register: lxc_host_ids
+
+    - name: Move qemu_vms hosts into Virtual machines group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ item.hostid }}"
+            groups:
+              - groupid: "{{ vm_group_lookup.json.result[0].groupid }}"
+          id: 1
+      loop: "{{ qemu_vm_host_ids.json.result }}"
+      register: vm_update_results
+
+    - name: Move lxc hosts into LXC Containers group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ item.hostid }}"
+            groups:
+              - groupid: "{{ lxc_group_lookup.json.result[0].groupid }}"
+          id: 1
+      loop: "{{ lxc_host_ids.json.result }}"
+      register: lxc_update_results
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: |
+          Virtual machines group:
+          {% for item in vm_update_results.results %}
+          ✓ {{ item.item.host }}
+          {% endfor %}
+          LXC Containers group:
+          {% for item in lxc_update_results.results %}
+          ✓ {{ item.item.host }}
+          {% endfor %}
