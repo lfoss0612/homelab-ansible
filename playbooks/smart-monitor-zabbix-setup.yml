@@ -9,8 +9,9 @@
   gather_facts: false
 
   vars:
-    zabbix_url: "http://10.0.5.9"
+    zabbix_url: "https://zabbix.home.lan:8443"
     zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    zabbix_validate_certs: false
 
     pve_hosts:
       - name: pve.home.lan
@@ -28,6 +29,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: hostgroup.get
@@ -48,6 +50,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: hostgroup.create
@@ -62,6 +65,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: hostgroup.get
@@ -80,6 +84,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: host.create
@@ -115,6 +120,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: host.get
@@ -140,6 +146,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: item.create
@@ -161,6 +168,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: item.create
@@ -232,6 +240,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: item.create
@@ -261,6 +270,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: trigger.create
@@ -280,6 +290,7 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        validate_certs: "{{ zabbix_validate_certs }}"
         body:
           jsonrpc: "2.0"
           method: trigger.create
