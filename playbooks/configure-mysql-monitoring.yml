@@ -1,0 +1,97 @@
+---
+# Configure Zabbix MySQL monitoring for zabbix.home.lan
+#
+# zabbix.home.lan runs its own MySQL 8.0 as the Zabbix server's database
+# backend. This creates a dedicated read-only monitoring user (distinct from
+# the zabbix-server's own DBUser=zabbix — see host_vars/zabbix.home.lan.yml
+# for why) and links the built-in "MySQL by Zabbix agent 2" template
+# (templateid 10320) alongside the existing "Linux by Zabbix agent" template
+# (10001).
+#
+# Uses raw `mysql` CLI commands via root's unix_socket auth rather than the
+# community.mysql collection, to avoid adding a new third-party collection
+# dependency for a single user-creation task (collections/requirements.yml
+# already documents this repo's preference to avoid that where avoidable).
+#
+# Usage:
+#   ansible-playbook playbooks/configure-mysql-monitoring.yml
+
+- name: Create MySQL monitoring user
+  hosts: zabbix.home.lan
+  become: true
+
+  tasks:
+    - name: Check if zbx_monitor MySQL user exists
+      ansible.builtin.command:
+        cmd: mysql -N -e "SELECT COUNT(*) FROM mysql.user WHERE user='{{ zbx_mysql_user }}' AND host='localhost'"
+      register: zbx_user_check
+      changed_when: false
+
+    - name: Create zbx_monitor MySQL user and grant monitoring privileges
+      ansible.builtin.shell: |
+        mysql -e "CREATE USER '{{ zbx_mysql_user }}'@'localhost' IDENTIFIED BY '{{ zbx_mysql_password }}';"
+        mysql -e "GRANT SELECT ON performance_schema.* TO '{{ zbx_mysql_user }}'@'localhost';"
+        mysql -e "GRANT REPLICATION CLIENT, PROCESS ON *.* TO '{{ zbx_mysql_user }}'@'localhost';"
+        mysql -e "FLUSH PRIVILEGES;"
+      when: zbx_user_check.stdout | trim == '0'
+      no_log: true
+
+- name: Link MySQL template and configure macros in Zabbix
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    linux_template_id: "10001"
+    mysql_template_id: "10320"
+    target_host: "zabbix.home.lan"
+
+  tasks:
+    - name: Get Zabbix host ID
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: ["{{ target_host }}"]
+          id: 1
+      register: zabbix_host_lookup
+
+    - name: Link Linux + MySQL templates and set MySQL macros
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ zabbix_host_lookup.json.result[0].hostid }}"
+            templates:
+              - templateid: "{{ linux_template_id }}"
+              - templateid: "{{ mysql_template_id }}"
+            macros:
+              - macro: "{$MYSQL.DSN}"
+                value: "unix:/var/run/mysqld/mysqld.sock"
+              - macro: "{$MYSQL.USER}"
+                value: "{{ zbx_mysql_user }}"
+              - macro: "{$MYSQL.PASSWORD}"
+                value: "{{ zbx_mysql_password }}"
+                type: "1"
+          id: 1
+      register: template_link_result
+      no_log: true
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ 'MySQL template linked to ' + target_host if template_link_result.json.result is defined else 'FAILED: ' + (template_link_result.json.error.data | default('unknown error')) }}"

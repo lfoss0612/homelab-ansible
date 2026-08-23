@@ -1,0 +1,27 @@
+---
+# host_vars/zabbix.home.lan.yml
+
+# --- MySQL monitoring credentials ---------------------------------------------
+#
+# zabbix.home.lan runs its own MySQL 8.0 as the Zabbix server's database
+# backend (DBUser=zabbix in /etc/zabbix/zabbix_server.conf). The Zabbix
+# "MySQL by Zabbix agent 2" template needs its own read-only monitoring user,
+# distinct from the zabbix-server's own DB user, for the same reason
+# opnsense_api_key/_secret are dedicated per-caller (see
+# group_vars/network_appliances.yml): sharing a credential between the
+# server's own DB access and monitoring means neither can be revoked or
+# re-scoped independently.
+#
+# playbooks/configure-mysql-monitoring.yml creates this user with:
+#   GRANT SELECT ON performance_schema.* TO 'zbx_monitor'@'localhost';
+#   GRANT REPLICATION CLIENT, PROCESS ON *.* TO 'zbx_monitor'@'localhost';
+#
+# Password generated with: openssl rand -base64 24 | tr -d '/+=' | head -c 32
+zbx_mysql_user: zbx_monitor
+zbx_mysql_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          35626236393638313165336135383838363538623964346566383037373764356632666639303136
+          3632623663313262656330396136303334653131353332640a366162633061653366373061643864
+          33373033646564366134386636396663343263653034616463623465313331326535383436623263
+          3762323931383234350a373065346461633535343532393539653531643466633764316566643166
+          34333265653337633037656534303338666565336365396164353939613462316437
