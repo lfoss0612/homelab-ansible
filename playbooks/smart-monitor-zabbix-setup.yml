@@ -28,13 +28,14 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: hostgroup.get
           params:
             filter:
               name: Proxmox
-          auth: "{{ zabbix_api_token }}"
           id: 1
       register: hostgroup_result
 
@@ -43,12 +44,13 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: hostgroup.create
           params:
             name: Proxmox
-          auth: "{{ zabbix_api_token }}"
           id: 1
       when: "hostgroup_result.get('json', {}).get('result', []) | length == 0"
 
@@ -56,11 +58,18 @@
       set_fact:
         hostgroup_get: "{{ hostgroup_result }}"
 
+    - name: Debug hostgroup_get
+      ansible.builtin.debug:
+        msg: "Hostgroup result: {{ hostgroup_get }}"
+        verbosity: 1
+
     - name: Create/update PVE hosts in Zabbix
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: host.create
@@ -76,7 +85,6 @@
                 ip: "{{ pve_host.ip_address }}"
                 dns: "{{ pve_host.name }}"
                 port: 10050
-          auth: "{{ zabbix_api_token }}"
           id: 1
         status_code: [200]
       loop: "{{ pve_hosts }}"
@@ -89,20 +97,21 @@
       set_fact:
         host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.get('json', {}).get('result', {}).get('hostids', [0])[0]}) }}"
       loop: "{{ host_create_result.results }}"
-      when: "item.get('json', {}).get('result', {}).get('hostids', [])"
+      when: "item.get('json', {}).get('result', {}).get('hostids', []) | bool"
 
     - name: Get existing host IDs if create failed
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: host.get
           params:
             filter:
               host: "{{ pve_host.name }}"
-          auth: "{{ zabbix_api_token }}"
           id: 1
       loop: "{{ pve_hosts }}"
       loop_control:
@@ -121,6 +130,8 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: item.create
@@ -130,7 +141,6 @@
             hostid: "{{ host_ids[pve_host.name] }}"
             type: 2
             value_type: 3
-          auth: "{{ zabbix_api_token }}"
           id: 1
       loop: "{{ pve_hosts }}"
       loop_control:
@@ -142,6 +152,8 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: item.create
@@ -152,7 +164,6 @@
             type: 2
             value_type: 3
             units: "{{ item.units | default('') }}"
-          auth: "{{ zabbix_api_token }}"
           id: 1
       vars:
         items:
@@ -213,6 +224,8 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: item.create
@@ -223,7 +236,6 @@
             type: 2
             value_type: 3
             units: "{{ item.units | default('') }}"
-          auth: "{{ zabbix_api_token }}"
           id: 1
       vars:
         items:
@@ -242,6 +254,8 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: trigger.create
@@ -249,7 +263,6 @@
             description: "SMART drive failure on {{ pve_host.name }}"
             expression: "last(/{{ pve_host.name }}/smart.status)=1"
             severity: 4
-          auth: "{{ zabbix_api_token }}"
           id: 1
       loop: "{{ pve_hosts }}"
       loop_control:
@@ -261,6 +274,8 @@
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
         body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
         body:
           jsonrpc: "2.0"
           method: trigger.create
@@ -268,7 +283,6 @@
             description: "SMART monitoring error on {{ pve_host.name }}"
             expression: "last(/{{ pve_host.name }}/smart.status)=2"
             severity: 3
-          auth: "{{ zabbix_api_token }}"
           id: 1
       loop: "{{ pve_hosts }}"
       loop_control:
