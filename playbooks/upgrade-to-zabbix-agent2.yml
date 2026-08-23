@@ -44,7 +44,9 @@
         - name: Add Zabbix official repository
           ansible.builtin.shell: echo "deb https://repo.zabbix.com/zabbix/7.4/ubuntu {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
           changed_when: true
-      when: ansible_distribution == 'Ubuntu'
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - ansible_distribution_release not in ['noble']
 
     - name: Update apt cache
       ansible.builtin.apt:
