@@ -57,8 +57,8 @@
 
     - name: Extract or use existing Proxmox group ID
       set_fact:
-        proxmox_groupid: "{{ hostgroup_create_result.get('json', {}).get('result', {}).get('groupids', [proxmox_groupid | default('2')])[0] }}"
-      when: hostgroup_create_result.get('json', {}).get('result', {}).get('groupids')
+        proxmox_groupid: "{{ hostgroup_create_result.get('json', {}).get('result', {}).get('groupids', ['2'])[0] }}"
+      when: "hostgroup_create_result.get('json', {}).get('result', {}).get('groupids', []) | length > 0"
 
     - name: Create/update PVE hosts in Zabbix
       ansible.builtin.uri:
