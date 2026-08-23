@@ -1,0 +1,199 @@
+---
+# Configure Zabbix items and triggers for SMART monitoring
+#
+# Usage:
+#   ansible-playbook playbooks/smart-monitor-zabbix-setup.yml --check --diff
+#   ansible-playbook playbooks/smart-monitor-zabbix-setup.yml
+
+- name: Configure Zabbix for SMART monitoring
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    pve_hosts:
+      - name: pve.home.lan
+        visible_name: PVE
+        ip_address: 10.0.5.4
+        drives: [sda, sdb, sdc, sdd, sde, sdf, sdg]
+      - name: pve-ai.home.lan
+        visible_name: PVE-AI
+        ip_address: 10.0.5.3
+        drives: [nvme0]
+
+  pre_tasks:
+    - name: Install community.zabbix collection
+      command: ansible-galaxy collection install community.zabbix --upgrade
+      changed_when: false
+
+    - name: Build host/drive combinations
+      set_fact:
+        host_drive_pairs: "{{ host_drive_pairs | default([]) + [{'host': item.0, 'drive': item.1}] }}"
+      loop: "{{ query('nested', pve_hosts, pve_hosts[0].drives) }}"
+      when: "'drives' in item.0 and item.1 in item.0.drives"
+
+    - name: Rebuild host_drive_pairs correctly
+      set_fact:
+        host_drive_pairs: "{{ query('nested', pve_hosts | list) | list }}"
+
+  tasks:
+    - name: Create/update Proxmox hosts in Zabbix
+      community.zabbix.zabbix_host:
+        server_url: "{{ zabbix_url }}"
+        login_token: "{{ zabbix_api_token }}"
+        host_name: "{{ item.name }}"
+        visible_name: "{{ item.visible_name }}"
+        host_groups:
+          - Proxmox
+        interfaces:
+          - type: agent
+            main: true
+            ip: "{{ item.ip_address }}"
+            port: 10050
+        state: present
+      loop: "{{ pve_hosts }}"
+
+    - name: Create overall SMART status item
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_url }}"
+        login_token: "{{ zabbix_api_token }}"
+        host_name: "{{ item.name }}"
+        name: "SMART status"
+        key: "smart.status"
+        type: trapper
+        value_type: unsigned
+        state: present
+      loop: "{{ pve_hosts }}"
+
+    - name: Create SMART items for PVE (7 drives)
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_url }}"
+        login_token: "{{ zabbix_api_token }}"
+        host_name: pve.home.lan
+        name: "{{ item.name }}"
+        key: "{{ item.key }}"
+        type: trapper
+        value_type: unsigned
+        units: "{{ item.units | default('') }}"
+        state: present
+      vars:
+        items:
+          - name: "SMART status - sda"
+            key: "smart.drive.sda.status"
+          - name: "SMART temperature - sda"
+            key: "smart.drive.sda.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sda"
+            key: "smart.drive.sda.failed_attrs"
+          - name: "SMART status - sdb"
+            key: "smart.drive.sdb.status"
+          - name: "SMART temperature - sdb"
+            key: "smart.drive.sdb.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sdb"
+            key: "smart.drive.sdb.failed_attrs"
+          - name: "SMART status - sdc"
+            key: "smart.drive.sdc.status"
+          - name: "SMART temperature - sdc"
+            key: "smart.drive.sdc.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sdc"
+            key: "smart.drive.sdc.failed_attrs"
+          - name: "SMART status - sdd"
+            key: "smart.drive.sdd.status"
+          - name: "SMART temperature - sdd"
+            key: "smart.drive.sdd.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sdd"
+            key: "smart.drive.sdd.failed_attrs"
+          - name: "SMART status - sde"
+            key: "smart.drive.sde.status"
+          - name: "SMART temperature - sde"
+            key: "smart.drive.sde.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sde"
+            key: "smart.drive.sde.failed_attrs"
+          - name: "SMART status - sdf"
+            key: "smart.drive.sdf.status"
+          - name: "SMART temperature - sdf"
+            key: "smart.drive.sdf.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sdf"
+            key: "smart.drive.sdf.failed_attrs"
+          - name: "SMART status - sdg"
+            key: "smart.drive.sdg.status"
+          - name: "SMART temperature - sdg"
+            key: "smart.drive.sdg.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - sdg"
+            key: "smart.drive.sdg.failed_attrs"
+      loop: "{{ items }}"
+
+    - name: Create SMART items for PVE-AI (nvme0)
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_url }}"
+        login_token: "{{ zabbix_api_token }}"
+        host_name: pve-ai.home.lan
+        name: "{{ item.name }}"
+        key: "{{ item.key }}"
+        type: trapper
+        value_type: unsigned
+        units: "{{ item.units | default('') }}"
+        state: present
+      vars:
+        items:
+          - name: "SMART status - nvme0"
+            key: "smart.drive.nvme0.status"
+          - name: "SMART temperature - nvme0"
+            key: "smart.drive.nvme0.temperature"
+            units: "°C"
+          - name: "SMART failed attributes - nvme0"
+            key: "smart.drive.nvme0.failed_attrs"
+      loop: "{{ items }}"
+
+    - name: Create SMART failure trigger
+      community.zabbix.zabbix_trigger:
+        server_url: "{{ zabbix_url }}"
+        login_token: "{{ zabbix_api_token }}"
+        name: "SMART drive failure on {{ item.name }}"
+        expression: "last(/{{ item.name }}/smart.status)=1"
+        severity: high
+        state: present
+      loop: "{{ pve_hosts }}"
+
+    - name: Create SMART error trigger
+      community.zabbix.zabbix_trigger:
+        server_url: "{{ zabbix_url }}"
+        login_token: "{{ zabbix_api_token }}"
+        name: "SMART monitoring error on {{ item.name }}"
+        expression: "last(/{{ item.name }}/smart.status)=2"
+        severity: medium
+        state: present
+      loop: "{{ pve_hosts }}"
+
+  post_tasks:
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          ✓ Zabbix SMART monitoring setup complete!
+
+          Configured hosts:
+          - pve.home.lan (7 drives: sda-sdg)
+          - pve-ai.home.lan (1 drive: nvme0)
+
+          Items created per host:
+          - smart.status (overall health)
+          - smart.drive.{device}.status (per-drive)
+          - smart.drive.{device}.temperature (per-drive, in °C)
+          - smart.drive.{device}.failed_attrs (per-drive)
+
+          Triggers created per host:
+          - SMART drive failure (High severity) → fires when smart.status = 1
+          - SMART monitoring error (Medium severity) → fires when smart.status = 2
+
+          Verify in Zabbix frontend:
+          1. Configuration > Hosts > [host] > Items
+          2. Should see all items with Type=Trapper
+          3. Monitoring > Problems to view active triggers
