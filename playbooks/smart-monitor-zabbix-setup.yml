@@ -20,6 +20,10 @@
       - name: pve-ai.home.lan
         visible_name: PVE-AI
         ip_address: 10.0.5.3
+        drives: [nvme0, nvme1]
+      - name: pve-router.home.lan
+        visible_name: PVE-Router
+        ip_address: 10.0.5.2
         drives: [nvme0]
 
   tasks:
