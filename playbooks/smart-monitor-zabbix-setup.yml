@@ -38,11 +38,6 @@
           id: 1
       register: hostgroup_result
 
-    - name: Debug hostgroup_result
-      ansible.builtin.debug:
-        var: hostgroup_result
-        verbosity: 1
-
     - name: Create Proxmox host group if not exists
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
@@ -57,23 +52,9 @@
           id: 1
       when: "hostgroup_result.get('json', {}).get('result', []) | length == 0"
 
-    - name: Get Proxmox host group ID
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        body:
-          jsonrpc: "2.0"
-          method: hostgroup.get
-          params:
-            filter:
-              name: Proxmox
-          auth: "{{ zabbix_api_token }}"
-          id: 1
-      register: hostgroup_get
-      until: "hostgroup_get.get('json', {}).get('result', []) | length > 0"
-      retries: 3
-      delay: 1
+    - name: Set hostgroup_get from initial result
+      set_fact:
+        hostgroup_get: "{{ hostgroup_result }}"
 
     - name: Create/update PVE hosts in Zabbix
       ansible.builtin.uri:
