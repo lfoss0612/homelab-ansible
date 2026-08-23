@@ -120,7 +120,7 @@
       set_fact:
         host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.get('json', {}).get('result', [{}])[0].get('hostid', '')}) }}"
       loop: "{{ existing_hosts_result.results }}"
-      when: "item.get('json', {}).get('result', [])"
+      when: "item.get('json', {}).get('result', []) | length > 0"
 
     - name: Create SMART status items
       ansible.builtin.uri:
