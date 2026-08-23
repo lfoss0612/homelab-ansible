@@ -35,18 +35,19 @@
         purge: true
       failed_when: false
 
+    - name: Download and add Zabbix GPG key
+      ansible.builtin.shell: curl -fsSL https://repo.zabbix.com/zabbix-official-repo.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/zabbix.gpg
+      changed_when: true
+      failed_when: false
+
     - name: Add Zabbix official repository (Debian/Trixie)
-      ansible.builtin.shell: |
-        curl -fsSL https://repo.zabbix.com/zabbix-official-repo.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/zabbix.gpg
-        echo "deb https://repo.zabbix.com/zabbix/7.4/debian {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
+      ansible.builtin.shell: echo "deb https://repo.zabbix.com/zabbix/7.4/debian {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
       when: ansible_distribution == 'Debian'
       changed_when: true
       failed_when: false
 
     - name: Add Zabbix official repository (Ubuntu)
-      ansible.builtin.shell: |
-        curl -fsSL https://repo.zabbix.com/zabbix-official-repo.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/zabbix.gpg
-        echo "deb https://repo.zabbix.com/zabbix/7.4/ubuntu {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
+      ansible.builtin.shell: echo "deb https://repo.zabbix.com/zabbix/7.4/ubuntu {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
       when: ansible_distribution == 'Ubuntu'
       changed_when: true
       failed_when: false
