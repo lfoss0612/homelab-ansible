@@ -84,9 +84,9 @@
               - macro: "{$MYSQL.DSN}"
                 value: "unix:/var/run/mysqld/mysqld.sock"
               - macro: "{$MYSQL.USER}"
-                value: "{{ zbx_mysql_user }}"
+                value: "{{ hostvars[target_host].zbx_mysql_user }}"
               - macro: "{$MYSQL.PASSWORD}"
-                value: "{{ zbx_mysql_password }}"
+                value: "{{ hostvars[target_host].zbx_mysql_password }}"
                 type: "1"
           id: 1
       register: template_link_result
