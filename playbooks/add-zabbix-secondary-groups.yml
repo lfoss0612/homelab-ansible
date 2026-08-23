@@ -9,6 +9,14 @@
 #     Nodes, not qemu_vms, per inventory.ini's topology split)
 #   zabbix.home.lan -> also Databases (runs its own MySQL 8.0 backend,
 #     monitored via the MySQL by Zabbix agent 2 template)
+#   zabbix.home.lan, opnsense.home.lan -> also Virtual machines. `qm list`
+#     across the cluster showed 10 running VMs (2026-08-23); these two were
+#     the only ones missing the tag because they already sit in a more
+#     specific group (Databases/Zabbix servers, Firewalls). haos (VMID 112
+#     on pve) is deliberately NOT added - immutable appliance, no agent path.
+#   Every host that actually runs Linux -> also Linux servers, as a broad
+#     OS-wide tag (LXC containers, VMs, Proxmox hosts, k8s nodes). Excludes
+#     opnsense.home.lan (FreeBSD) and pbs.home.lan (already primary there).
 #
 # host.update's "groups" param REPLACES the whole membership list, so each
 # host's current groups are fetched first and the new one appended - same
@@ -34,8 +42,24 @@
         - k8s-master.home.lan
         - k8s-worker.home.lan
         - k8s-worker-2.home.lan
+        - zabbix.home.lan
+        - opnsense.home.lan
       Databases:
         - zabbix.home.lan
+      Linux servers:
+        - pve.home.lan
+        - pve-ai.home.lan
+        - pve-router.home.lan
+        - cockpit.home.lan
+        - pdm.home.lan
+        - omv.home.lan
+        - vscode.home.lan
+        - openclaw.home.lan
+        - desktop.home.lan
+        - zabbix.home.lan
+        - k8s-master.home.lan
+        - k8s-worker.home.lan
+        - k8s-worker-2.home.lan
 
   tasks:
     - name: Get all target host groups' IDs
@@ -60,9 +84,9 @@
         group_ids: "{{ group_ids | default({}) | combine({item.name: item.groupid}) }}"
       loop: "{{ target_groups.json.result }}"
 
-    - name: Flatten host-to-secondary-group pairs
+    - name: Flatten host-to-groupid pairs
       ansible.builtin.set_fact:
-        host_group_pairs: "{{ host_group_pairs | default([]) + [{'host': host_item, 'group_name': group_name}] }}"
+        host_group_pairs: "{{ host_group_pairs | default([]) + [{'host': host_item, 'groupid': group_ids[group_name]}] }}"
       loop: "{{ secondary_group_assignments | dict2items | subelements('value') }}"
       loop_control:
         loop_var: pair
@@ -88,7 +112,17 @@
           id: 1
       register: current_host_groups
 
-    - name: Add secondary group to each host, preserving existing groups
+    - name: Initialize per-host full groups list from current state
+      ansible.builtin.set_fact:
+        host_full_groups: "{{ host_full_groups | default({}) | combine({item.host: item.hostgroups}) }}"
+      loop: "{{ current_host_groups.json.result }}"
+
+    - name: Append each new group to the per-host list, deduplicated
+      ansible.builtin.set_fact:
+        host_full_groups: "{{ host_full_groups | combine({item.host: (host_full_groups[item.host] + [{'groupid': item.groupid}]) | unique}) }}"
+      loop: "{{ host_group_pairs }}"
+
+    - name: Apply full groups list to each host
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
@@ -99,15 +133,15 @@
           jsonrpc: "2.0"
           method: host.update
           params:
-            hostid: "{{ (current_host_groups.json.result | selectattr('host', 'equalto', item.host) | first).hostid }}"
-            groups: "{{ (current_host_groups.json.result | selectattr('host', 'equalto', item.host) | first).hostgroups + [{'groupid': group_ids[item.group_name]}] }}"
+            hostid: "{{ (current_host_groups.json.result | selectattr('host', 'equalto', item) | first).hostid }}"
+            groups: "{{ host_full_groups[item] }}"
           id: 1
-      loop: "{{ host_group_pairs }}"
+      loop: "{{ host_full_groups.keys() | list }}"
       register: update_results
 
     - name: Show results
       ansible.builtin.debug:
         msg: |
-          {% for item in update_results.results %}
-          ✓ {{ item.item.host }} -> {{ item.item.group_name }}
+          {% for host in host_full_groups.keys() %}
+          ✓ {{ host }}: {{ host_full_groups[host] | length }} groups
           {% endfor %}
