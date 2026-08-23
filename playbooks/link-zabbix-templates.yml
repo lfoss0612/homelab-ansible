@@ -1,0 +1,93 @@
+---
+# Link the "Linux by Zabbix agent" template to all monitored hosts
+#
+# Context: none of the 14 hosts had a template linked at the host level in
+# Zabbix. 6 hosts (the proxmox nodes, omv, zabbix, cockpit) had items left
+# over from a template that was unlinked at some point (items still exist,
+# still collect data, but host.get shows no parentTemplates and the link
+# to future template updates is broken). 7 hosts had zero items at all.
+#
+# templateid 10001 ("Linux by Zabbix agent", passive checks) was confirmed
+# as the origin of the orphaned items via item.get on itemid 42187
+# ("Host name of Zabbix agent running" -> hosts: "Linux by Zabbix agent").
+# It matches our agent2 config, which sets Server= (passive) in addition to
+# ServerActive=.
+#
+# Usage:
+#   ansible-playbook playbooks/link-zabbix-templates.yml
+
+- name: Link Zabbix templates to hosts
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    linux_template_id: "10001"
+
+    hosts_to_template:
+      - pve.home.lan
+      - pve-ai.home.lan
+      - pve-router.home.lan
+      - zabbix.home.lan
+      - cockpit.home.lan
+      - omv.home.lan
+      - vscode.home.lan
+      - openclaw.home.lan
+      - desktop.home.lan
+      - pdm.home.lan
+      - pbs.home.lan
+      - k8s-master.home.lan
+      - k8s-worker.home.lan
+
+  tasks:
+    - name: Get Zabbix host IDs
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+          id: 1
+      register: zabbix_hosts
+
+    - name: Build host ID mapping
+      ansible.builtin.set_fact:
+        host_ids: "{{ host_ids | default({}) | combine({item.host: item.hostid}) }}"
+      loop: "{{ zabbix_hosts.json.result }}"
+
+    - name: Link Linux by Zabbix agent template to each host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ host_ids[item] }}"
+            templates:
+              - templateid: "{{ linux_template_id }}"
+          id: 1
+      loop: "{{ hosts_to_template }}"
+      when: item in host_ids
+      register: template_link_results
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: |
+          Template linking complete!
+          {% for item in template_link_results.results %}
+          {% if item.json is defined and item.json.result is defined %}
+          ✓ {{ item.item }}
+          {% elif item.json is defined and item.json.error is defined %}
+          ✗ {{ item.item }}: {{ item.json.error.data }}
+          {% endif %}
+          {% endfor %}
