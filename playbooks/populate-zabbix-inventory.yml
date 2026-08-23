@@ -9,6 +9,17 @@
 # so their `inventory` data never actually persisted (inventory: [] on
 # re-check) even though the API call returned no error.
 #
+# Uses inventory_mode=1 (Automatic), not 0 (Manual): the "Linux by Zabbix
+# agent" template links system.hostname -> the `name` field and
+# system.sw.os -> the `os`/`os_full` fields (item.get on templateid 10001,
+# inventory_link != 0). Automatic mode keeps those two fields live off the
+# actual agent-reported OS/hostname while leaving every manually-set field
+# below (type, os_short, hardware, contact, location, notes) untouched -
+# verified against pve.home.lan, which has run in Automatic mode since
+# before this playbook existed and still has the exact os_short/hardware/
+# notes values set here. Manual mode would freeze `os` at whatever value
+# was set here forever, defeating the point of tracking OS updates.
+#
 # Usage:
 #   ansible-playbook playbooks/populate-zabbix-inventory.yml
 
@@ -177,7 +188,7 @@
           method: host.update
           params:
             hostid: "{{ host_ids[item.key] }}"
-            inventory_mode: "0"
+            inventory_mode: "1"
             inventory: "{{ item.value }}"
           id: 1
       loop: "{{ hosts_inventory | dict2items }}"
