@@ -1,6 +1,14 @@
 ---
 # Populate Zabbix inventory fields for all hosts
 #
+# inventory_mode must be set explicitly alongside inventory data. Zabbix
+# silently no-ops writes to the `inventory` field when a host's
+# inventory_mode is -1 (Disabled) - discovered 2026-08-23 when cockpit.home.lan
+# and omv.home.lan were still missing from the Host Inventory page despite
+# this playbook reporting success: both had inventory_mode=-1 at the time,
+# so their `inventory` data never actually persisted (inventory: [] on
+# re-check) even though the API call returned no error.
+#
 # Usage:
 #   ansible-playbook playbooks/populate-zabbix-inventory.yml
 
@@ -169,6 +177,7 @@
           method: host.update
           params:
             hostid: "{{ host_ids[item.key] }}"
+            inventory_mode: "0"
             inventory: "{{ item.value }}"
           id: 1
       loop: "{{ hosts_inventory | dict2items }}"
