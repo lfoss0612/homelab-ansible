@@ -1,0 +1,116 @@
+---
+# Link the "MAC Address by Zabbix agent" template (a small custom template,
+# not a modification of the built-in "Linux by Zabbix agent" - avoids losing
+# the change on a future Zabbix template-package upgrade) to all hosts, and
+# set each host's {$NET.IFACE} macro to its actual primary interface name.
+#
+# The template's one item is:
+#   vfs.file.contents[/sys/class/net/{$NET.IFACE}/address]
+# linked to the macaddress_a inventory field (inventory_link=12 - verified
+# against the same numbering that correctly mapped system.hostname->name(3)
+# and system.sw.os->os(5) on the Linux template).
+#
+# Uses usermacro.create (additive) rather than host.update's macros array
+# (which REPLACES the whole macro list) - host.update would silently wipe
+# the secret-type macros already set on zabbix.home.lan ({$MYSQL.PASSWORD})
+# and k8s-master.home.lan ({$KUBE.API.TOKEN}), since their values come back
+# masked/empty when read via the API and re-submitting that empty value
+# would overwrite the real secret.
+#
+# Usage:
+#   ansible-playbook playbooks/configure-mac-inventory.yml
+
+- name: Link MAC address template and configure interface macros
+  hosts: all:!api_managed
+  gather_facts: true
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    mac_template_id: "10887"
+
+  tasks:
+    - name: Get Zabbix host ID and current templates
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectParentTemplates: ["templateid"]
+            filter:
+              host: ["{{ inventory_hostname }}"]
+          id: 1
+      register: zabbix_host_lookup
+      delegate_to: localhost
+
+    - name: Skip hosts not present in Zabbix
+      ansible.builtin.meta: end_host
+      when: zabbix_host_lookup.json.result | length == 0
+
+    - name: Set facts for this host's Zabbix state
+      ansible.builtin.set_fact:
+        zbx_hostid: "{{ zabbix_host_lookup.json.result[0].hostid }}"
+        zbx_current_template_ids: "{{ zabbix_host_lookup.json.result[0].parentTemplates | map(attribute='templateid') | list }}"
+
+    - name: Link MAC Address template (preserving existing templates)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ zbx_hostid }}"
+            templates: "{{ [{'templateid': tid} for tid in (zbx_current_template_ids + [mac_template_id]) | unique] }}"
+          id: 1
+      delegate_to: localhost
+      when: mac_template_id not in zbx_current_template_ids
+
+    - name: Check if NET.IFACE macro already exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: usermacro.get
+          params:
+            hostids: ["{{ zbx_hostid }}"]
+            filter:
+              macro: "{$NET.IFACE}"
+          id: 1
+      register: existing_macro
+      delegate_to: localhost
+
+    - name: Create NET.IFACE macro with this host's primary interface
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: usermacro.create
+          params:
+            hostid: "{{ zbx_hostid }}"
+            macro: "{$NET.IFACE}"
+            value: "{{ ansible_default_ipv4.interface }}"
+          id: 1
+      delegate_to: localhost
+      when: existing_macro.json.result | length == 0
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: NET.IFACE={{ ansible_default_ipv4.interface }}, MAC template {{ 'already linked' if mac_template_id in zbx_current_template_ids else 'linked' }}"
