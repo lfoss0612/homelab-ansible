@@ -2,7 +2,6 @@
 # Configure Zabbix items and triggers for SMART monitoring
 #
 # Usage:
-#   ansible-playbook playbooks/smart-monitor-zabbix-setup.yml --check --diff
 #   ansible-playbook playbooks/smart-monitor-zabbix-setup.yml
 
 - name: Configure Zabbix for SMART monitoring
@@ -23,63 +22,153 @@
         ip_address: 10.0.5.3
         drives: [nvme0]
 
-  pre_tasks:
-    - name: Install community.zabbix collection
-      command: ansible-galaxy collection install community.zabbix --upgrade
-      changed_when: false
-
-    - name: Build host/drive combinations
-      set_fact:
-        host_drive_pairs: "{{ host_drive_pairs | default([]) + [{'host': item.0, 'drive': item.1}] }}"
-      loop: "{{ query('nested', pve_hosts, pve_hosts[0].drives) }}"
-      when: "'drives' in item.0 and item.1 in item.0.drives"
-
-    - name: Rebuild host_drive_pairs correctly
-      set_fact:
-        host_drive_pairs: "{{ query('nested', pve_hosts | list) | list }}"
-
   tasks:
-    - name: Create/update Proxmox hosts in Zabbix
-      community.zabbix.zabbix_host:
-        server_url: "{{ zabbix_url }}"
-        login_token: "{{ zabbix_api_token }}"
-        host_name: "{{ item.name }}"
-        visible_name: "{{ item.visible_name }}"
-        host_groups:
-          - Proxmox
-        interfaces:
-          - type: agent
-            main: true
-            useip: true
-            ip: "{{ item.ip_address }}"
-            dns: "{{ item.name }}"
-            port: 10050
-        state: present
-      loop: "{{ pve_hosts }}"
+    - name: Get/create Proxmox host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            filter:
+              name: Proxmox
+          auth: "{{ zabbix_api_token }}"
+          id: 1
+      register: hostgroup_result
+      failed_when: false
 
-    - name: Create overall SMART status item
-      community.zabbix.zabbix_item:
-        server_url: "{{ zabbix_url }}"
-        login_token: "{{ zabbix_api_token }}"
-        host_name: "{{ item.name }}"
-        name: "SMART status"
-        key: "smart.status"
-        type: trapper
-        value_type: unsigned
-        state: present
-      loop: "{{ pve_hosts }}"
+    - name: Create Proxmox host group if not exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.create
+          params:
+            name: Proxmox
+          auth: "{{ zabbix_api_token }}"
+          id: 1
+      when: hostgroup_result.json.result | length == 0
 
-    - name: Create SMART items for PVE (7 drives)
-      community.zabbix.zabbix_item:
-        server_url: "{{ zabbix_url }}"
-        login_token: "{{ zabbix_api_token }}"
-        host_name: pve.home.lan
-        name: "{{ item.name }}"
-        key: "{{ item.key }}"
-        type: trapper
-        value_type: unsigned
-        units: "{{ item.units | default('') }}"
-        state: present
+    - name: Get Proxmox host group ID
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            filter:
+              name: Proxmox
+          auth: "{{ zabbix_api_token }}"
+          id: 1
+      register: hostgroup_get
+      until: hostgroup_get.json.result | length > 0
+      retries: 3
+      delay: 1
+
+    - name: Create/update PVE hosts in Zabbix
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: host.create
+          params:
+            host: "{{ pve_host.name }}"
+            visible_name: "{{ pve_host.visible_name }}"
+            groups:
+              - groupid: "{{ hostgroup_get.json.result[0].groupid }}"
+            interfaces:
+              - type: 1
+                main: 1
+                useip: 1
+                ip: "{{ pve_host.ip_address }}"
+                dns: "{{ pve_host.name }}"
+                port: 10050
+          auth: "{{ zabbix_api_token }}"
+          id: 1
+        status_code: [200]
+      loop: "{{ pve_hosts }}"
+      loop_control:
+        loop_var: pve_host
+      register: host_create_result
+      failed_when: false
+
+    - name: Extract host IDs
+      set_fact:
+        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.json.result.hostids[0]}) }}"
+      loop: "{{ host_create_result.results }}"
+      when: "'result' in item.json and 'hostids' in item.json.result"
+
+    - name: Get existing host IDs if create failed
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            filter:
+              host: "{{ pve_host.name }}"
+          auth: "{{ zabbix_api_token }}"
+          id: 1
+      loop: "{{ pve_hosts }}"
+      loop_control:
+        loop_var: pve_host
+      register: existing_hosts_result
+      when: pve_host.name not in (host_ids | default({}))
+
+    - name: Update host_ids with existing hosts
+      set_fact:
+        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.json.result[0].hostid}) }}"
+      loop: "{{ existing_hosts_result.results }}"
+      when: "item.json.result | length > 0"
+
+    - name: Create SMART status items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            name: "SMART status"
+            key_: "smart.status"
+            hostid: "{{ host_ids[pve_host.name] }}"
+            type: 2
+            value_type: 3
+          auth: "{{ zabbix_api_token }}"
+          id: 1
+      loop: "{{ pve_hosts }}"
+      loop_control:
+        loop_var: pve_host
+      failed_when: false
+
+    - name: Create per-drive SMART items for PVE
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            name: "{{ item.name }}"
+            key_: "{{ item.key }}"
+            hostid: "{{ host_ids['pve.home.lan'] }}"
+            type: 2
+            value_type: 3
+            units: "{{ item.units | default('') }}"
+          auth: "{{ zabbix_api_token }}"
+          id: 1
       vars:
         items:
           - name: "SMART status - sda"
@@ -132,18 +221,25 @@
           - name: "SMART failed attributes - sdg"
             key: "smart.drive.sdg.failed_attrs"
       loop: "{{ items }}"
+      failed_when: false
 
-    - name: Create SMART items for PVE-AI (nvme0)
-      community.zabbix.zabbix_item:
-        server_url: "{{ zabbix_url }}"
-        login_token: "{{ zabbix_api_token }}"
-        host_name: pve-ai.home.lan
-        name: "{{ item.name }}"
-        key: "{{ item.key }}"
-        type: trapper
-        value_type: unsigned
-        units: "{{ item.units | default('') }}"
-        state: present
+    - name: Create per-drive SMART items for PVE-AI
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            name: "{{ item.name }}"
+            key_: "{{ item.key }}"
+            hostid: "{{ host_ids['pve-ai.home.lan'] }}"
+            type: 2
+            value_type: 3
+            units: "{{ item.units | default('') }}"
+          auth: "{{ zabbix_api_token }}"
+          id: 1
       vars:
         items:
           - name: "SMART status - nvme0"
@@ -154,26 +250,45 @@
           - name: "SMART failed attributes - nvme0"
             key: "smart.drive.nvme0.failed_attrs"
       loop: "{{ items }}"
+      failed_when: false
 
-    - name: Create SMART failure trigger
-      community.zabbix.zabbix_trigger:
-        server_url: "{{ zabbix_url }}"
-        login_token: "{{ zabbix_api_token }}"
-        name: "SMART drive failure on {{ item.name }}"
-        expression: "last(/{{ item.name }}/smart.status)=1"
-        severity: high
-        state: present
+    - name: Create SMART failure triggers
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "SMART drive failure on {{ pve_host.name }}"
+            expression: "last(/{{ pve_host.name }}/smart.status)=1"
+            severity: 4
+          auth: "{{ zabbix_api_token }}"
+          id: 1
       loop: "{{ pve_hosts }}"
+      loop_control:
+        loop_var: pve_host
+      failed_when: false
 
-    - name: Create SMART error trigger
-      community.zabbix.zabbix_trigger:
-        server_url: "{{ zabbix_url }}"
-        login_token: "{{ zabbix_api_token }}"
-        name: "SMART monitoring error on {{ item.name }}"
-        expression: "last(/{{ item.name }}/smart.status)=2"
-        severity: medium
-        state: present
+    - name: Create SMART error triggers
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "SMART monitoring error on {{ pve_host.name }}"
+            expression: "last(/{{ pve_host.name }}/smart.status)=2"
+            severity: 3
+          auth: "{{ zabbix_api_token }}"
+          id: 1
       loop: "{{ pve_hosts }}"
+      loop_control:
+        loop_var: pve_host
+      failed_when: false
 
   post_tasks:
     - name: Summary
@@ -181,7 +296,7 @@
         msg: |
           ✓ Zabbix SMART monitoring setup complete!
 
-          Configured hosts:
+          Created/Updated hosts:
           - pve.home.lan (7 drives: sda-sdg)
           - pve-ai.home.lan (1 drive: nvme0)
 
@@ -192,10 +307,10 @@
           - smart.drive.{device}.failed_attrs (per-drive)
 
           Triggers created per host:
-          - SMART drive failure (High severity) → fires when smart.status = 1
-          - SMART monitoring error (Medium severity) → fires when smart.status = 2
+          - SMART drive failure (High severity)
+          - SMART monitoring error (Medium severity)
 
           Verify in Zabbix frontend:
-          1. Configuration > Hosts > [host] > Items
-          2. Should see all items with Type=Trapper
-          3. Monitoring > Problems to view active triggers
+          1. Configuration > Hosts > select host
+          2. Items tab: should see all SMART items
+          3. Monitoring > Problems: view active triggers
