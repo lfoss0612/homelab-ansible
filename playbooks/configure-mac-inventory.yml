@@ -58,6 +58,11 @@
         zbx_hostid: "{{ zabbix_host_lookup.json.result[0].hostid }}"
         zbx_current_template_ids: "{{ zabbix_host_lookup.json.result[0].parentTemplates | map(attribute='templateid') | list }}"
 
+    - name: Build combined template objects list
+      ansible.builtin.set_fact:
+        zbx_template_objects: "{{ zbx_template_objects | default([]) + [{'templateid': item}] }}"
+      loop: "{{ (zbx_current_template_ids + [mac_template_id]) | unique }}"
+
     - name: Link MAC Address template (preserving existing templates)
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
@@ -70,7 +75,7 @@
           method: host.update
           params:
             hostid: "{{ zbx_hostid }}"
-            templates: "{{ [{'templateid': tid} for tid in (zbx_current_template_ids + [mac_template_id]) | unique] }}"
+            templates: "{{ zbx_template_objects }}"
           id: 1
       delegate_to: localhost
       when: mac_template_id not in zbx_current_template_ids
