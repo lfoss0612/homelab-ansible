@@ -1,0 +1,189 @@
+---
+# Populate Zabbix inventory fields for all hosts
+#
+# Usage:
+#   ansible-playbook playbooks/populate-zabbix-inventory.yml
+
+- name: Populate Zabbix Host Inventory
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    # Map inventory hostnames to their details for populating inventory
+    hosts_inventory:
+      # Proxmox hosts
+      pve.home.lan:
+        type: "Proxmox Host"
+        alias: "pve.home.lan"
+        contact: "pve.home.lan"
+        location: "Homelab - Primary"
+        os_short: "Proxmox VE 8.x"
+        hardware: "7x SATA HDDs"
+        notes: "Primary Proxmox cluster member"
+      pve-ai.home.lan:
+        type: "Proxmox Host"
+        alias: "pve-ai.home.lan"
+        contact: "pve-ai.home.lan"
+        location: "Homelab - AI Node"
+        os_short: "Proxmox VE 8.x"
+        hardware: "2x NVMe SSDs"
+        notes: "AI compute node"
+      pve-router.home.lan:
+        type: "Proxmox Host"
+        alias: "pve-router.home.lan"
+        contact: "pve-router.home.lan"
+        location: "Homelab - Router Host"
+        os_short: "Proxmox VE 8.x"
+        hardware: "1x NVMe SSD"
+        notes: "Hosts OPNsense network router"
+
+      # QEMU VMs
+      zabbix.home.lan:
+        type: "Zabbix Server"
+        alias: "zabbix.home.lan"
+        contact: "zabbix.home.lan"
+        location: "Homelab - Monitoring"
+        os_short: "Debian Linux"
+        hardware: "Virtual - QEMU"
+        notes: "Zabbix monitoring server"
+      cockpit.home.lan:
+        type: "Control Node"
+        alias: "cockpit.home.lan"
+        contact: "cockpit.home.lan"
+        location: "Homelab - Control"
+        os_short: "Debian Linux"
+        hardware: "LXC Container"
+        notes: "Ansible control node"
+      omv.home.lan:
+        type: "NAS"
+        alias: "omv.home.lan"
+        contact: "omv.home.lan"
+        location: "Homelab - Storage"
+        os_short: "Debian Linux"
+        hardware: "Virtual - QEMU"
+        notes: "OpenMediaVault NAS"
+      vscode.home.lan:
+        type: "VirtualBox VM"
+        alias: "vscode.home.lan"
+        contact: "vscode.home.lan"
+        location: "Homelab"
+        os_short: "Ubuntu Linux"
+        hardware: "Virtual - VirtualBox"
+        notes: "VSCode server VM"
+      openclaw.home.lan:
+        type: "OpenClaw Gateway"
+        alias: "openclaw.home.lan"
+        contact: "openclaw.home.lan"
+        location: "Homelab - Control"
+        os_short: "Debian Linux"
+        hardware: "Virtual - QEMU"
+        notes: "OpenClaw Gateway"
+      desktop.home.lan:
+        type: "Desktop VM"
+        alias: "desktop.home.lan"
+        contact: "desktop.home.lan"
+        location: "Homelab - Workstation"
+        os_short: "Ubuntu Linux"
+        hardware: "Virtual - QEMU"
+        notes: "Desktop VM (VMID 104 on pve)"
+
+      # LXC Containers
+      pdm.home.lan:
+        type: "PDM Container"
+        alias: "pdm.home.lan"
+        contact: "pdm.home.lan"
+        location: "Homelab - Control"
+        os_short: "Debian Linux"
+        hardware: "LXC Container"
+        notes: "PDM Container (VMID 107 on pve-router)"
+
+      # Bare Metal
+      pbs.home.lan:
+        type: "Proxmox Backup Server"
+        alias: "pbs.home.lan"
+        contact: "pbs.home.lan"
+        location: "Homelab - Storage"
+        os_short: "Debian Linux"
+        hardware: "Bare Metal"
+        notes: "Proxmox Backup Server"
+
+      # Kubernetes
+      k8s-master.home.lan:
+        type: "Kubernetes Master"
+        alias: "k8s-master.home.lan"
+        contact: "k8s-master.home.lan"
+        location: "Homelab - Kubernetes"
+        os_short: "Debian Linux"
+        hardware: "Virtual - QEMU"
+        notes: "Kubernetes Master Node"
+      k8s-worker.home.lan:
+        type: "Kubernetes Worker"
+        alias: "k8s-worker.home.lan"
+        contact: "k8s-worker.home.lan"
+        location: "Homelab - Kubernetes"
+        os_short: "Debian Linux"
+        hardware: "Virtual - QEMU"
+        notes: "Kubernetes Worker Node 1"
+      k8s-worker-2.home.lan:
+        type: "Kubernetes Worker"
+        alias: "k8s-worker-2.home.lan"
+        contact: "k8s-worker-2.home.lan"
+        location: "Homelab - Kubernetes"
+        os_short: "Debian Linux"
+        hardware: "Virtual - QEMU"
+        notes: "Kubernetes Worker Node 2"
+
+  tasks:
+    - name: Get Zabbix host IDs
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+          id: 1
+      register: zabbix_hosts
+
+    - name: Build host ID mapping
+      set_fact:
+        host_ids: "{{ host_ids | default({}) | combine({item.host: item.hostid}) }}"
+      loop: "{{ zabbix_hosts.json.result }}"
+
+    - name: Populate inventory for each host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ host_ids[item.key] }}"
+            inventory: "{{ item.value }}"
+          id: 1
+      loop: "{{ hosts_inventory | dict2items }}"
+      when: item.key in host_ids
+      register: inventory_updates
+      failed_when: false
+
+    - name: Show inventory update results
+      ansible.builtin.debug:
+        msg: |
+          Inventory population complete!
+
+          Updated hosts:
+          {% for item in inventory_updates.results %}
+          {% if item.json.result.hostids is defined %}
+          ✓ {{ item.item.key }}
+          {% endif %}
+          {% endfor %}
