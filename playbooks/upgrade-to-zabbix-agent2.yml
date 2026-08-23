@@ -41,12 +41,10 @@
           ansible.builtin.shell: curl -fsSL https://repo.zabbix.com/zabbix-official-repo.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/zabbix.gpg
           changed_when: true
 
-        - name: Add Zabbix official repository
-          ansible.builtin.shell: echo "deb https://repo.zabbix.com/zabbix/7.4/ubuntu {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
+        - name: Add Zabbix official repository (use stable for noble support)
+          ansible.builtin.shell: echo "deb https://repo.zabbix.com/zabbix/7.4/stable/ubuntu {{ ansible_distribution_release }} main" > /etc/apt/sources.list.d/zabbix.list
           changed_when: true
-      when:
-        - ansible_distribution == 'Ubuntu'
-        - ansible_distribution_release not in ['noble']
+      when: ansible_distribution == 'Ubuntu'
 
     - name: Update apt cache
       ansible.builtin.apt:
