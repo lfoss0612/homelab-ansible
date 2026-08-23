@@ -1,0 +1,113 @@
+---
+# Add secondary Zabbix host group memberships reflecting each host's actual
+# role, on top of its existing primary group (Proxmox Servers, Kubernetes
+# Nodes, etc.) - hosts can belong to multiple groups in Zabbix.
+#
+#   pve/pve-ai/pve-router  -> also Hypervisors (they are the hypervisors)
+#   k8s-master/worker/worker-2 -> also Virtual machines (confirmed KVM/QEMU
+#     via systemd-detect-virt, even though their primary group is Kubernetes
+#     Nodes, not qemu_vms, per inventory.ini's topology split)
+#   zabbix.home.lan -> also Databases (runs its own MySQL 8.0 backend,
+#     monitored via the MySQL by Zabbix agent 2 template)
+#
+# host.update's "groups" param REPLACES the whole membership list, so each
+# host's current groups are fetched first and the new one appended - same
+# pattern as playbooks/configure-mac-inventory.yml uses for templates.
+#
+# Usage:
+#   ansible-playbook playbooks/add-zabbix-secondary-groups.yml
+
+- name: Add secondary Zabbix host group memberships
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    secondary_group_assignments:
+      Hypervisors:
+        - pve.home.lan
+        - pve-ai.home.lan
+        - pve-router.home.lan
+      Virtual machines:
+        - k8s-master.home.lan
+        - k8s-worker.home.lan
+        - k8s-worker-2.home.lan
+      Databases:
+        - zabbix.home.lan
+
+  tasks:
+    - name: Get all target host groups' IDs
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: "{{ secondary_group_assignments.keys() | list }}"
+          id: 1
+      register: target_groups
+
+    - name: Build group name-to-id mapping
+      ansible.builtin.set_fact:
+        group_ids: "{{ group_ids | default({}) | combine({item.name: item.groupid}) }}"
+      loop: "{{ target_groups.json.result }}"
+
+    - name: Flatten host-to-secondary-group pairs
+      ansible.builtin.set_fact:
+        host_group_pairs: "{{ host_group_pairs | default([]) + [{'host': host_item, 'group_name': group_name}] }}"
+      loop: "{{ secondary_group_assignments | dict2items | subelements('value') }}"
+      loop_control:
+        loop_var: pair
+      vars:
+        group_name: "{{ pair.0.key }}"
+        host_item: "{{ pair.1 }}"
+
+    - name: Get current groups for each affected host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectHostGroups: ["groupid"]
+            filter:
+              host: "{{ host_group_pairs | map(attribute='host') | unique | list }}"
+          id: 1
+      register: current_host_groups
+
+    - name: Add secondary group to each host, preserving existing groups
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ (current_host_groups.json.result | selectattr('host', 'equalto', item.host) | first).hostid }}"
+            groups: "{{ (current_host_groups.json.result | selectattr('host', 'equalto', item.host) | first).hostgroups + [{'groupid': group_ids[item.group_name]}] }}"
+          id: 1
+      loop: "{{ host_group_pairs }}"
+      register: update_results
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: |
+          {% for item in update_results.results %}
+          ✓ {{ item.item.host }} -> {{ item.item.group_name }}
+          {% endfor %}
