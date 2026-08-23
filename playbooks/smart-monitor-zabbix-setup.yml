@@ -50,7 +50,9 @@
         interfaces:
           - type: agent
             main: true
+            useip: true
             ip: "{{ item.ip_address }}"
+            dns: "{{ item.name }}"
             port: 10050
         state: present
       loop: "{{ pve_hosts }}"
