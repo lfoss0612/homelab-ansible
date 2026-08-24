@@ -55,6 +55,10 @@
     trapper_key: "openclaw.fleet.update"
     trapper_name: "OpenClaw fleet update: last run outcome"
 
+    # Per-host breakdown, created on every fleet host. Must match
+    # openclaw_control_notify_zabbix_host_key in the control role.
+    per_host_key: "openclaw.fleet.host"
+
     nodata_window: "10d"
 
   tasks:
@@ -216,11 +220,140 @@
       failed_when: trigger_create.json.error is defined
       changed_when: trigger_create.json.result is defined
 
+    # --- Per-host breakdown ------------------------------------------------
+    # The aggregate item above says the fleet run failed. These say WHICH host,
+    # so the answer stops requiring last-failure or the journal. The fleet list
+    # comes from the inventory rather than a hardcoded list here, so a host
+    # added to openclaw_nodes picks this up on the next run.
+    - name: Resolve the fleet host list from inventory
+      ansible.builtin.set_fact:
+        fleet_hosts: >-
+          {{ ((groups['openclaw'] | default([]))
+              + (groups['openclaw_control'] | default([]))) | unique | sort }}
+
+    - name: Look up the Zabbix hosts for the fleet
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ fleet_hosts }}"
+            selectItems: ["key_"]
+          id: 1
+      register: fleet_lookup
+      check_mode: false
+      failed_when: fleet_lookup.json.error is defined
+
+    - name: Warn about fleet hosts with no matching Zabbix host
+      ansible.builtin.debug:
+        msg: >-
+          NOT IN ZABBIX (per-host status will be discarded for these):
+          {{ fleet_hosts | difference(fleet_lookup.json.result | map(attribute='host') | list) }}
+      when: >-
+        fleet_hosts | difference(fleet_lookup.json.result | map(attribute='host') | list) | length > 0
+
+    - name: Create the per-host status item where it is missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "OpenClaw fleet update: this host's last result"
+            key_: "{{ per_host_key }}"
+            type: 2
+            value_type: 3
+            history: "400d"
+            trends: "0"
+            description: >-
+              Pushed by openclaw-fleet-update-notify on the control node, from
+              the PLAY RECAP of the weekly convergence run.
+              0 = converged clean, 1 = task failures, 2 = unreachable.
+              2 is expected on openclaw_optional hosts (desktop) when they are
+              powered off, which is why it is not folded into 1.
+          id: 1
+      register: per_host_create
+      loop: "{{ fleet_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.host }}"
+      when: per_host_key not in (item['items'] | map(attribute='key_') | list)
+      failed_when: per_host_create.json.error is defined
+      changed_when: per_host_create.json.result is defined
+
+    - name: Check whether the per-host trigger exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description"]
+            hostids: "{{ fleet_lookup.json.result | map(attribute='hostid') | list }}"
+            search:
+              description: "did not converge"
+          id: 1
+      register: per_host_trigger_lookup
+      check_mode: false
+      failed_when: per_host_trigger_lookup.json.error is defined
+
+    # Only value 1 alerts. 2 (unreachable) is recorded but deliberately silent:
+    # desktop is powered off most of the time and alerting on that would make
+    # the fleet permanently red for a condition that is expected.
+    - name: Create the per-host convergence trigger
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "OpenClaw fleet update: {HOST.NAME} did not converge"
+            expression: "last(/{{ item.host }}/{{ per_host_key }})=1"
+            priority: 3
+            manual_close: 0
+            comments: >-
+              This host reported task failures in the last weekly convergence
+              run. Self-clearing on the next clean run. Value 2 (unreachable)
+              does not raise this - see the item description.
+          id: 1
+      register: per_host_trigger_create
+      loop: "{{ fleet_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.host }}"
+      when: >-
+        per_host_key in (item['items'] | map(attribute='key_') | list)
+        or per_host_create is changed
+      failed_when: >-
+        per_host_trigger_create.json.error is defined
+        and 'already exists' not in (per_host_trigger_create.json.error.data | default(''))
+      changed_when: per_host_trigger_create.json.result is defined
+
     - name: Report the end state
       ansible.builtin.debug:
         msg: >-
-          {{ target_host }}: item {{ trapper_key }}
+          {{ target_host }}: aggregate item {{ trapper_key }}
           {{ 'exists (itemid ' ~ item_final.json.result[0].itemid ~ ')'
-             if item_final.json.result | length > 0 else 'MISSING' }}.
-          Send a test value with:
+             if item_final.json.result | length > 0 else 'MISSING' }};
+          per-host item {{ per_host_key }} covers
+          {{ fleet_lookup.json.result | length }} of {{ fleet_hosts | length }}
+          fleet hosts. Send a test value with:
           systemctl start openclaw-fleet-update-notify@ok.service

@@ -106,6 +106,36 @@ else
       log "WARNING: Zabbix discarded the value — is trapper item '$zabbix_key' defined on host '${zabbix_host:-$host}'? See README."
       ;;
   esac
+
+  # --- Per-host breakdown ---------------------------------------------------
+  # The aggregate above says the fleet run failed; this says WHICH host, so the
+  # answer no longer requires reading last-failure or the journal. Written by
+  # openclaw-fleet-update itself from the PLAY RECAP blocks; absent if that
+  # script died before any playbook ran, which is not an error here.
+  hosts_key={{ openclaw_control_notify_zabbix_host_key }}
+  hosts_file={{ openclaw_control_state_dir }}/last-hosts
+
+  if [ ! -r "$hosts_file" ]; then
+    log "no $hosts_file — skipping the per-host breakdown"
+  else
+    # zabbix_sender -i takes "<host> <key> <value>" lines and, unlike -k/-o,
+    # can address hosts other than this one in a single connection.
+    hosts_input=$(mktemp) || hosts_input=
+    if [ -n "$hosts_input" ]; then
+      awk -v k="$hosts_key" 'NF == 2 { print $1, k, $2 }' "$hosts_file" > "$hosts_input"
+      if [ -s "$hosts_input" ]; then
+        hosts_out=$(zabbix_sender -c "$zabbix_conf" -i "$hosts_input" 2>&1)
+        log "zabbix_sender($hosts_key, $(wc -l < "$hosts_input") hosts): $hosts_out"
+        case "$hosts_out" in
+          *"failed: 0"*) : ;;
+          *) log "WARNING: Zabbix discarded some per-host values — is trapper item '$hosts_key' defined on every fleet host? Run playbooks/zabbix-fleet-update-item.yml." ;;
+        esac
+      else
+        log "$hosts_file held no usable rows — skipping the per-host breakdown"
+      fi
+      rm -f "$hosts_input"
+    fi
+  fi
 fi
 {% else %}
 log "zabbix channel disabled (openclaw_control_notify_zabbix=false)"

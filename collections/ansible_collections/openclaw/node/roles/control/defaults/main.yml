@@ -55,6 +55,13 @@ openclaw_control_notify_unit: openclaw-fleet-update-notify
 openclaw_control_notify_zabbix: true
 openclaw_control_notify_zabbix_key: openclaw.fleet.update
 
+# Per-host breakdown, pushed to EVERY fleet host rather than just the control
+# node: 0 = converged, 1 = task failures, 2 = unreachable. A deliberately
+# different key from the aggregate above, because cockpit carries both and one
+# key cannot hold two meanings. Unreachable is distinct from failed so that an
+# openclaw_optional host being powered off does not read as a failure.
+openclaw_control_notify_zabbix_host_key: openclaw.fleet.host
+
 # A LIST, tried in order, first readable one wins. This was a single path
 # (/etc/zabbix/zabbix_agentd.conf) until 2026-08-24, which silently disabled
 # the whole channel once cockpit moved to agent2: the file simply stopped
