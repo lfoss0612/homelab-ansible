@@ -12,12 +12,19 @@
 # ended up stacked up fighting over the same apt/dpkg locks across the
 # fleet before anyone noticed.
 #
+# The k8s group is excluded 2026-08-24: those 3 nodes are now monitored by
+# the in-cluster zabbix-agent DaemonSet instead (homelab-gitops:
+# argocd/cattle-monitoring-system/zabbix-proxy-agent.yaml). It uses
+# hostNetwork: true and binds the same node IP:10050 - re-running this
+# playbook against them would just recreate the port conflict that
+# playbooks/remove-agent-from-k8s-nodes.yml was written to fix.
+#
 # Usage:
 #   ansible-playbook playbooks/upgrade-to-zabbix-agent2.yml --check --diff
 #   ansible-playbook playbooks/upgrade-to-zabbix-agent2.yml
 
 - name: Upgrade to Zabbix Agent 2
-  hosts: all:!api_managed
+  hosts: all:!api_managed:!k8s
   become: true
 
   vars:

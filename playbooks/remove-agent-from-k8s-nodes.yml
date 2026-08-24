@@ -1,0 +1,38 @@
+---
+# Remove the host-level zabbix-agent2 from the 3 k8s nodes - they're now
+# monitored by the in-cluster zabbix-agent DaemonSet instead (deployed via
+# homelab-gitops: argocd/cattle-monitoring-system/zabbix-proxy-agent.yaml,
+# the official Zabbix Helm chart).
+#
+# The DaemonSet uses hostNetwork: true and binds the SAME node IP:10050
+# these hosts' Zabbix host objects already use as their agent interface,
+# with hostPath mounts for /proc, /sys, and / (plus hostPID: true) for
+# full host-level metric fidelity - not just container-scoped stats. No
+# changes needed on the Zabbix server side (same interface, same port);
+# this playbook only frees the port these two agents were fighting over
+# ("bind: address already in use" in the DaemonSet pods' crash logs).
+#
+# Usage:
+#   ansible-playbook playbooks/remove-agent-from-k8s-nodes.yml
+
+- name: Remove host-level zabbix-agent2 from k8s nodes
+  hosts: k8s
+  become: true
+
+  tasks:
+    - name: Stop and disable zabbix-agent2
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove zabbix-agent2 package
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: absent
+        purge: true
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: host-level agent removed, port 10050 now free for the in-cluster DaemonSet"
