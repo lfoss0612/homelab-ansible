@@ -1,0 +1,176 @@
+---
+# Consolidate "Proxmox VE by HTTP" (templateid 10517) onto a single cluster node.
+#
+# Context: pve, pve-ai and pve-router each carried this template, each with its
+# own {$PVE.URL.HOST} and the same API token. That looks like per-node
+# monitoring but is not - the template polls /api2/json/cluster/resources,
+# which is CLUSTER-scoped. {$PVE.URL.HOST} only decides which node answers the
+# question, not what gets monitored. So all three were independent pollers
+# asking three different nodes for the same cluster-wide answer.
+#
+# Verified 2026-08-24 before writing this play - coverage was byte-identical:
+# 249 Proxmox items and 42 discovered entities on each host, identical entity
+# sets. pve alone already held Node [pve-ai], Node [pve-router],
+# VM [pve-router/OPNsense], VM [pve-ai/k8s-worker-2], LXC [pve-router/cockpit],
+# LXC [pve-router/pdm] and every storage pool on all three nodes. Unlinking two
+# of the three loses no coverage; it deletes two redundant copies.
+#
+# The triplication turned 7 real conditions into 21 open problems. None of them
+# could be closed by hand - every Proxmox VE trigger ships with
+# manual_close = 0, so the "Close problem" control is greyed out. Unlinking WITH
+# CLEAR is what actually removes them, because deleting the items deletes their
+# triggers and any open problems along with them.
+#
+# Why pve-router is the keeper: the only thing lost while the polling node is
+# down is the cluster-level view (VM states, storage, per-node API metrics).
+# Node up/down is unaffected - "Linux by Zabbix agent" stays on all three, plus
+# the "Local network" discovery covers ICMP. So the only criterion is which node
+# is least likely to be down, and that is pve-router: 3 of 5 corosync votes,
+# quorate alone, and it hosts the OPNsense VM for the whole house. This does not
+# conflict with the standing caution around changing pve-router - the template
+# makes read-only API calls and this play only edits Zabbix-side host config.
+# Nothing lands on the node itself.
+#
+# templates_clear (NOT templates) is used deliberately. `templates` REPLACES a
+# host's whole template list - the same footgun documented at the top of
+# link-zabbix-templates.yml. `templates_clear` only removes what it names, so
+# "Linux by Zabbix agent" and "MAC Address by Zabbix agent" are untouched
+# without having to fetch and rebuild the list first.
+#
+# NOT done here, deliberately: the now-unused {$PVE.URL.HOST}, {$PVE.URL.PORT},
+# {$PVE.TOKEN.ID} and {$PVE.TOKEN.SECRET} macros are left in place on the
+# unlinked hosts. Removing them is a separate decision - they are the only
+# record of what those hosts were pointed at, and the token is being rotated
+# anyway (see homelab-vault TODO.md, "Zabbix - broken monitoring"). Be aware
+# they are stale after this runs: rotating the token means updating pve-router,
+# not these.
+#
+# Usage:
+#   ansible-playbook playbooks/consolidate-proxmox-template.yml --check --diff
+#   ansible-playbook playbooks/consolidate-proxmox-template.yml
+
+- name: Consolidate Proxmox VE by HTTP onto one cluster node
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    proxmox_template_id: "10517"
+    proxmox_template_name: "Proxmox VE by HTTP"
+
+    # The node that keeps polling the cluster API.
+    keeper_host: "pve-router.home.lan"
+
+    # Nodes that lose the redundant copy.
+    hosts_to_unlink:
+      - pve.home.lan
+      - pve-ai.home.lan
+
+  tasks:
+    # Read tasks run even under --check, so a dry run reports real state
+    # instead of skipping and leaving every later task with no facts.
+    - name: Get current template links for all three cluster nodes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectParentTemplates: ["templateid", "name"]
+            filter:
+              host: "{{ [keeper_host] + hosts_to_unlink }}"
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != (([keeper_host] + hosts_to_unlink) | length)
+
+    - name: Index hosts by name
+      ansible.builtin.set_fact:
+        pve_hosts: >-
+          {{ dict(host_lookup.json.result | map(attribute='host') | zip(host_lookup.json.result)) }}
+
+    # Guard against ending up with zero Proxmox monitoring. If the keeper has
+    # already lost the template, unlinking the other two would leave the cluster
+    # entirely unmonitored via the API.
+    - name: Assert the keeper still has the template linked
+      ansible.builtin.assert:
+        that:
+          - proxmox_template_id in (pve_hosts[keeper_host].parentTemplates | map(attribute='templateid') | list)
+        fail_msg: >-
+          {{ keeper_host }} does not have "{{ proxmox_template_name }}" linked.
+          Refusing to unlink it from {{ hosts_to_unlink | join(', ') }}, which
+          would leave the cluster with no Proxmox API monitoring at all. Link it
+          to {{ keeper_host }} first, then re-run.
+        success_msg: "{{ keeper_host }} holds the template - safe to unlink the redundant copies."
+
+    - name: Report what will change
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}:
+          {{ 'WILL UNLINK + CLEAR "' ~ proxmox_template_name ~ '"'
+             if proxmox_template_id in (pve_hosts[item].parentTemplates | map(attribute='templateid') | list)
+             else 'already unlinked, nothing to do' }}
+          (keeps: {{ pve_hosts[item].parentTemplates
+                     | rejectattr('templateid', 'equalto', proxmox_template_id)
+                     | map(attribute='name') | join(', ') }})
+      loop: "{{ hosts_to_unlink }}"
+
+    - name: Unlink and clear the redundant template copies
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ pve_hosts[item].hostid }}"
+            # Unlink AND delete the inherited items/triggers/discovered entities.
+            # A plain unlink would orphan 247 items per host and leave their
+            # open problems standing forever.
+            templates_clear:
+              - templateid: "{{ proxmox_template_id }}"
+          id: 1
+      register: unlink_result
+      loop: "{{ hosts_to_unlink }}"
+      when: proxmox_template_id in (pve_hosts[item].parentTemplates | map(attribute='templateid') | list)
+      failed_when: unlink_result.json.error is defined
+      changed_when: unlink_result.json.result is defined
+
+    - name: Re-read template links to confirm the end state
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectParentTemplates: ["name"]
+            filter:
+              host: "{{ [keeper_host] + hosts_to_unlink }}"
+          id: 1
+      register: host_verify
+      check_mode: false
+      failed_when: host_verify.json.error is defined
+
+    - name: Show final template layout
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.host }}: {{ item.parentTemplates | map(attribute='name') | sort | join(', ') }}
+      loop: "{{ host_verify.json.result | sort(attribute='host') }}"
+      loop_control:
+        label: "{{ item.host }}"
