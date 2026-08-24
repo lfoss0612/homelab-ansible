@@ -1,9 +1,18 @@
 ---
-# Link "Kubernetes cluster state by HTTP" (templateid 10510) to
-# k8s-master.home.lan, scoped to just the kube-state-metrics/pod-health
-# portion - the Kubelet and control-plane component LLD rules in this
-# template need nodes/proxy or nodes/metrics RBAC our zabbix-monitoring
-# ClusterRole doesn't grant (confirmed via direct curl: 403 on both
+# Replace "Kubernetes nodes by HTTP" (10507) with "Kubernetes cluster
+# state by HTTP" (10510) on k8s-master.home.lan. They can't coexist on
+# the same host - both define an LLD rule with the key
+# "kube.node.discovery", and Zabbix rejects linking two templates with a
+# conflicting item/LLD key ("Cannot inherit LLD rule ... because an LLD
+# rule with the same key is already inherited from template..."). Cluster
+# state is strictly the richer choice: kube-state-metrics already exports
+# node info (kube_node_info, kube_node_status_condition, ...) on top of
+# real pod/deployment/replica health, using the same RBAC we already have.
+#
+# Scoped to just the kube-state-metrics/pod-health portion of this
+# template - the Kubelet and control-plane component LLD rules need
+# nodes/proxy or nodes/metrics RBAC our zabbix-monitoring ClusterRole
+# doesn't grant (confirmed via direct curl: 403 on both
 # https://<node>:10250/metrics/resource and the API-server-proxied
 # equivalent). Left as-is deliberately - those LLD rules will just
 # discover nothing, which is fine.
@@ -19,13 +28,14 @@
 # Usage:
 #   ansible-playbook playbooks/configure-kube-state-metrics-monitoring.yml
 
-- name: Link kube-state-metrics template to k8s-master.home.lan
+- name: Replace nodes-by-HTTP with cluster state template on k8s-master.home.lan
   hosts: localhost
   gather_facts: false
 
   vars:
     zabbix_url: "http://10.0.5.9/zabbix"
     zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    nodes_template_id: "10507"
     cluster_state_template_id: "10510"
     target_host: "k8s-master.home.lan"
 
@@ -48,12 +58,18 @@
           id: 1
       register: host_lookup
 
-    - name: Build combined template objects list
+    - name: Build combined template objects list (dropping nodes-by-HTTP, adding cluster state)
       ansible.builtin.set_fact:
         template_objects: "{{ template_objects | default([]) + [{'templateid': item}] }}"
-      loop: "{{ (host_lookup.json.result[0].parentTemplates | map(attribute='templateid') | list + [cluster_state_template_id]) | unique }}"
+      loop: >-
+        {{
+          (
+            (host_lookup.json.result[0].parentTemplates | map(attribute='templateid') | list | difference([nodes_template_id]))
+            + [cluster_state_template_id]
+          ) | unique
+        }}
 
-    - name: Link cluster state template (preserving existing templates)
+    - name: Link cluster state template (preserving other existing templates)
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
