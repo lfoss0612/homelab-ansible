@@ -13,6 +13,18 @@
 # It matches our agent2 config, which sets Server= (passive) in addition to
 # ServerActive=.
 #
+# DO NOT blanket re-run this against hosts that have picked up additional
+# templates since (MAC Address by Zabbix agent on nearly everyone, MySQL by
+# Zabbix agent 2 on zabbix.home.lan, Kubernetes cluster state by HTTP on
+# k8s-master.home.lan) - the "Link Linux by Zabbix agent template" task's
+# host.update call passes templates: [{templateid: linux_template_id}] only,
+# which REPLACES the host's whole template list rather than adding to it.
+# Discovered 2026-08-24: k8s-worker-2.home.lan was missing from
+# hosts_to_template below (it wasn't reachable yet when this playbook was
+# first run) and ended up with only "MAC Address by Zabbix agent" linked -
+# fixed with a one-off host.update that fetched its current templates and
+# combined them first, not by adding it here and re-running.
+#
 # Usage:
 #   ansible-playbook playbooks/link-zabbix-templates.yml
 
