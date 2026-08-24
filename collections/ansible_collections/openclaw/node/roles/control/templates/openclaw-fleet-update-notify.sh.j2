@@ -74,13 +74,23 @@ fi
 
 # --- Channel: Zabbix trapper ------------------------------------------------
 {% if openclaw_control_notify_zabbix %}
-zabbix_conf={{ openclaw_control_notify_zabbix_conf }}
 zabbix_key={{ openclaw_control_notify_zabbix_key }}
+
+# Resolve the agent config at RUNTIME rather than baking one path in. A single
+# hardcoded path is what silently killed this channel when cockpit moved to
+# agent2 — see the comment on openclaw_control_notify_zabbix_confs.
+zabbix_conf=
+for candidate in {{ openclaw_control_notify_zabbix_confs | join(' ') }}; do
+  if [ -r "$candidate" ]; then
+    zabbix_conf=$candidate
+    break
+  fi
+done
 
 if ! command -v zabbix_sender >/dev/null 2>&1; then
   log "zabbix_sender not installed — skipping the zabbix channel"
-elif [ ! -r "$zabbix_conf" ]; then
-  log "$zabbix_conf not readable — skipping the zabbix channel"
+elif [ -z "$zabbix_conf" ]; then
+  log "WARNING: no readable agent config in ({{ openclaw_control_notify_zabbix_confs | join(', ') }}) — skipping the zabbix channel"
 else
   zabbix_out=$(zabbix_sender -c "$zabbix_conf" -k "$zabbix_key" -o "$zabbix_value" 2>&1)
   log "zabbix_sender($zabbix_key=$zabbix_value): $zabbix_out"

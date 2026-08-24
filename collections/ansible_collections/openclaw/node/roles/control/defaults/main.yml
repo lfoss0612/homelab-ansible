@@ -48,13 +48,25 @@ openclaw_control_notify_script: /usr/local/sbin/openclaw-fleet-update-notify
 openclaw_control_notify_unit: openclaw-fleet-update-notify
 
 # Zabbix trapper push: 1 on failure, 0 on success, so a trigger raises AND
-# clears itself. No secret is needed — zabbix_agentd.conf already names both
-# the server and this host — but the trapper ITEM must exist on the Zabbix
-# host, or the server accepts the value and discards it
-# ("processed: 0; failed: 1"). One-time item/trigger spec is in the README.
+# clears itself. No secret is needed — the agent config already names both the
+# server and this host — but the trapper ITEM must exist on the Zabbix host, or
+# the server accepts the value and discards it ("processed: 0; failed: 1").
+# Item/trigger are created by playbooks/zabbix-fleet-update-item.yml.
 openclaw_control_notify_zabbix: true
 openclaw_control_notify_zabbix_key: openclaw.fleet.update
-openclaw_control_notify_zabbix_conf: /etc/zabbix/zabbix_agentd.conf
+
+# A LIST, tried in order, first readable one wins. This was a single path
+# (/etc/zabbix/zabbix_agentd.conf) until 2026-08-24, which silently disabled
+# the whole channel once cockpit moved to agent2: the file simply stopped
+# existing, the script's `[ ! -r ]` guard fired, and it logged
+# "not readable — skipping the zabbix channel" to a journal nobody reads.
+# The fleet-update timer then failed on 2026-08-16 and 2026-08-23 with no
+# notification of any kind. A list rather than a corrected single path because
+# the failure mode is the hardcoding, not the value: agent1 is kept as a
+# fallback so this survives a move in either direction.
+openclaw_control_notify_zabbix_confs:
+  - /etc/zabbix/zabbix_agent2.conf
+  - /etc/zabbix/zabbix_agentd.conf
 
 # Generic POST for ntfy/Gotify/Home Assistant/Discord. Empty disables it.
 # Set it in group_vars/openclaw_control.yml (vault the URL if it embeds a token).

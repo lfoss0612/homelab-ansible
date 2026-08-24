@@ -207,11 +207,8 @@ go to the journal under `SyslogIdentifier=openclaw-fleet-update-notify`.
 Email is deliberately not a channel: cockpit's postfix has no `relayhost` and
 `myhostname=cockpit.localdomain`, so mail reaches a local mailbox nobody reads.
 
-**One manual step remains — the Zabbix item does not exist yet.** The transport is
-already working (the agent is active, `Server=10.0.5.9`, and the server recognises host
-`cockpit.home.lan`), but with no matching item the server accepts each value and
-discards it, logging `processed: 0; failed: 1`, which the script reports as a WARNING.
-Create on Zabbix host **`cockpit.home.lan`**:
+The Zabbix side is created by **`playbooks/zabbix-fleet-update-item.yml`** on host
+`cockpit.home.lan` — a trapper item plus both triggers:
 
 | | |
 |---|---|
@@ -222,6 +219,21 @@ Create on Zabbix host **`cockpit.home.lan`**:
 The second trigger is the one that would have caught 2026-08-02: a timer that stops
 firing altogether sends nothing at all, so only a nodata check notices. 10d spans the
 weekly schedule plus its randomized delay.
+
+> **This was a manual TODO for months, and it cost exactly what it was predicted to.**
+> The item was never created by hand, and there were *two* faults rather than one. The
+> missing item is the obvious half — the server accepts each value and discards it,
+> logging `processed: 0; failed: 1`. The other half is that this notifier had
+> `/etc/zabbix/zabbix_agentd.conf` hardcoded, and cockpit runs **agent2**
+> (`zabbix_agent2.conf`), so once that migration happened the file stopped existing,
+> the script's `[ ! -r ]` guard fired, and `zabbix_sender` was never invoked at all.
+> Net effect: the timer failed on **2026-08-16** and **2026-08-23** and nothing said a
+> word — `last-success` still read 2026-08-09 when this was found on 2026-08-24. The
+> config path is now a *list* tried in order
+> (`openclaw_control_notify_zabbix_confs`), because the failure mode was the
+> hardcoding, not the value. Both halves must be applied for the channel to work:
+> `zabbix-fleet-update-item.yml` for the item, `openclaw-automation.yml` to re-render
+> the script.
 
 Test either path without waiting for Sunday:
 

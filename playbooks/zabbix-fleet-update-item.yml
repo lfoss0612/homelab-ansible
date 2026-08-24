@@ -1,0 +1,226 @@
+---
+# Create the Zabbix trapper item + triggers that the weekly fleet-update timer
+# pushes to, on host cockpit.home.lan.
+#
+# This closes the "one manual step remains" note that had been in the README
+# since the notify hooks were written. It was never done by hand, and the
+# consequence was exactly what the README predicted, twice: the
+# openclaw-fleet-update timer failed on 2026-08-16 and 2026-08-23 (SSH timeout
+# to k8s-worker-2) and nothing told anyone. last-success still read 2026-08-09
+# when this was found on 2026-08-24, two weeks later.
+#
+# There were TWO faults, not one. The missing item is the obvious half; the
+# other is that the notify script had /etc/zabbix/zabbix_agentd.conf baked in
+# and cockpit now runs agent2, so the file did not exist, the script's
+# `[ ! -r ]` guard fired, and zabbix_sender was never even invoked. Creating
+# this item without that fix would have changed nothing. Fixed in the control
+# role - see openclaw_control_notify_zabbix_confs in its defaults - so run
+# openclaw-automation.yml as well, or the channel stays dead:
+#
+#   ansible-playbook playbooks/openclaw-automation.yml
+#
+# Trigger design, both from the README spec:
+#   - "run failed"   last(...)=1        raises on a failed run, and CLEARS
+#                                       itself on the next good one, which is
+#                                       why the script sends 0 on success
+#                                       rather than sending nothing.
+#   - "runs stopped" nodata(...,10d)=1  the important one. A timer that stops
+#                                       firing altogether sends NOTHING, so
+#                                       last() can never notice - it would sit
+#                                       on the last good 0 forever. 10d spans
+#                                       the weekly schedule plus its
+#                                       randomized delay.
+#
+# Both are created with manual_close disabled on purpose: they are self-clearing
+# by design, and a human closing one by hand would only hide a still-broken
+# fleet until the next Sunday.
+#
+# Idempotent - re-running is a no-op once the item and triggers exist.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-fleet-update-item.yml --check --diff
+#   ansible-playbook playbooks/zabbix-fleet-update-item.yml
+
+- name: Create the fleet-update trapper item and triggers in Zabbix
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    # Must match the agent's Hostname= on cockpit (the FQDN, not `hostname -s`)
+    # and openclaw_control_notify_zabbix_key in the control role.
+    target_host: "cockpit.home.lan"
+    trapper_key: "openclaw.fleet.update"
+    trapper_name: "OpenClaw fleet update: last run outcome"
+
+    nodata_window: "10d"
+
+  tasks:
+    - name: Look up the Zabbix host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: ["{{ target_host }}"]
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Check whether the trapper item already exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_", "type"]
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            filter:
+              key_: ["{{ trapper_key }}"]
+          id: 1
+      register: item_lookup
+      check_mode: false
+      failed_when: item_lookup.json.error is defined
+
+    - name: Create the trapper item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "{{ trapper_name }}"
+            key_: "{{ trapper_key }}"
+            type: 2            # 2 = Zabbix trapper
+            value_type: 3      # 3 = Numeric (unsigned)
+            # Long history on purpose: this is one value per week, so the
+            # storage cost is nil and a year of it makes "how often does the
+            # fleet update actually fail" answerable.
+            history: "400d"
+            trends: "0"
+            description: >-
+              Pushed by openclaw-fleet-update-notify on the control node:
+              0 = last weekly fleet update succeeded, 1 = it failed.
+              See homelab-ansible README, "The fleet timer notifies via
+              OnFailure=/OnSuccess=".
+          id: 1
+      register: item_create
+      when: item_lookup.json.result | length == 0
+      failed_when: item_create.json.error is defined
+      changed_when: item_create.json.result is defined
+
+    - name: Re-read the item id
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid"]
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            filter:
+              key_: ["{{ trapper_key }}"]
+          id: 1
+      register: item_final
+      check_mode: false
+      failed_when: item_final.json.error is defined
+
+    - name: Check which triggers already exist
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description"]
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            search:
+              description: "OpenClaw fleet update"
+          id: 1
+      register: trigger_lookup
+      check_mode: false
+      failed_when: trigger_lookup.json.error is defined
+
+    - name: Create the triggers
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "{{ item.description }}"
+            expression: "{{ item.expression }}"
+            priority: "{{ item.priority }}"
+            manual_close: 0
+            comments: "{{ item.comments }}"
+          id: 1
+      register: trigger_create
+      loop:
+        - description: "OpenClaw fleet update: last run FAILED"
+          expression: "last(/{{ target_host }}/{{ trapper_key }})=1"
+          priority: 4          # High
+          comments: >-
+            The weekly fleet update exited non-zero. Details are in
+            /var/lib/openclaw-fleet-update/last-failure on the control node,
+            and in `journalctl -u openclaw-fleet-update.service`.
+            Self-clearing: the next successful run pushes 0.
+        - description: "OpenClaw fleet update: no run in {{ nodata_window }}"
+          expression: "nodata(/{{ target_host }}/{{ trapper_key }},{{ nodata_window }})=1"
+          priority: 3          # Average
+          comments: >-
+            No value received in {{ nodata_window }} - the weekly timer has
+            stopped firing altogether, or the notify hook is no longer
+            reaching Zabbix. A stopped timer sends nothing at all, so the
+            last() trigger cannot see this; only a nodata check can.
+            Check `systemctl list-timers openclaw-fleet-update.timer` and
+            `journalctl -t openclaw-fleet-update-notify`.
+      loop_control:
+        label: "{{ item.description }}"
+      when: >-
+        item.description not in
+        (trigger_lookup.json.result | map(attribute='description') | list)
+      failed_when: trigger_create.json.error is defined
+      changed_when: trigger_create.json.result is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          {{ target_host }}: item {{ trapper_key }}
+          {{ 'exists (itemid ' ~ item_final.json.result[0].itemid ~ ')'
+             if item_final.json.result | length > 0 else 'MISSING' }}.
+          Send a test value with:
+          systemctl start openclaw-fleet-update-notify@ok.service
