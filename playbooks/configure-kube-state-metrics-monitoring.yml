@@ -1,0 +1,107 @@
+---
+# Link "Kubernetes cluster state by HTTP" (templateid 10510) to
+# k8s-master.home.lan, scoped to just the kube-state-metrics/pod-health
+# portion - the Kubelet and control-plane component LLD rules in this
+# template need nodes/proxy or nodes/metrics RBAC our zabbix-monitoring
+# ClusterRole doesn't grant (confirmed via direct curl: 403 on both
+# https://<node>:10250/metrics/resource and the API-server-proxied
+# equivalent). Left as-is deliberately - those LLD rules will just
+# discover nothing, which is fine.
+#
+# Reuses the existing {$KUBE.API.URL}/{$KUBE.API.TOKEN} macros already
+# set on this host (from playbooks/configure-kubernetes-monitoring.yml).
+# Only adds {$KUBE.STATE.ENDPOINT.NAME}, overridden from the template's
+# default "zabbix-kube-state-metrics" (assumes Zabbix's own Helm chart)
+# to "rancher-monitoring-kube-state-metrics" - the actual Endpoints
+# object name in this cluster, confirmed via:
+#   kubectl get ep -n cattle-monitoring-system | grep -i state
+#
+# Usage:
+#   ansible-playbook playbooks/configure-kube-state-metrics-monitoring.yml
+
+- name: Link kube-state-metrics template to k8s-master.home.lan
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    cluster_state_template_id: "10510"
+    target_host: "k8s-master.home.lan"
+
+  tasks:
+    - name: Get host ID and current templates
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectParentTemplates: ["templateid"]
+            filter:
+              host: ["{{ target_host }}"]
+          id: 1
+      register: host_lookup
+
+    - name: Build combined template objects list
+      ansible.builtin.set_fact:
+        template_objects: "{{ template_objects | default([]) + [{'templateid': item}] }}"
+      loop: "{{ (host_lookup.json.result[0].parentTemplates | map(attribute='templateid') | list + [cluster_state_template_id]) | unique }}"
+
+    - name: Link cluster state template (preserving existing templates)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            templates: "{{ template_objects }}"
+          id: 1
+
+    - name: Check if KUBE.STATE.ENDPOINT.NAME macro already exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: usermacro.get
+          params:
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            filter:
+              macro: "{$KUBE.STATE.ENDPOINT.NAME}"
+          id: 1
+      register: existing_macro
+
+    - name: Set kube-state-metrics endpoint name macro
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: usermacro.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            macro: "{$KUBE.STATE.ENDPOINT.NAME}"
+            value: "rancher-monitoring-kube-state-metrics"
+          id: 1
+      when: existing_macro.json.result | length == 0
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "Kubernetes cluster state template linked to {{ target_host }}"
