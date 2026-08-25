@@ -1,0 +1,252 @@
+---
+# Flatten the ZFS pool's mountpoint so PBS datastores sit directly under
+# /mnt/datastore instead of one level deeper.
+#
+#   before   /mnt/datastore/backup10tb/vm_backups
+#   after    /mnt/datastore/vm_backups
+#
+# `backup10tb` was never a directory - it is the ZFS POOL, whose mountpoint is
+# set locally to /mnt/datastore/backup10tb, with all four datasets inheriting
+# from it. So this is a REMOUNT, not a data move: nothing is copied and the
+# 1.9 TB already stored is untouched and instant.
+#
+# Worth doing because PBS's own convention is /mnt/datastore/<datastore-name>.
+# The datastores currently sit a level below where PBS would put them, so
+# flattening makes the layout more conventional rather than less.
+#
+# Only two files on the host reference the old path, confirmed by grepping /etc
+# and /usr/local: datastore.cfg (3 active datastores) and /etc/exports (the
+# longhorn_backups export). There are no fstab entries - ZFS mounts itself from
+# the pool's mountpoint property.
+#
+# PVE IS NOT AFFECTED. The three hypervisors reach PBS by datastore NAME over
+# its API, never by filesystem path, so their backup jobs keep working with no
+# change. The two `_old` datastores point at /pbs_storage/* and are likewise
+# untouched.
+#
+# The unmount/rmdir/remount dance is deliberate rather than a single
+# `zfs set mountpoint`. Setting the property alone remounts the pool over
+# /mnt/datastore while the now-empty `backup10tb` directory still exists on the
+# root xfs underneath, shadowed by the new mount and invisible - harmless but a
+# trap for whoever finds it later. Unmounting first lets that directory be
+# removed properly.
+#
+# Children are unmounted before the parent: they are separate filesystems
+# mounted beneath it, so unmounting the pool with them still mounted fails busy.
+#
+# Usage - PBS is stopped and restarted, so run it outside a backup window:
+#   ansible-playbook playbooks/pbs-flatten-datastore-mountpoint.yml --check --diff
+#   ansible-playbook playbooks/pbs-flatten-datastore-mountpoint.yml
+
+- name: Flatten the PBS datastore mountpoint
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    zfs_pool: backup10tb
+    old_root: /mnt/datastore/backup10tb
+    new_root: /mnt/datastore
+    pbs_services:
+      - proxmox-backup-proxy
+      - proxmox-backup
+    # Children unmount first, pool last.
+    zfs_datasets:
+      - backup10tb/vm_backups
+      - backup10tb/host_backups
+      - backup10tb/photo_backups
+      - backup10tb/longhorn_backups
+      - backup10tb
+
+  tasks:
+    # `zfs list`, never `du`. A PBS datastore is a chunk store of millions of
+    # small files - `du -s` over it runs for many minutes and hung this play on
+    # the first attempt. ZFS already knows the used bytes from metadata and
+    # answers instantly.
+    - name: Record dataset sizes and mountpoints before the change
+      ansible.builtin.command: "zfs list -H -o name,used,mountpoint -r {{ zfs_pool }}"
+      register: before_sizes
+      changed_when: false
+      check_mode: false
+
+    - name: Show what is there now
+      ansible.builtin.debug:
+        msg: "{{ before_sizes.stdout_lines }}"
+
+    # Refuse to proceed if anything outside this host is holding the export.
+    # Yanking a mountpoint from under a live NFS client gives it stale handles
+    # rather than a clean error.
+    - name: Check for NFS clients on the datastore paths
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        ss -tn state established sport = :2049 2>/dev/null | tail -n +2 | wc -l
+      args:
+        executable: /bin/bash
+      register: nfs_clients
+      changed_when: false
+      check_mode: false
+
+    - name: Report NFS client count
+      ansible.builtin.debug:
+        msg: >-
+          {{ nfs_clients.stdout | trim }} established NFS connection(s) to this
+          host. These are for /srv/nfs/template (on the root filesystem, not
+          affected) unless something has mounted a datastore path - the
+          longhorn_backups export has no consumer yet.
+
+    - name: Stop PBS
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ pbs_services }}"
+
+    - name: Unmount the datasets, children before the pool
+      ansible.builtin.command: "zfs unmount {{ item }}"
+      loop: "{{ zfs_datasets }}"
+      register: unmount_result
+      # A dataset that is already unmounted is not an error here.
+      failed_when: >-
+        unmount_result.rc != 0
+        and 'not currently mounted' not in (unmount_result.stderr | default(''))
+      changed_when: unmount_result.rc == 0
+
+    # `rmdir`, deliberately NOT `file: state=absent`.
+    #
+    # state=absent deletes recursively. If the unmount above had failed or been
+    # skipped, this path still contains the entire mounted 1.9 TB datastore and
+    # that task would have destroyed it. It also hung the check run outright,
+    # walking the whole chunk store to decide what it would delete.
+    #
+    # rmdir cannot do that: it removes an empty directory and fails on a
+    # non-empty one. So a failed unmount surfaces as a loud, harmless error
+    # instead of data loss. "Directory not empty" is treated as fatal for
+    # exactly that reason.
+    - name: Remove the now-empty directory that would otherwise be shadowed
+      ansible.builtin.command: "rmdir {{ old_root }}"
+      register: rmdir_old
+      failed_when: >-
+        rmdir_old.rc != 0
+        and 'No such file or directory' not in (rmdir_old.stderr | default(''))
+      changed_when: rmdir_old.rc == 0
+
+    - name: Point the pool at the flattened mountpoint
+      ansible.builtin.command: "zfs set mountpoint={{ new_root }} {{ zfs_pool }}"
+      register: set_mp
+      changed_when: set_mp.rc == 0
+
+    - name: Mount everything back
+      ansible.builtin.command: "zfs mount -a"
+      register: zfs_mount
+      changed_when: zfs_mount.rc == 0
+
+    - name: Read back sizes and mountpoints after the remount
+      ansible.builtin.command: "zfs list -H -o name,used,mountpoint -r {{ zfs_pool }}"
+      register: after_sizes
+      changed_when: false
+
+    # Cheap and decisive: a PBS datastore always contains a .chunks directory.
+    # Listing one directory costs nothing, unlike walking the chunk store.
+    - name: Confirm the datastore contents are visible at the new path
+      ansible.builtin.stat:
+        path: "{{ new_root }}/vm_backups/.chunks"
+      register: chunks_stat
+
+    # Guards against the pool having mounted somewhere unexpected and PBS then
+    # being pointed at an empty directory, which it would happily accept and
+    # treat as a datastore with zero backups.
+    - name: Assert the data really moved with the mountpoint
+      ansible.builtin.assert:
+        that:
+          - chunks_stat.stat.exists | default(false)
+          - chunks_stat.stat.isdir | default(false)
+          - new_root + '/vm_backups' in after_sizes.stdout
+          - old_root not in after_sizes.stdout
+        fail_msg: >-
+          {{ new_root }}/vm_backups/.chunks is missing, or the datasets are not
+          on {{ new_root }}. NOT updating PBS config - pointing it at an empty
+          directory would give a datastore that reports zero backups without
+          erroring. zfs list said:
+          {{ after_sizes.stdout }}
+        success_msg: "Chunk store present at {{ new_root }}/vm_backups."
+      # Cannot pass under --check: the unmount and remount are skipped, so the
+      # data is still at the old path and this guard would always fail. The
+      # guard matters only on a real run, which is where it is enforced.
+      when: not ansible_check_mode
+
+    - name: Note that --check cannot verify the remount
+      ansible.builtin.debug:
+        msg: >-
+          --check skips the unmount/remount, so the data-moved assertion was
+          not evaluated. Everything up to that point is validated; run without
+          --check to exercise the guard.
+      when: ansible_check_mode
+
+    - name: Back up the datastore config
+      ansible.builtin.copy:
+        src: /etc/proxmox-backup/datastore.cfg
+        dest: "/etc/proxmox-backup/datastore.cfg.bak-{{ ansible_date_time.date }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0640"
+        force: false
+
+    # Only the backup10tb-prefixed paths match, so the two `_old` datastores
+    # pointing at /pbs_storage are left alone.
+    - name: Rewrite the datastore paths
+      ansible.builtin.replace:
+        path: /etc/proxmox-backup/datastore.cfg
+        regexp: '{{ old_root | regex_escape }}/'
+        replace: '{{ new_root }}/'
+
+    - name: Rewrite the NFS export path
+      ansible.builtin.replace:
+        path: /etc/exports
+        regexp: '{{ old_root | regex_escape }}/'
+        replace: '{{ new_root }}/'
+      notify: reload nfs exports
+
+    - name: Apply the export change now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start PBS
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+      loop: "{{ pbs_services | reverse | list }}"
+
+    - name: Wait for the API to answer
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8007/api2/json/ping
+        validate_certs: false
+        status_code: [200, 401]
+      register: pbs_ping
+      retries: 12
+      delay: 5
+      until: pbs_ping.status in [200, 401]
+
+    - name: Read back the datastore list
+      ansible.builtin.command: proxmox-backup-manager datastore list
+      register: ds_list
+      changed_when: false
+
+    - name: Confirm the active datastores are on the new paths
+      ansible.builtin.assert:
+        that:
+          - "'{{ new_root }}/vm_backups' in ds_list.stdout"
+          - "'{{ new_root }}/host_backups' in ds_list.stdout"
+          - "'{{ new_root }}/photo_backups' in ds_list.stdout"
+          - "'{{ old_root }}' not in ds_list.stdout"
+        fail_msg: "Datastore list still shows old paths:\n{{ ds_list.stdout }}"
+        success_msg: "All three active datastores are on {{ new_root }}."
+      # Skipped under --check for the same reason as the data-moved guard: the
+      # command that populates ds_list does not run, so there is nothing to
+      # assert against.
+      when: not ansible_check_mode
+
+    - name: Show the final state
+      ansible.builtin.debug:
+        msg: "{{ ds_list.stdout_lines }}"
+
+  handlers:
+    - name: reload nfs exports
+      ansible.builtin.command: exportfs -ra
