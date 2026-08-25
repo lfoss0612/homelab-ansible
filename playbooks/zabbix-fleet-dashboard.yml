@@ -1,0 +1,248 @@
+---
+# Build the "OpenClaw Fleet Update Health" Zabbix dashboard.
+#
+# Answers one question at a glance: did the weekly convergence run pass, and if
+# not, which host broke it. Before this, the second half required reading
+# /var/lib/openclaw-fleet-update/last-failure or the journal on cockpit - which
+# is a large part of why the 2026-08-16 and 2026-08-23 failures went unnoticed
+# for two weeks.
+#
+# Depends on playbooks/zabbix-fleet-update-item.yml having created both items,
+# and on the control role pushing to them. Widgets reference items BY NAME, so
+# renaming either item in that playbook silently empties the widget here -
+# change both together.
+#
+# Scoped to host group "Linux servers" (groupid resolved by name below) rather
+# than a hardcoded list of 14 host IDs: verified 2026-08-24 that its membership
+# is exactly the Ansible openclaw fleet, and a group stays correct as hosts are
+# added where a baked-in ID list would not.
+#
+# Layout is on Zabbix 7.0+'s 72-column grid, not the old 24-column one.
+#
+# Idempotent: creates the dashboard, or replaces its pages in place if it
+# already exists, keeping the same dashboardid and URL.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-fleet-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-fleet-dashboard.yml
+
+- name: Build the fleet update health dashboard
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "OpenClaw Fleet Update Health"
+    fleet_group_name: "Linux servers"
+    control_host: "cockpit.home.lan"
+
+    # Must match the item names created by zabbix-fleet-update-item.yml.
+    aggregate_item_name: "OpenClaw fleet update: last run outcome"
+    per_host_item_name: "OpenClaw fleet update: this host's last result"
+
+  tasks:
+    - name: Resolve the fleet host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ fleet_group_name }}"]
+          id: 1
+      register: group_lookup
+      check_mode: false
+      failed_when: >-
+        group_lookup.json.error is defined
+        or (group_lookup.json.result | default([]) | length) != 1
+
+    - name: Resolve the aggregate item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "name"]
+            host: "{{ control_host }}"
+            filter:
+              key_: ["openclaw.fleet.update"]
+          id: 1
+      register: agg_item
+      check_mode: false
+      failed_when: >-
+        agg_item.json.error is defined
+        or (agg_item.json.result | default([]) | length) != 1
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Fleet update health"
+            widgets:
+              # --- Row 1: is the fleet green right now --------------------
+              - type: item
+                name: "Last fleet run"
+                x: 0
+                y: 0
+                width: 16
+                height: 4
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ agg_item.json.result[0].itemid }}"}
+                  - {type: 0, name: "show.0", value: "1"}     # description
+                  - {type: 0, name: "show.1", value: "2"}     # value
+                  - {type: 0, name: "show.2", value: "3"}     # time
+                  - {type: 1, name: "description", value: "0 = converged   1 = FAILED"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+                  # Colour is the whole point of this tile: green at 0, red at 1.
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
+
+              - type: problems
+                name: "Fleet update problems"
+                x: 16
+                y: 0
+                width: 56
+                height: 4
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  # Name filter, so this pane stays about convergence and does
+                  # not fill with unrelated disk/memory alerts from the fleet.
+                  - {type: 1, name: "problem", value: "OpenClaw fleet update"}
+                  - {type: 0, name: "show", value: "1"}
+                  - {type: 1, name: "reference", value: "FLTPB"}
+
+              # --- Row 2: which host, and how often ----------------------
+              - type: tophosts
+                name: "Per-host result of the last run"
+                x: 0
+                y: 4
+                width: 36
+                height: 9
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 1, name: "columns.0.name", value: "Host"}
+                  - {type: 0, name: "columns.0.data", value: "2"}
+                  - {type: 1, name: "columns.1.name", value: "Last result"}
+                  - {type: 0, name: "columns.1.data", value: "1"}
+                  - {type: 1, name: "columns.1.item", value: "{{ per_host_item_name }}"}
+                  - {type: 0, name: "columns.1.decimal_places", value: "0"}
+                  - {type: 1, name: "columns.1.base_color", value: "4CAF50"}
+                  # 1 = task failures (red), 2 = unreachable (amber, and
+                  # expected on openclaw_optional hosts that are powered off).
+                  - {type: 1, name: "columnsthresholds.1.color.0", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.0", value: "1"}
+                  - {type: 1, name: "columnsthresholds.1.color.1", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.1", value: "2"}
+                  - {type: 0, name: "column", value: "1"}
+                  - {type: 1, name: "reference", value: "FLTTH"}
+
+              - type: svggraph
+                name: "Outcome history"
+                x: 36
+                y: 4
+                width: 36
+                height: 9
+                fields:
+                  - {type: 1, name: "ds.0.hosts.0", value: "{{ control_host }}"}
+                  - {type: 1, name: "ds.0.items.0", value: "{{ aggregate_item_name }}"}
+                  - {type: 1, name: "ds.0.color", value: "F44336"}
+                  # Staircase: one value per week, so interpolating between
+                  # points would draw a slope that never happened.
+                  - {type: 0, name: "ds.0.type", value: "2"}
+                  - {type: 1, name: "righty", value: "0"}
+
+              # --- Row 3: the precondition for any of the above ----------
+              # If an agent is down, that host's per-host value is stale rather
+              # than good, and nothing above distinguishes the two.
+              - type: hostavail
+                name: "Fleet agent availability"
+                x: 0
+                y: 13
+                width: 72
+                height: 3
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 0, name: "interface_type.0", value: "1"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}
