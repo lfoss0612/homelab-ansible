@@ -77,3 +77,9 @@ openclaw_networkd_migrate_iface: "{{ ansible_default_ipv4.interface }}"
 openclaw_zabbix_version_report: true
 openclaw_zabbix_version_key: openclaw.version
 openclaw_zabbix_agent2_include_dir: /etc/zabbix/zabbix_agent2.d
+
+# Where the drop-in goes on k8s nodes, which have no host-level agent. The
+# in-cluster DaemonSet mounts this directory at /etc/zabbix/zabbix_agentd.d
+# (already on the container's Include list, and empty in the image, so nothing
+# is shadowed) - see homelab-gitops zabbix-proxy-agent.yaml.
+openclaw_zabbix_userparam_hostdir: /etc/zabbix/agent2-userparams.d

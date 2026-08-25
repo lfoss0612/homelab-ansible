@@ -19,8 +19,12 @@
 # in a UserParameter as positional arguments, so a shell variable there needs
 # UnsafeUserParameters or escaping. Reading one known path avoids the question.
 #
-# The three k8s nodes are NOT covered by this file. They have no host-level
-# agent (removed in a3c4e75 in favour of the in-cluster DaemonSet); that agent
-# reads the very same package.json through its read-only /hostfs/root mount of
-# the host filesystem, configured in homelab-gitops.
-UserParameter={{ openclaw_zabbix_version_key }},sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' {{ openclaw_npm_prefix.stdout | trim }}/lib/node_modules/openclaw/package.json | head -1
+# openclaw_zabbix_version_pkg_path differs by where the AGENT runs, not by
+# where this file is written:
+#   - host agent      -> <npm prefix>/lib/node_modules/openclaw/package.json
+#   - k8s DaemonSet   -> /hostfs/root<npm prefix>/lib/... , because that agent
+#                        is a container and reaches the node's filesystem only
+#                        through its read-only /hostfs/root mount.
+# Both read the identical file; only the path the agent must use to name it
+# differs. Getting this backwards yields an item that is silently unsupported.
+UserParameter={{ openclaw_zabbix_version_key }},sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' {{ openclaw_zabbix_version_pkg_path }} | head -1

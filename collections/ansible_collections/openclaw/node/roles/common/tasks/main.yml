@@ -735,6 +735,14 @@
 # --- Zabbix: report the installed openclaw version ---------------------------
 # See the template header for why this reads package.json rather than running
 # the CLI, and why the path is templated rather than hardcoded.
+#
+# Two delivery paths, because the fleet has two kinds of agent:
+#   - Hosts with their own agent2: drop-in goes straight into its include dir.
+#   - k8s nodes: no host-level agent since a3c4e75. The in-cluster DaemonSet
+#     is the agent, so the drop-in goes to a directory on the node that the
+#     DaemonSet mounts at /etc/zabbix/zabbix_agentd.d (see homelab-gitops), and
+#     the path INSIDE it is prefixed with /hostfs/root because that container
+#     reaches the node's filesystem only through that read-only mount.
 - name: Check for a host-level Zabbix agent2 include directory
   ansible.builtin.stat:
     path: "{{ openclaw_zabbix_agent2_include_dir }}"
@@ -743,8 +751,8 @@
   tags: zabbix
 
 # Guarded on the include directory rather than on a host list: the k8s nodes
-# have no host-level agent (a3c4e75), and hardcoding their names here would go
-# stale the moment the cluster gains or loses one.
+# have no host-level agent, and hardcoding their names here would go stale the
+# moment the cluster gains or loses one.
 - name: Publish the installed openclaw version as a Zabbix UserParameter
   ansible.builtin.template:
     src: zabbix-openclaw-version.conf.j2
@@ -752,10 +760,49 @@
     owner: root
     group: root
     mode: "0644"
+  vars:
+    openclaw_zabbix_version_pkg_path: >-
+      {{ openclaw_npm_prefix.stdout | trim }}/lib/node_modules/openclaw/package.json
   when:
     - openclaw_zabbix_version_report
     - openclaw_zabbix_include_dir.stat is defined
     - openclaw_zabbix_include_dir.stat.exists | default(false)
     - openclaw_zabbix_include_dir.stat.isdir | default(false)
   notify: restart zabbix agent2
+  tags: zabbix
+
+# The DaemonSet path. The directory must exist before the DaemonSet mounts it:
+# the chart sets no hostPath `type`, so kubelet will not create a missing one
+# and the pod fails to start. Ansible therefore has to run before the gitops
+# change lands, not after.
+- name: Create the DaemonSet UserParameter directory on k8s nodes
+  ansible.builtin.file:
+    path: "{{ openclaw_zabbix_userparam_hostdir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - openclaw_zabbix_version_report
+    - "'k8s' in group_names"
+  tags: zabbix
+
+- name: Publish the UserParameter for the in-cluster DaemonSet agent
+  ansible.builtin.template:
+    src: zabbix-openclaw-version.conf.j2
+    dest: "{{ openclaw_zabbix_userparam_hostdir }}/openclaw-version.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    # /hostfs/root prefix: this file is read by the DaemonSet container, which
+    # sees the node's filesystem only under that mount.
+    openclaw_zabbix_version_pkg_path: >-
+      /hostfs/root{{ openclaw_npm_prefix.stdout | trim }}/lib/node_modules/openclaw/package.json
+  when:
+    - openclaw_zabbix_version_report
+    - "'k8s' in group_names"
+  # No handler: the agent is a pod, not a host unit. agent2 re-reads
+  # UserParameters only at start, so the DaemonSet needs a rollout restart
+  # after this lands - done once when the gitops change is applied.
   tags: zabbix
