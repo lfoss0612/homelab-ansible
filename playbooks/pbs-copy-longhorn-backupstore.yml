@@ -1,0 +1,107 @@
+---
+# Copy Longhorn's backup store off the full ext4 volume onto the ZFS mirror,
+# ahead of repointing Longhorn's BackupTarget at the new location.
+#
+#   from  /mnt/backups/longhorn/backupstore          (ext4, 1.8 TB, 100% FULL)
+#   to    /mnt/datastore/longhorn_backups/backupstore (ZFS mirror, 7.1 TB free)
+#
+# ~513 GB. Without this, changing the BackupTarget makes Longhorn's entire
+# backup history invisible - the data is not deleted, but nothing can be
+# restored from it until the target is pointed back.
+#
+# The source is STATIC, which is what makes this safe to do online: the volume
+# it lives on has 0 bytes free, so nothing can write to it, and the newest
+# entry under backupstore/ is dated 2026-07-18. There is no moving target and
+# no need to quiesce Longhorn first. (That same fullness is why Longhorn's
+# backups have been failing silently - it is still pointed here.)
+#
+# Trailing slashes are load-bearing: `src/ dest/` copies the CONTENTS of src
+# into dest. Without them rsync would nest a second backupstore directory
+# inside the first and Longhorn would find nothing at the path it expects.
+#
+# Run detached via systemd-run rather than as a normal task. A half-terabyte
+# copy outlives any sensible Ansible timeout, and a transient unit survives the
+# SSH connection dropping - an interrupted rsync here is recoverable but wastes
+# hours. Progress goes to the journal; rsync is restartable, so re-running this
+# play resumes rather than starting over.
+#
+# NOTHING IS DELETED. No --delete flag, and the source is left completely
+# untouched: it stays as the fallback until the new location is proven good.
+# Reclaiming that space is a separate, later decision.
+#
+# Usage:
+#   ansible-playbook playbooks/pbs-copy-longhorn-backupstore.yml
+#   # then watch:
+#   ssh pbs journalctl -u longhorn-store-copy -f
+#
+- name: Copy the Longhorn backup store to the ZFS mirror
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    src_store: /mnt/backups/longhorn/backupstore
+    dst_store: /mnt/datastore/longhorn_backups/backupstore
+    copy_unit: longhorn-store-copy
+
+  tasks:
+    - name: Confirm the source store exists
+      ansible.builtin.stat:
+        path: "{{ src_store }}/volumes"
+      register: src_stat
+      failed_when: not (src_stat.stat.isdir | default(false))
+
+    - name: Read free space on the destination
+      ansible.builtin.command: "zfs list -H -o available backup10tb/longhorn_backups"
+      register: dst_free
+      changed_when: false
+
+    - name: Show the plan
+      ansible.builtin.debug:
+        msg: >-
+          Copying {{ src_store }} -> {{ dst_store }};
+          destination has {{ dst_free.stdout | trim }} free.
+
+    - name: Check whether a copy is already running
+      ansible.builtin.command: "systemctl is-active {{ copy_unit }}.service"
+      register: unit_active
+      changed_when: false
+      failed_when: false
+
+    - name: Report an in-flight copy and stop
+      ansible.builtin.debug:
+        msg: >-
+          {{ copy_unit }} is already {{ unit_active.stdout | trim }} - leaving it
+          alone. Watch it with `journalctl -u {{ copy_unit }} -f`.
+      when: unit_active.stdout | trim == 'active'
+
+    - name: Create the destination directory
+      ansible.builtin.file:
+        path: "{{ dst_store }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: unit_active.stdout | trim != 'active'
+
+    # -aHAX preserves hardlinks, ACLs and xattrs; Longhorn's store uses ordinary
+    # files, but preserving everything costs nothing and avoids surprises.
+    # --numeric-ids keeps ownership literal rather than remapping
+    # through name lookups. No --delete: this only ever adds.
+    - name: Start the copy as a transient unit
+      ansible.builtin.command: >-
+        systemd-run --unit={{ copy_unit }} --description="Copy Longhorn backupstore to ZFS mirror"
+        /usr/bin/rsync -aHAX --numeric-ids --stats
+        {{ src_store }}/ {{ dst_store }}/
+      register: copy_start
+      changed_when: copy_start.rc == 0
+      when: unit_active.stdout | trim != 'active'
+
+    - name: Report how to follow it
+      ansible.builtin.debug:
+        msg: >-
+          Copy started as {{ copy_unit }}.service.
+          Follow with:  journalctl -u {{ copy_unit }} -f
+          Check state:  systemctl status {{ copy_unit }}
+          The source is untouched and the BackupTarget is unchanged until this
+          finishes and is verified.
+      when: unit_active.stdout | trim != 'active'
