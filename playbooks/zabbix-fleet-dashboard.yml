@@ -37,6 +37,11 @@
     dashboard_name: "OpenClaw Fleet Update Health"
     fleet_group_name: "Linux servers"
     control_host: "cockpit.home.lan"
+    # The OpenClaw gateway ("server"). Distinct from the control node, which is
+    # the Ansible side.
+    gateway_host: "openclaw.home.lan"
+    version_key: "openclaw.version"
+    version_item_name: "OpenClaw: installed version"
 
     # Must match the item names created by zabbix-fleet-update-item.yml.
     aggregate_item_name: "OpenClaw fleet update: last run outcome"
@@ -86,6 +91,30 @@
         agg_item.json.error is defined
         or (agg_item.json.result | default([]) | length) != 1
 
+    # The gateway IS a fleet host and already reports openclaw.version like any
+    # other, but it earns its own tile: it is the one host whose version
+    # everything else talks to, so "what is the server on" should be readable
+    # without scanning a 14-row table for it.
+    - name: Resolve the gateway's version item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "name"]
+            host: "{{ gateway_host }}"
+            filter:
+              key_: ["{{ version_key }}"]
+          id: 1
+      register: gw_version_item
+      check_mode: false
+      failed_when: gw_version_item.json.error is defined
+
     - name: Look for an existing dashboard
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
@@ -115,7 +144,7 @@
                 name: "Last fleet run"
                 x: 0
                 y: 0
-                width: 16
+                width: 14
                 height: 4
                 fields:
                   - {type: 4, name: "itemid.0", value: "{{ agg_item.json.result[0].itemid }}"}
@@ -131,11 +160,25 @@
                   - {type: 1, name: "thresholds.1.color", value: "F44336"}
                   - {type: 1, name: "thresholds.1.threshold", value: "1"}
 
+              - type: item
+                name: "Gateway version"
+                x: 14
+                y: 0
+                width: 14
+                height: 4
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ gw_version_item.json.result[0].itemid }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "openclaw.home.lan"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+
               - type: problems
                 name: "Fleet update problems"
-                x: 16
+                x: 28
                 y: 0
-                width: 56
+                width: 44
                 height: 4
                 fields:
                   - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
@@ -147,10 +190,10 @@
 
               # --- Row 2: which host, and how often ----------------------
               - type: tophosts
-                name: "Per-host result of the last run"
+                name: "Per-host result and installed version"
                 x: 0
                 y: 4
-                width: 36
+                width: 40
                 height: 9
                 fields:
                   - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
@@ -167,14 +210,21 @@
                   - {type: 1, name: "columnsthresholds.1.threshold.0", value: "1"}
                   - {type: 1, name: "columnsthresholds.1.color.1", value: "FF9800"}
                   - {type: 1, name: "columnsthresholds.1.threshold.1", value: "2"}
+                  # Version alongside the convergence result, in one table:
+                  # "did this host converge" and "what is it actually running"
+                  # are the same question asked two ways, and splitting them
+                  # across two widgets makes you correlate rows by eye.
+                  - {type: 1, name: "columns.2.name", value: "Installed version"}
+                  - {type: 0, name: "columns.2.data", value: "1"}
+                  - {type: 1, name: "columns.2.item", value: "{{ version_item_name }}"}
                   - {type: 0, name: "column", value: "1"}
                   - {type: 1, name: "reference", value: "FLTTH"}
 
               - type: svggraph
                 name: "Outcome history"
-                x: 36
+                x: 40
                 y: 4
-                width: 36
+                width: 32
                 height: 9
                 fields:
                   - {type: 1, name: "ds.0.hosts.0", value: "{{ control_host }}"}
