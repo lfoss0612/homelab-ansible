@@ -1,0 +1,156 @@
+---
+# Disable the duplicated legacy pod triggers on the Kubernetes host.
+#
+# Surfaced immediately after playbooks/zabbix-fix-pod-discovery.yml made pod
+# discovery work for the first time. Every pod ends up with FOUR triggers, in
+# two functionally duplicated pairs:
+#
+#   sev 2  "Kubernetes cluster state: ... Pod is crash looping"
+#            -> kube.pod.containers_restarts          KEEP
+#   sev 4  "Kubernetes cluster state: ... Pod is not healthy"
+#            -> kube.pod.phase.failed                 KEEP
+#   sev 2  "Kubernetes nodes: Node [{#NODE}] ... crash looping"
+#            -> kube.pod.containers.restartcount      DISABLE
+#   sev 4  "Kubernetes nodes: Node [{#NODE}] ..."
+#            -> kube.pod.status.phase                 DISABLE
+#
+# So a crash-looping pod raises two problems rather than one - the same
+# duplicate-alerting shape as the Proxmox template being linked to all three
+# cluster nodes.
+#
+# The giveaway is in the name: "Node [{#NODE}]" is LITERAL. Those prototypes
+# reference {#NODE}, which this template's Pod discovery never declares - the
+# identical defect as the {#POD} one, in the other direction. That is what
+# makes it a safe and precise marker: a working trigger always has its macros
+# resolved, so anything still carrying a literal {#NODE} is by definition one
+# of these. Verified 2026-08-25: 240 matches, all on k8s-master, exactly
+# 120 pods x 2.
+#
+# Root cause is that "Kubernetes cluster state by HTTP" on this server is a
+# MERGED HYBRID of itself and the old "Kubernetes nodes by HTTP" - it carries
+# the old template's pod prototypes alongside its own. That is also why the
+# prototypes keyed on {#POD} while the macro paths declared {#NAME}.
+#
+# THIS IS A WORKAROUND, NOT THE FIX. The real fix is disabling the two
+# offending TRIGGER PROTOTYPES on the template, which needs
+# triggerprototype.update - a method the automation token is not permitted to
+# call ("No permissions to call"). Until that is done on the template:
+#
+#   * this play disables the triggers that exist right now, and
+#   * every NEWLY discovered pod still gets a fresh pair of enabled duplicates,
+#     so this needs re-running as pods churn.
+#
+# Manually disabling a discovered trigger does survive an LLD re-run - verified
+# by disabling one, forcing kube.pod.discovery with task.create, and confirming
+# status stayed 1 - so the disables are not undone by discovery itself. It is
+# only new pods that arrive un-suppressed.
+#
+# To fix it properly, in the UI:
+#   Data collection -> Templates -> "Kubernetes cluster state by HTTP"
+#     -> Discovery rules -> "Pod discovery" -> Trigger prototypes
+#     -> disable the two whose names start "Kubernetes nodes: Node [{#NODE}]"
+# Then this play becomes a permanent no-op.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-disable-duplicate-pod-triggers.yml --check --diff
+#   ansible-playbook playbooks/zabbix-disable-duplicate-pod-triggers.yml
+
+- name: Disable duplicated legacy pod triggers
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    # !unsafe because "{#" opens a Jinja comment - a bare value here fails to
+    # template with "Missing end of comment tag" rather than doing anything
+    # useful. Same trap as {#POD} in zabbix-fix-pod-discovery.yml.
+    duplicate_marker: !unsafe "Node [{#NODE}]"
+
+  tasks:
+    - name: Find triggers still carrying an unresolved macro
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description", "status"]
+            selectHosts: ["host"]
+            search:
+              description: "{{ duplicate_marker }}"
+            limit: 5000
+          id: 1
+      register: dup_lookup
+      check_mode: false
+      failed_when: dup_lookup.json.error is defined
+
+    - name: Report the scope
+      ansible.builtin.debug:
+        msg: >-
+          {{ dup_lookup.json.result | length }} trigger(s) match '{{ duplicate_marker }}';
+          {{ dup_lookup.json.result | selectattr('status', 'equalto', '0') | list | length }}
+          still enabled and will be disabled.
+          Hosts: {{ dup_lookup.json.result | map(attribute='hosts') | map('first')
+                    | map(attribute='host') | unique | list }}
+
+    # Batched into one call rather than looping: 240 sequential HTTP round trips
+    # for what the API accepts as a single array is needless, and a partial
+    # failure midway would leave the set half-disabled.
+    - name: Disable them
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.update
+          params: >-
+            {{ dup_lookup.json.result
+               | selectattr('status', 'equalto', '0')
+               | map(attribute='triggerid')
+               | map('community.general.dict_kv', 'triggerid')
+               | map('combine', {'status': 1})
+               | list }}
+          id: 1
+      register: dup_disable
+      when: >-
+        (dup_lookup.json.result | selectattr('status', 'equalto', '0') | list | length) > 0
+      failed_when: dup_disable.json.error is defined
+      changed_when: dup_disable.json.result is defined
+
+    - name: Re-read to confirm
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "status"]
+            search:
+              description: "{{ duplicate_marker }}"
+            limit: 5000
+          id: 1
+      register: dup_verify
+      check_mode: false
+      failed_when: dup_verify.json.error is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          {{ dup_verify.json.result | length }} duplicate trigger(s);
+          still enabled: {{ dup_verify.json.result | selectattr('status', 'equalto', '0') | list | length }}
+          (expected 0). Newly discovered pods will still arrive with enabled
+          duplicates until the trigger prototypes are disabled on the template
+          — see this play's header.
