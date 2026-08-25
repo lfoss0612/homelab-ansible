@@ -99,15 +99,63 @@
         state: stopped
       loop: "{{ pbs_services }}"
 
-    - name: Unmount the datasets, children before the pool
-      ansible.builtin.command: "zfs unmount {{ item }}"
-      loop: "{{ zfs_datasets }}"
-      register: unmount_result
-      # A dataset that is already unmounted is not an error here.
-      failed_when: >-
-        unmount_result.rc != 0
-        and 'not currently mounted' not in (unmount_result.stderr | default(''))
-      changed_when: unmount_result.rc == 0
+    # One shell loop rather than an Ansible loop with `until`. With a loop,
+    # `until` retries PER ITEM and the registered result is an aggregate, so a
+    # straggler that clears on retry still leaves the aggregate marked failed -
+    # which is exactly how the second attempt at this play bailed out while
+    # reporting an empty holder list. Checking the real end state (nothing in
+    # the pool still mounted) is unambiguous.
+    #
+    # `systemctl stop` returns when the main process exits, but ZFS can report
+    # the dataset busy for a few seconds afterwards while chunk-store handles
+    # and in-flight I/O drain. Hence the retries.
+    - name: Unmount every dataset, children before the pool, retrying while busy
+      ansible.builtin.shell: |
+        set -u
+        for attempt in 1 2 3 4 5 6 7 8; do
+          for ds in {{ zfs_datasets | join(' ') }}; do
+            zfs unmount "$ds" 2>/dev/null || true
+          done
+          if [ "$(zfs list -H -o mounted -r {{ zfs_pool }} | grep -c yes)" -eq 0 ]; then
+            echo "all unmounted on attempt $attempt"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "STILL MOUNTED after retries:"
+        zfs list -H -o name,mounted -r {{ zfs_pool }} | grep yes
+        exit 1
+      args:
+        executable: /bin/bash
+      register: unmount_all
+      changed_when: "'all unmounted' in unmount_all.stdout"
+      failed_when: unmount_all.rc != 0
+
+    # Only reached if the unmount succeeded, so this reports on a real failure
+    # path rather than firing spuriously.
+    - name: Report anything still holding the datasets
+      ansible.builtin.shell: |
+        set -u
+        for p in /proc/[0-9]*; do
+          cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+          case "$cwd" in /mnt/datastore*) echo "pid ${p#/proc/} $(cat "$p/comm" 2>/dev/null) cwd=$cwd";; esac
+        done
+        true
+      args:
+        executable: /bin/bash
+      register: holders
+      changed_when: false
+      when: unmount_all is failed
+
+    - name: Fail with the holder list
+      ansible.builtin.fail:
+        msg: >-
+          Could not unmount after retrying. {{ unmount_all.stdout | default('') }}
+          Processes with a cwd under /mnt/datastore:
+          {{ holders.stdout_lines | default(['(none - check `lsof +D` for open files)']) }}.
+          PBS has been left stopped; start it with
+          `systemctl start proxmox-backup proxmox-backup-proxy`.
+      when: unmount_all is failed
 
     # `rmdir`, deliberately NOT `file: state=absent`.
     #
