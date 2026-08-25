@@ -31,13 +31,18 @@
 # granted - also covers every pod discovered from now on, which that
 # workaround could not.
 #
-# The 8 orphaned ITEM prototypes are deliberately NOT touched here. Six of them
-# duplicate template items under different key names, but two do not:
-# kube.pod.conditions.initialized and kube.pod.uptime have no equivalent in the
-# cluster-state template, so deleting them loses monitoring rather than noise.
-# That is a judgement call for a human, and it is coupled to the {#POD} macro
-# path added to the template - the orphan items need it, so it cannot be
-# reverted while they remain.
+# The 8 orphaned ITEM prototypes are handled too, on an explicit decision taken
+# 2026-08-25. Six duplicate template items under different key names; two do
+# not - kube.pod.conditions.initialized and kube.pod.uptime have no equivalent
+# in the cluster-state template, so this DOES give up two metrics. Pod age
+# remains visible via kubectl, and pod-initialized is covered in practice by
+# the template's ready/scheduled conditions, which is why the trade was
+# accepted rather than keeping a permanently orphaned prototype set alive.
+#
+# With the orphan items gone, the {#POD} macro path is no longer needed by
+# anything and is removed from the template, returning it to stock. Order
+# matters: the prototypes must be neutralised BEFORE the macro path goes, or
+# they revert to emitting literal-{#POD} keys in between.
 #
 # DISABLE, not delete - and not by preference. Deleting is the better end
 # state, since an orphan prototype belongs to nothing and no template update
@@ -67,6 +72,12 @@
 
     target_host: "k8s-master.home.lan"
     lld_key: "kube.pod.discovery"
+    cluster_state_templateid: "10510"
+
+    # !unsafe throughout: "{#" opens a Jinja comment, so a bare literal here
+    # fails to template with "Missing end of comment tag".
+    pod_macro: !unsafe "{#POD}"
+    pod_macro_marker: !unsafe "\\{#POD\\}"
 
   tasks:
     # hostids, not host. discoveryrule.get's `host` parameter does NOT filter -
@@ -175,6 +186,110 @@
       when: orphan_triggers | length > 0
       failed_when: tp_delete.json.error is defined
       changed_when: tp_delete.json.result is defined
+
+    - name: List the item prototypes on that rule
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.get
+          params:
+            discoveryids: ["{{ lld_lookup.json.result[0].itemid }}"]
+            output: ["itemid", "key_", "templateid", "status"]
+          id: 1
+      register: ip_lookup
+      check_mode: false
+      failed_when: ip_lookup.json.error is defined
+
+    - name: Select the orphaned item prototypes
+      ansible.builtin.set_fact:
+        orphan_items: >-
+          {{ ip_lookup.json.result
+             | selectattr('templateid', 'equalto', '0')
+             | selectattr('key_', 'search', pod_macro_marker)
+             | list }}
+
+    - name: Report the item prototypes that will be disabled
+      ansible.builtin.debug:
+        msg: >-
+          {{ ip_lookup.json.result | length }} item prototype(s);
+          {{ orphan_items | length }} orphaned →
+          {{ orphan_items | map(attribute='key_') | list }}
+
+    - name: Disable the orphaned item prototypes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.update
+          params: >-
+            {{ orphan_items
+               | selectattr('status', 'equalto', '0')
+               | map(attribute='itemid')
+               | map('community.general.dict_kv', 'itemid')
+               | map('combine', {'status': 1})
+               | list }}
+          id: 1
+      register: ip_disable
+      when: (orphan_items | selectattr('status', 'equalto', '0') | list | length) > 0
+      failed_when: ip_disable.json.error is defined
+      changed_when: ip_disable.json.result is defined
+
+    # Only once nothing references {#POD} any more. Reverting this while an
+    # enabled orphan prototype still used it would put the literal-key
+    # collision straight back.
+    - name: Re-read the template's pod discovery macro paths
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.get
+          params:
+            output: ["itemid"]
+            selectLLDMacroPaths: "extend"
+            templateids: ["{{ cluster_state_templateid }}"]
+            filter:
+              key_: ["{{ lld_key }}"]
+          id: 1
+      register: tpl_lld
+      check_mode: false
+      failed_when: >-
+        tpl_lld.json.error is defined
+        or (tpl_lld.json.result | default([]) | length) != 1
+
+    - name: Remove the now-unneeded macro path from the template
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.update
+          params:
+            itemid: "{{ tpl_lld.json.result[0].itemid }}"
+            lld_macro_paths: >-
+              {{ tpl_lld.json.result[0].lld_macro_paths
+                 | rejectattr('lld_macro', 'equalto', pod_macro) | list }}
+          id: 1
+      register: shim_revert
+      when: >-
+        pod_macro in (tpl_lld.json.result[0].lld_macro_paths | map(attribute='lld_macro') | list)
+      failed_when: shim_revert.json.error is defined
+      changed_when: shim_revert.json.result is defined
 
     - name: Confirm the end state
       ansible.builtin.uri:
