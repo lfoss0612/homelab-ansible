@@ -1,0 +1,128 @@
+---
+# Export the ZFS mirror's longhorn_backups dataset over NFS, so Longhorn can be
+# repointed at it.
+#
+# Longhorn's BackupTarget currently reads
+# nfs://10.0.5.5:/mnt/backups/longhorn - a directory on the 1.8 TB ext4 volume
+# that is 100% full with 0 bytes free. The intended destination,
+# /mnt/datastore/backup10tb/longhorn_backups on the ZFS mirror (7.08 TB
+# available, no quota), exists but is NOT in /etc/exports at all, so pointing
+# Longhorn at it before this runs would simply fail to mount.
+#
+# ADDITIVE, NOT TEMPLATED - deliberately. /etc/exports on pbs is not otherwise
+# Ansible-managed and already carries exports that three Proxmox hypervisors
+# depend on: /srv/nfs/template is mounted at /mnt/pve/template on pve, pve-ai
+# and pve-router right now. Rendering the whole file from a template would be
+# more declarative but puts those mounts one typo away from breaking, for no
+# benefit here. lineinfile adds one line and cannot disturb the others.
+#
+# Exported to 10.2.5.0/24 only - the Kubernetes node network, which is where
+# Longhorn runs. The old export also listed 10.0.3.0/24, but no host on that
+# network has an active NFS connection to pbs (checked via
+# /proc/fs/nfsd/clients and ss), so that is not reproduced here rather than
+# copied across without knowing why it was there.
+#
+# fsid=5 is the next free value. Existing real exports use 1-4 and 11-14; the
+# fsid=0 that shows up in a naive grep of this file comes from a COMMENTED-OUT
+# NFSv4 example on line 8, not a live export.
+#
+# no_root_squash matches every other export in this file and is required:
+# Longhorn's backup store is created and written as root. It is not a new
+# privilege for this host, but it is a real one - the export is read-write to
+# any root user on the k8s node network.
+#
+# Ownership needs no change: the new dataset is already root:root 0755, the
+# same as the old /mnt/backups/longhorn, and Longhorn creates the
+# backupstore/ subdirectory itself (0700 root:root on the old target).
+#
+# This play does NOT change Longhorn's BackupTarget - that is a cluster-side
+# change and belongs in homelab-gitops. It also does not migrate the 513 GB of
+# existing backups under /mnt/backups/longhorn/backupstore, which is a separate
+# decision: after the target moves, Longhorn no longer sees that history.
+#
+# Usage:
+#   ansible-playbook playbooks/pbs-export-longhorn-datastore.yml --check --diff
+#   ansible-playbook playbooks/pbs-export-longhorn-datastore.yml
+
+- name: Export the longhorn_backups dataset from pbs
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    longhorn_dataset_path: /mnt/datastore/backup10tb/longhorn_backups
+    longhorn_export_clients: "10.2.5.0/24(fsid=5,rw,sync,no_root_squash)"
+
+  tasks:
+    - name: Assert the dataset exists before exporting it
+      ansible.builtin.stat:
+        path: "{{ longhorn_dataset_path }}"
+      register: dataset_stat
+      failed_when: not (dataset_stat.stat.exists | default(false) and dataset_stat.stat.isdir | default(false))
+      changed_when: false
+
+    # Exporting a path that is not a mountpoint silently exports the PARENT
+    # filesystem's directory instead, which would put Longhorn's backups on the
+    # wrong volume with no error anywhere.
+    - name: Confirm it is actually a ZFS mountpoint, not just a directory
+      ansible.builtin.command: findmnt --noheadings --output SOURCE,FSTYPE --target "{{ longhorn_dataset_path }}"
+      register: dataset_mount
+      changed_when: false
+      failed_when: >-
+        dataset_mount.rc != 0
+        or 'zfs' not in dataset_mount.stdout
+        or 'longhorn_backups' not in dataset_mount.stdout
+
+    - name: Back up /etc/exports before touching it
+      ansible.builtin.copy:
+        src: /etc/exports
+        dest: "/etc/exports.bak-{{ ansible_date_time.date }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+
+    - name: Add the longhorn_backups export
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        # Anchored on the path at line start so a re-run updates the client
+        # list in place rather than appending a duplicate export.
+        regexp: '^{{ longhorn_dataset_path | regex_escape }}\s'
+        line: "{{ longhorn_dataset_path }} {{ longhorn_export_clients }}"
+        insertafter: '^# Backups'
+        owner: root
+        group: root
+        mode: "0644"
+        validate: "exportfs -s -f %s"
+      notify: reload nfs exports
+
+    - name: Apply now rather than waiting for the handler
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read back the active exports
+      ansible.builtin.command: exportfs -v
+      register: active_exports
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm the new export is live
+      ansible.builtin.assert:
+        that:
+          - longhorn_dataset_path in active_exports.stdout
+        fail_msg: >-
+          {{ longhorn_dataset_path }} is not in `exportfs -v` output after
+          reload. Longhorn cannot mount it. Output:
+          {{ active_exports.stdout }}
+        success_msg: "{{ longhorn_dataset_path }} is exported and live."
+      when: not ansible_check_mode
+
+    - name: Show the export table
+      ansible.builtin.debug:
+        msg: "{{ active_exports.stdout_lines }}"
+
+  handlers:
+    - name: reload nfs exports
+      # -ra re-exports everything from /etc/exports without dropping existing
+      # client mounts, so the three Proxmox hosts holding /mnt/pve/template are
+      # undisturbed.
+      ansible.builtin.command: exportfs -ra
