@@ -242,6 +242,25 @@ systemctl start openclaw-fleet-update-notify@failed.service
 journalctl -t openclaw-fleet-update-notify -n 20
 ```
 
+A hand-started `@failed` is detected as a test and **does not touch
+`last-failure`**. The notifier compares the outcome it was handed against the
+unit's real state: started by hand, `openclaw-fleet-update.service` sits at
+`result=success`/`exit_status=0`, because it never ran. Such a run is written
+to `last-test` instead, carrying an extra `manual_test=yes` line, and the
+journal says so explicitly.
+
+That distinction exists because this command used to destroy evidence. Before
+2026-08-25 the test wrote straight into `last-failure`, producing a file named
+`last-failure` that said `result=success` — and overwriting the real record of
+the last genuine failure. It happened for real: a test on 2026-08-24 wiped the
+2026-08-23 record, which had to be rebuilt from the journal. A genuine failure
+can never be mistaken for a test in the other direction, since `OnFailure=`
+only fires when the unit actually failed.
+
+The Zabbix value is still pushed on a test — exercising the trapper → item →
+trigger chain is the point — so expect the `last run FAILED` trigger to fire.
+It clears on the next successful run.
+
 ## Bumping the OpenClaw version
 
 The version is pinned by a human commit, not derived at runtime:

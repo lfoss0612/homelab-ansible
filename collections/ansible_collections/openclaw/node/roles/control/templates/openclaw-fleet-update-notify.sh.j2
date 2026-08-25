@@ -26,6 +26,7 @@ UNIT="${2:-{{ openclaw_control_unit }}.service}"
 
 STATE_DIR={{ openclaw_control_state_dir }}
 FAILURE_FILE="$STATE_DIR/last-failure"
+TEST_FILE="$STATE_DIR/last-test"
 ANSIBLE_DIR={{ openclaw_control_dir }}
 JOURNAL_LINES={{ openclaw_control_notify_journal_lines }}
 
@@ -59,17 +60,43 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 if [ "$OUTCOME" = failed ]; then
   result=$(systemctl show "$UNIT" -p Result --value 2>/dev/null)
   status=$(systemctl show "$UNIT" -p ExecMainStatus --value 2>/dev/null)
+
+  # Tell a real failure apart from a hand-started test. The README offers
+  #   systemctl start {{ openclaw_control_notify_unit }}@failed.service
+  # as the way to exercise this path without waiting for Sunday: that runs this
+  # script with OUTCOME=failed while $UNIT itself is sitting at
+  # result=success/status=0, because it never ran.
+  #
+  # Writing that into last-failure did two bad things. It recorded nonsense - a
+  # file named last-failure containing "result=success" - and it DESTROYED the
+  # record of the last real failure. That is not hypothetical: on 2026-08-24 a
+  # test overwrote the genuine 2026-08-23 record, which had to be rebuilt from
+  # the journal afterwards. The durable evidence was the one thing this file
+  # exists to be.
+  #
+  # A genuine failure can never look like this, because OnFailure= only fires
+  # when the unit actually failed - result would be exit-code, signal, timeout
+  # or similar, never success.
+  record_file="$FAILURE_FILE"
+  synthetic=no
+  if [ "${result:-}" = success ] && [ "${status:-}" = 0 ]; then
+    synthetic=yes
+    record_file="$TEST_FILE"
+    log "NOTE: $UNIT did not actually fail (result=success, exit_status=0) — treating this as a manual test. Writing $TEST_FILE and leaving $FAILURE_FILE untouched."
+  fi
+
   {
     printf 'timestamp=%s\n' "$(date -Iseconds)"
     printf 'unit=%s\n' "$UNIT"
     printf 'result=%s\n' "${result:-unknown}"
     printf 'exit_status=%s\n' "${status:-unknown}"
     printf 'commit=%s\n' "$commit"
+    [ "$synthetic" = yes ] && printf 'manual_test=yes\n'
     printf -- '--- last %s journal lines ---\n' "$JOURNAL_LINES"
     journalctl -u "$UNIT" -n "$JOURNAL_LINES" --no-pager 2>/dev/null
-  } > "$FAILURE_FILE" 2>/dev/null \
-    && log "recorded $FAILURE_FILE" \
-    || log "WARNING: could not write $FAILURE_FILE"
+  } > "$record_file" 2>/dev/null \
+    && log "recorded $record_file" \
+    || log "WARNING: could not write $record_file"
 fi
 
 # --- Channel: Zabbix trapper ------------------------------------------------
@@ -92,6 +119,12 @@ if ! command -v zabbix_sender >/dev/null 2>&1; then
 elif [ -z "$zabbix_conf" ]; then
   log "WARNING: no readable agent config in ({{ openclaw_control_notify_zabbix_confs | join(', ') }}) — skipping the zabbix channel"
 else
+  # A manual test still pushes, because exercising the trapper -> item ->
+  # trigger chain is the entire point of running it. The value is
+  # self-correcting: the next real run overwrites it. Logged loudly so a 1 in
+  # Zabbix can be traced back to a test rather than mistaken for a real
+  # failure.
+  [ "${synthetic:-no}" = yes ] && log "NOTE: the value below is from a manual test, not a real run."
   zabbix_out=$(zabbix_sender -c "$zabbix_conf" -k "$zabbix_key" -o "$zabbix_value" 2>&1)
   log "zabbix_sender($zabbix_key=$zabbix_value): $zabbix_out"
   # The server returns success for the CONNECTION even when it throws the value
