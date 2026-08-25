@@ -150,10 +150,20 @@
                   - {type: 4, name: "itemid.0", value: "{{ agg_item.json.result[0].itemid }}"}
                   - {type: 0, name: "show.0", value: "1"}     # description
                   - {type: 0, name: "show.1", value: "2"}     # value
-                  - {type: 0, name: "show.2", value: "3"}     # time
+                  # No "Time" element: it needs its own time_* sizing fields
+                  # to validate, and the problems pane already carries timing.
                   - {type: 1, name: "description", value: "0 = converged   1 = FAILED"}
+                  # decimal_size is NOT optional next to value_size on a NUMERIC
+                  # item: without it the widget renders "Widget is not fully
+                  # configured" and shows nothing, even though the item has data.
+                  # The character-valued Gateway tile below has no decimals to
+                  # size, which is why it worked while this one did not.
                   - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "desc_v_pos", value: "0"}
+                  - {type: 0, name: "desc_h_pos", value: "0"}
+                  - {type: 0, name: "value_h_pos", value: "0"}
+                  - {type: 0, name: "units_show", value: "0"}
                   # Colour is the whole point of this tile: green at 0, red at 1.
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
                   - {type: 1, name: "thresholds.0.threshold", value: "0"}
@@ -218,6 +228,11 @@
                   - {type: 0, name: "columns.2.data", value: "1"}
                   - {type: 1, name: "columns.2.item", value: "{{ version_item_name }}"}
                   - {type: 0, name: "column", value: "1"}
+                  # Host limit. The default is 10, which silently truncated a
+                  # 14-host fleet - pbs and all three k8s nodes simply were not
+                  # in the table, with nothing on screen to say rows were
+                  # missing. Set well above the fleet size.
+                  - {type: 0, name: "count", value: "50"}
                   - {type: 1, name: "reference", value: "FLTTH"}
 
               - type: svggraph
