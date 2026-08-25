@@ -1,0 +1,170 @@
+---
+# Stop Proxmox VM *templates* being discovered as if they were VMs.
+#
+# `VM [pve/Deb13-tplt (qemu/110)]: Not running` had been firing for 131 days.
+# It is not a fault: a Proxmox VM template is never running, so the trigger is
+# correct and permanent. vmid 110 used to be the `openclaw` VM and was later
+# repurposed as a Debian 13 template; the event still carries the old name
+# because event names freeze at creation, while the trigger itself was renamed
+# long ago - which is why this looked like a dead VM rather than a template.
+#
+# QEMU discovery filters on `{#RESOURCE.TYPE}` matching `^qemu$`, and Proxmox
+# reports templates as `type: qemu` as well, so nothing distinguished them.
+#
+# Filtering on the `template` field rather than the name, because a name match
+# ("-tplt$" or similar) breaks the moment someone names a template differently.
+# Verified against the live API before writing this - /cluster/resources returns
+# the field for EVERY qemu entry, 0 for real VMs and 1 for the template, so the
+# filter is unambiguous and cannot accidentally exclude a normal VM through the
+# field being absent:
+#
+#     vmid  name            type   template
+#      104  desktop         qemu     0
+#      106  OPNsense        qemu     0
+#      110  Deb13-tplt      qemu     1     <-- the only one
+#      111  openclaw        qemu     0
+#
+# Also clears the last 2 unsupported items on pve-router (`Disk read/write,
+# rate` for qemu/110), which never had data because a template has no running
+# disk I/O to report.
+#
+# LXC discovery is untouched: Proxmox supports container templates too, but
+# there are only two LXCs here (cockpit, pdm) and neither is one. Deliberate,
+# not overlooked.
+#
+# VENDOR TEMPLATE EDIT - a re-import of "Proxmox VE by HTTP" reverts this and
+# the phantom VM comes back. Idempotent, so re-run after any template import.
+#
+# Note the discovered items for qemu/110 do not vanish the instant this
+# applies: LLD stops rediscovering them, and they then age out under the rule's
+# lost-resource policy. The open problem also needs Zabbix's housekeeper to
+# clear, which runs roughly hourly.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-filter-qemu-templates.yml --check --diff
+#   ansible-playbook playbooks/zabbix-filter-qemu-templates.yml
+
+- name: Exclude Proxmox VM templates from QEMU discovery
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    proxmox_template: "Proxmox VE by HTTP"
+    lld_name: "QEMU discovery"
+
+    # !unsafe: "{#" opens a Jinja comment, so a bare LLD macro fails to template
+    # with "Missing end of comment tag".
+    tmpl_macro: !unsafe "{#QEMU.TEMPLATE}"
+    tmpl_path: "$.template"
+
+  tasks:
+    - name: Find the rule on the template itself
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.get
+          params:
+            output: ["itemid", "name", "templateid"]
+            selectLLDMacroPaths: "extend"
+            selectFilter: "extend"
+            selectHosts: ["host"]
+            search:
+              name: "{{ lld_name }}"
+          id: 1
+      register: lld_lookup
+      check_mode: false
+      failed_when: lld_lookup.json.error is defined
+
+    # templateid == "0" AND owned by the template host: the definition, not an
+    # inherited copy on a monitored host. Editing an inherited copy is rejected;
+    # the change has to be made on the template to reach all three PVE hosts.
+    - name: Select the template's own rule
+      ansible.builtin.set_fact:
+        tpl_lld: >-
+          {{ (lld_lookup.json.result
+              | selectattr('templateid', 'equalto', '0')
+              | selectattr('hosts.0.host', 'equalto', proxmox_template)
+              | list | first) | default({}, true) }}
+
+    - name: Assert it was found
+      ansible.builtin.assert:
+        that:
+          - tpl_lld.itemid is defined
+        fail_msg: "No '{{ lld_name }}' rule found on template '{{ proxmox_template }}'."
+        success_msg: "Found {{ lld_name }} on {{ proxmox_template }} (itemid {{ tpl_lld.itemid | default('?') }})."
+
+    - name: Report current state
+      ansible.builtin.debug:
+        msg: >-
+          macros: {{ tpl_lld.lld_macro_paths | map(attribute='lld_macro') | list }};
+          filter conditions:
+          {{ tpl_lld.filter.conditions | map(attribute='macro') | list }}
+
+    # lld_macro_paths and filter both REPLACE wholesale, so existing entries
+    # have to be sent back alongside the additions or they are silently dropped.
+    - name: Add the template macro path and exclude templates
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.update
+          params:
+            itemid: "{{ tpl_lld.itemid }}"
+            lld_macro_paths: >-
+              {{ tpl_lld.lld_macro_paths
+                 + [{'lld_macro': tmpl_macro, 'path': tmpl_path}] }}
+            filter:
+              # evaltype 1 = And/Or. Two conditions on different macros are
+              # ANDed, so this narrows discovery rather than widening it.
+              evaltype: 1
+              conditions: >-
+                {{ tpl_lld.filter.conditions
+                   + [{'macro': tmpl_macro, 'operator': 9, 'value': '^1$', 'formulaid': 'B'}] }}
+          id: 1
+      register: lld_update
+      when: tmpl_macro not in (tpl_lld.lld_macro_paths | map(attribute='lld_macro') | list)
+      failed_when: lld_update.json.error is defined
+      changed_when: lld_update.json.result is defined
+
+    - name: Re-read to confirm
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.get
+          params:
+            itemids: ["{{ tpl_lld.itemid }}"]
+            output: ["itemid"]
+            selectLLDMacroPaths: "extend"
+            selectFilter: "extend"
+          id: 1
+      register: lld_verify
+      check_mode: false
+      failed_when: lld_verify.json.error is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          macros now
+          {{ lld_verify.json.result[0].lld_macro_paths | map(attribute='lld_macro') | list }};
+          filter now
+          {{ lld_verify.json.result[0].filter.conditions
+             | map(attribute='macro') | list }}.
+          Discovered qemu/110 items age out under the rule's lost-resource
+          policy; the open problem clears when the housekeeper next runs.
