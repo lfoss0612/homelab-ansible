@@ -67,3 +67,13 @@ openclaw_networkd_migrate_from_nm: false
 # Interface to migrate when openclaw_networkd_migrate_from_nm is set. Defaults
 # to the host's own default-route interface.
 openclaw_networkd_migrate_iface: "{{ ansible_default_ipv4.interface }}"
+
+# --- Zabbix: installed-version reporting -------------------------------------
+# Publishes the openclaw version actually installed on this host as an agent
+# UserParameter, so version drift is visible without depending on a convergence
+# run having succeeded — the failure mode described in openclaw-fleet-update.sh.
+# Skipped automatically on hosts with no agent2 include directory (the k8s
+# nodes, which are covered by the in-cluster DaemonSet instead).
+openclaw_zabbix_version_report: true
+openclaw_zabbix_version_key: openclaw.version
+openclaw_zabbix_agent2_include_dir: /etc/zabbix/zabbix_agent2.d

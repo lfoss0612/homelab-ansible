@@ -1,0 +1,218 @@
+---
+# Create the Zabbix item + drift trigger for the installed openclaw version.
+#
+# The agent-side half is the `common` role, which drops a UserParameter
+# (openclaw.version) reading the version out of npm's package.json. This
+# playbook creates the item that collects it, on every fleet host.
+#
+# Why this exists rather than pushing the version from the convergence run:
+# a push only refreshes when convergence succeeds, which is exactly the case
+# that fails. An agent-polled item reports live truth even while the fleet
+# update is broken, and also catches a version changed outside Ansible - the
+# drift class that left the fleet un-upgraded for two months (see the header
+# of openclaw-fleet-update.sh).
+#
+# The trigger compares each host against the pin in group_vars/openclaw.yml,
+# read at run time rather than duplicated here, so bumping the pin and
+# re-running this play is all that is needed - there is no second place to
+# forget. It is a CHARACTER-FOR-CHARACTER comparison against the npm version
+# string, not a semver comparison: Zabbix's trigger language has no version
+# ordering, and "not equal to the pin" is the condition worth alerting on
+# anyway, in either direction.
+#
+# All 14 hosts get the item, including the three k8s nodes - their values come
+# from the in-cluster DaemonSet reading the same file through /hostfs/root, so
+# the item is identical from Zabbix's point of view. That half lives in
+# homelab-gitops; until it is deployed those three items simply stay
+# unsupported, which is visible rather than silent.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-openclaw-version-item.yml --check --diff
+#   ansible-playbook playbooks/zabbix-openclaw-version-item.yml
+
+- name: Create the openclaw version item and drift trigger in Zabbix
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    # Must match openclaw_zabbix_version_key in the common role.
+    version_key: "openclaw.version"
+    version_item_name: "OpenClaw: installed version"
+
+  tasks:
+    - name: Read the pinned openclaw version from group_vars
+      ansible.builtin.set_fact:
+        openclaw_pin: >-
+          {{ (lookup('ansible.builtin.file', playbook_dir + '/../group_vars/openclaw.yml')
+              | from_yaml).openclaw_version }}
+
+    - name: Show the pin this run will enforce
+      ansible.builtin.debug:
+        msg: "Pinned openclaw_version = {{ openclaw_pin }}"
+
+    - name: Resolve the fleet host list from inventory
+      ansible.builtin.set_fact:
+        fleet_hosts: >-
+          {{ ((groups['openclaw'] | default([]))
+              + (groups['openclaw_control'] | default([]))) | unique | sort }}
+
+    - name: Look up the Zabbix hosts for the fleet
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ fleet_hosts }}"
+            selectItems: ["key_"]
+          id: 1
+      register: fleet_lookup
+      check_mode: false
+      failed_when: fleet_lookup.json.error is defined
+
+    - name: Create the version item where it is missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "{{ version_item_name }}"
+            key_: "{{ version_key }}"
+            type: 0             # 0 = Zabbix agent (passive)
+            value_type: 1       # 1 = Character
+            # Hourly is plenty for something that changes weekly at most, and
+            # keeps 14 extra node spawns off the poller.
+            delay: "1h"
+            history: "400d"
+            description: >-
+              npm-installed openclaw version, read from package.json by an
+              agent UserParameter (openclaw.node.common role). On the k8s
+              nodes this comes from the in-cluster DaemonSet reading the host
+              filesystem through /hostfs/root.
+            preprocessing:
+              # Discard unchanged values: this is a weekly-at-most string, and
+              # storing 24 identical values a day for 400d serves nobody.
+              - type: 20        # Discard unchanged with heartbeat
+                params: "1d"
+                error_handler: 0
+                error_handler_params: ""
+          id: 1
+      register: version_create
+      loop: "{{ fleet_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.host }}"
+      when: version_key not in (item['items'] | map(attribute='key_') | list)
+      failed_when: version_create.json.error is defined
+      changed_when: version_create.json.result is defined
+
+    - name: Check which drift triggers already exist
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description", "expression"]
+            hostids: "{{ fleet_lookup.json.result | map(attribute='hostid') | list }}"
+            search:
+              description: "OpenClaw version drift"
+            expandExpression: true
+          id: 1
+      register: drift_lookup
+      check_mode: false
+      failed_when: drift_lookup.json.error is defined
+
+    # Deleted and recreated rather than updated when the pin moves: the pin is
+    # baked into the expression, and trigger.update on an expression change is
+    # fiddlier than a clean replace for a trigger that holds no state worth
+    # keeping.
+    - name: Remove drift triggers that no longer match the pin
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.delete
+          params: "{{ stale_drift_triggerids }}"
+          id: 1
+      vars:
+        stale_drift_triggerids: >-
+          {{ drift_lookup.json.result
+             | rejectattr('expression', 'search', openclaw_pin | regex_escape)
+             | map(attribute='triggerid') | list }}
+      register: drift_delete
+      when: stale_drift_triggerids | length > 0
+      failed_when: drift_delete.json.error is defined
+      changed_when: drift_delete.json.result is defined
+
+    - name: Create the version drift trigger
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "OpenClaw version drift on {HOST.NAME}"
+            # nodata() guard so a host that has never reported does not read as
+            # drift - that is an unsupported item, a different problem with a
+            # different fix.
+            expression: >-
+              last(/{{ item.host }}/{{ version_key }})<>"{{ openclaw_pin }}"
+              and nodata(/{{ item.host }}/{{ version_key }},2h)=0
+            priority: 2
+            manual_close: 0
+            comments: >-
+              Installed openclaw version does not match the pin
+              ({{ openclaw_pin }}) in group_vars/openclaw.yml. Either the
+              weekly convergence has not reached this host, or something
+              changed it outside Ansible. Re-run
+              playbooks/update-openclaw.yml. If the pin itself was bumped,
+              re-run playbooks/zabbix-openclaw-version-item.yml to move the
+              triggers with it.
+          id: 1
+      register: drift_create
+      loop: "{{ fleet_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.host }}"
+      when: >-
+        item.host not in (drift_lookup.json.result
+          | selectattr('expression', 'search', openclaw_pin | regex_escape)
+          | map(attribute='expression') | join(' '))
+      failed_when: >-
+        drift_create.json.error is defined
+        and 'already exists' not in (drift_create.json.error.data | default(''))
+      changed_when: drift_create.json.result is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          Item {{ version_key }} on {{ fleet_lookup.json.result | length }}
+          fleet hosts, drift triggers pinned to {{ openclaw_pin }}.
+          The three k8s nodes stay unsupported until the DaemonSet
+          UserParameter lands in homelab-gitops.

@@ -32,3 +32,14 @@
     name: systemd-resolved.service
     state: restarted
   tags: dns
+
+# agent2 parses UserParameters at startup, so a new drop-in does nothing until
+# the agent restarts. Tagged to match the task that notifies it — handlers are
+# tag-filtered too, so an untagged handler is silently dropped from a
+# `--tags zabbix` run even when notified (same trap as the openclaw units
+# handler above).
+- name: restart zabbix agent2
+  ansible.builtin.systemd:
+    name: zabbix-agent2.service
+    state: restarted
+  tags: zabbix

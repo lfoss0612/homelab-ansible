@@ -724,3 +724,31 @@
       HAProxy migration bug). Not auto-removed; review by hand.
   when: (openclaw_hosts_self_ref.stdout_lines | default([])) | length > 0
   tags: dns
+
+# --- Zabbix: report the installed openclaw version ---------------------------
+# See the template header for why this reads package.json rather than running
+# the CLI, and why the path is templated rather than hardcoded.
+- name: Check for a host-level Zabbix agent2 include directory
+  ansible.builtin.stat:
+    path: "{{ openclaw_zabbix_agent2_include_dir }}"
+  register: openclaw_zabbix_include_dir
+  when: openclaw_zabbix_version_report
+  tags: zabbix
+
+# Guarded on the include directory rather than on a host list: the k8s nodes
+# have no host-level agent (a3c4e75), and hardcoding their names here would go
+# stale the moment the cluster gains or loses one.
+- name: Publish the installed openclaw version as a Zabbix UserParameter
+  ansible.builtin.template:
+    src: zabbix-openclaw-version.conf.j2
+    dest: "{{ openclaw_zabbix_agent2_include_dir }}/openclaw-version.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - openclaw_zabbix_version_report
+    - openclaw_zabbix_include_dir.stat is defined
+    - openclaw_zabbix_include_dir.stat.exists | default(false)
+    - openclaw_zabbix_include_dir.stat.isdir | default(false)
+  notify: restart zabbix agent2
+  tags: zabbix
