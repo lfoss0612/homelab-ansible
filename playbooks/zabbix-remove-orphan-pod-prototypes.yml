@@ -1,0 +1,188 @@
+---
+# Delete the orphaned pod TRIGGER prototypes left on k8s-master.home.lan by
+# unlinking "Kubernetes nodes by HTTP" without "clear".
+#
+# Corrects an earlier misdiagnosis. The duplicate pod triggers were blamed on
+# the "Kubernetes cluster state by HTTP" template being a merged hybrid. It is
+# not - inspected directly once prototype permissions were granted, that
+# template is clean: 17 item prototypes all keyed on {#NAME}, and exactly 2
+# trigger prototypes, both correct.
+#
+# The orphans live on the HOST's copy of the discovery rule. Unlinking a
+# template WITHOUT "clear" leaves its inherited objects in place and merely
+# strips their templateid, turning them into host-local orphans that no
+# template owns and no template update will ever correct. On k8s-master's
+# kube.pod.discovery that left:
+#
+#   8 item prototypes    keyed on {#POD}          (templateid=0)
+#   2 trigger prototypes named "Node [{#NODE}]"   (templateid=0)
+#
+# {#POD} and {#NODE} are macros the CURRENT rule never declares, which is why
+# both carried unresolved literals. That is the same root cause behind the
+# {#POD} item bug fixed in zabbix-fix-pod-discovery.yml - not two defects but
+# one, seen from two directions.
+#
+# Scope here is the TRIGGER prototypes only, because that deletion is
+# loss-free: both duplicate a "Kubernetes cluster state:" trigger that already
+# covers the same condition, so removing them stops a crash-looping pod raising
+# two problems instead of one. Deleting them at the prototype level - rather
+# than disabling the 240 discovered triggers as
+# zabbix-disable-duplicate-pod-triggers.yml had to before permissions were
+# granted - also covers every pod discovered from now on, which that
+# workaround could not.
+#
+# The 8 orphaned ITEM prototypes are deliberately NOT touched here. Six of them
+# duplicate template items under different key names, but two do not:
+# kube.pod.conditions.initialized and kube.pod.uptime have no equivalent in the
+# cluster-state template, so deleting them loses monitoring rather than noise.
+# That is a judgement call for a human, and it is coupled to the {#POD} macro
+# path added to the template - the orphan items need it, so it cannot be
+# reverted while they remain.
+#
+# Deletion, not disable: an orphan prototype belongs to nothing, will never be
+# corrected by a template update, and cannot be reinstated by re-linking.
+# Leaving it disabled would preserve a broken object forever with no owner.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-remove-orphan-pod-prototypes.yml --check --diff
+#   ansible-playbook playbooks/zabbix-remove-orphan-pod-prototypes.yml
+
+- name: Remove orphaned pod trigger prototypes
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    target_host: "k8s-master.home.lan"
+    lld_key: "kube.pod.discovery"
+
+  tasks:
+    # hostids, not host. discoveryrule.get's `host` parameter does NOT filter -
+    # it returns the rule from every template that defines the same key as well
+    # as the host's own copy, so selecting on it silently picks a template's
+    # rule and edits the wrong object.
+    - name: Resolve the host id
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: ["{{ target_host }}"]
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Find the host's pod discovery rule
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            filter:
+              key_: ["{{ lld_key }}"]
+          id: 1
+      register: lld_lookup
+      check_mode: false
+      failed_when: >-
+        lld_lookup.json.error is defined
+        or (lld_lookup.json.result | default([]) | length) != 1
+
+    - name: List the trigger prototypes on that rule
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.get
+          params:
+            discoveryids: ["{{ lld_lookup.json.result[0].itemid }}"]
+            output: ["triggerid", "description", "templateid"]
+          id: 1
+      register: tp_lookup
+      check_mode: false
+      failed_when: tp_lookup.json.error is defined
+
+    # templateid == "0" is the orphan marker: a prototype no template owns.
+    # Both conditions are required - an inherited prototype must never be
+    # deleted here, and a host-local one that resolves its macros correctly
+    # would be a deliberate local addition rather than unlink debris.
+    - name: Select the orphans
+      ansible.builtin.set_fact:
+        orphan_triggers: >-
+          {{ tp_lookup.json.result
+             | selectattr('templateid', 'equalto', '0')
+             | selectattr('description', 'search', 'NODE')
+             | list }}
+
+    - name: Report what will be deleted
+      ansible.builtin.debug:
+        msg: >-
+          {{ tp_lookup.json.result | length }} trigger prototype(s) on
+          {{ target_host }}/{{ lld_key }};
+          {{ orphan_triggers | length }} orphaned (templateid=0, unresolved macro) →
+          {{ orphan_triggers | map(attribute='description') | map('truncate', 60) | list }}
+
+    - name: Delete the orphaned trigger prototypes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.delete
+          params: "{{ orphan_triggers | map(attribute='triggerid') | list }}"
+          id: 1
+      register: tp_delete
+      when: orphan_triggers | length > 0
+      failed_when: tp_delete.json.error is defined
+      changed_when: tp_delete.json.result is defined
+
+    - name: Confirm the end state
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.get
+          params:
+            discoveryids: ["{{ lld_lookup.json.result[0].itemid }}"]
+            output: ["triggerid", "description", "templateid"]
+          id: 1
+      register: tp_verify
+      check_mode: false
+      failed_when: tp_verify.json.error is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          {{ tp_verify.json.result | length }} trigger prototype(s) remain,
+          {{ tp_verify.json.result | selectattr('templateid', 'equalto', '0') | list | length }}
+          orphaned (expected 0). Discovered triggers for the deleted prototypes
+          are removed by Zabbix along with them.
