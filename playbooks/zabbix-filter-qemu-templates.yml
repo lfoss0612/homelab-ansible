@@ -129,9 +129,17 @@
               # evaltype 1 = And/Or. Two conditions on different macros are
               # ANDed, so this narrows discovery rather than widening it.
               evaltype: 1
+              # formulaid must be ABSENT under evaltype 1 - Zabbix assigns them
+              # itself, and only a custom expression (evaltype 3) accepts them.
+              # discoveryrule.get RETURNS formulaid on every condition, so the
+              # existing ones have to be stripped on the way back in or the
+              # update fails with 'value must be empty'.
               conditions: >-
-                {{ tpl_lld.filter.conditions
-                   + [{'macro': tmpl_macro, 'operator': 9, 'value': '^1$', 'formulaid': 'B'}] }}
+                {{ (tpl_lld.filter.conditions
+                    | map('dict2items')
+                    | map('rejectattr', 'key', 'equalto', 'formulaid')
+                    | map('items2dict') | list)
+                   + [{'macro': tmpl_macro, 'operator': 9, 'value': '^1$'}] }}
           id: 1
       register: lld_update
       when: tmpl_macro not in (tpl_lld.lld_macro_paths | map(attribute='lld_macro') | list)
