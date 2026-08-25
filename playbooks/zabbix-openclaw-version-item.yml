@@ -43,11 +43,14 @@
     version_item_name: "OpenClaw: installed version"
 
   tasks:
-    - name: Read the pinned openclaw version from group_vars
+    # Read through hostvars rather than parsing group_vars/openclaw.yml
+    # directly: that file carries a !vault-tagged gateway token, and from_yaml
+    # cannot construct the !vault tag. hostvars also gives the value Ansible
+    # actually resolved, including any host_vars override, rather than the
+    # literal text of one file.
+    - name: Read the pinned openclaw version
       ansible.builtin.set_fact:
-        openclaw_pin: >-
-          {{ (lookup('ansible.builtin.file', playbook_dir + '/../group_vars/openclaw.yml')
-              | from_yaml).openclaw_version }}
+        openclaw_pin: "{{ hostvars[groups['openclaw'] | first].openclaw_version }}"
 
     - name: Show the pin this run will enforce
       ansible.builtin.debug:
