@@ -77,6 +77,9 @@
             filter:
               host: "{{ fleet_hosts }}"
             selectItems: ["key_"]
+            # A passive agent item (type 0) is bound to an interface and
+            # item.create refuses without one.
+            selectInterfaces: ["interfaceid", "type", "main"]
           id: 1
       register: fleet_lookup
       check_mode: false
@@ -94,6 +97,11 @@
           method: item.create
           params:
             hostid: "{{ item.hostid }}"
+            # The host's main agent interface (type 1). Required for passive
+            # agent items; item.create fails with "interfaceid is missing".
+            interfaceid: >-
+              {{ (item.interfaces | selectattr('type', 'equalto', '1')
+                  | selectattr('main', 'equalto', '1') | first).interfaceid }}
             name: "{{ version_item_name }}"
             key_: "{{ version_key }}"
             type: 0             # 0 = Zabbix agent (passive)
@@ -119,7 +127,10 @@
       loop: "{{ fleet_lookup.json.result }}"
       loop_control:
         label: "{{ item.host }}"
-      when: version_key not in (item['items'] | map(attribute='key_') | list)
+      when:
+        - version_key not in (item['items'] | map(attribute='key_') | list)
+        # Skip a host with no agent interface rather than failing the run.
+        - (item.interfaces | selectattr('type', 'equalto', '1') | list) | length > 0
       failed_when: version_create.json.error is defined
       changed_when: version_create.json.result is defined
 
