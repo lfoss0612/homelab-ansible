@@ -1,0 +1,177 @@
+---
+# Disable the six Kubelet-template items that scrape the kubelet's /pods
+# endpoint, because that endpoint is the only thing left needing `nodes/proxy`
+# and the data it returns is already collected elsewhere.
+#
+# Context. The `zabbix-monitoring` ServiceAccount was granted `nodes/metrics`
+# on 2026-08-25 (homelab-gitops), which unblocked the Kubernetes Kubelet
+# template's metrics scraping and, with it, per-container CPU and memory -
+# the thing kube-state-metrics fundamentally cannot provide, since it reports
+# what a pod REQUESTS rather than what it uses. That took the Kubelet hosts
+# from 30 unsupported items to 15.
+#
+# The remaining 15 are five dependent items on all three discovered Kubelet
+# hosts, all fed by one master:
+#
+#   master  kube.pods  ->  {$KUBE.KUBELET.URL}{$KUBE.KUBELET.PODS.ENDPOINT}
+#   deps    kube.kubelet.pods.running
+#           kube.kubelet.containers.ready / started / restarts
+#           kube.kublet.containers.terminated   (sic - Zabbix's own typo)
+#
+# /pods is a Kubernetes API surface rather than a metrics endpoint, so the
+# kubelet authorises it against `nodes/proxy`, confirmed by SubjectAccessReview
+# (allowed: false). Granting that is a materially bigger step than
+# `nodes/metrics`: even with only `get`, `nodes/proxy` permits GET against ANY
+# kubelet path - /logs, /configz, /runningpods - not just metrics. That is a
+# real move away from the read-only posture the RBAC file is built around.
+#
+# And it would buy nothing. These five are per-NODE pod counts; the
+# "Kubernetes cluster state by HTTP" template already reports the same
+# information per POD across all 120 of them, plus the kube.pods.* aggregates
+# added for the Kubernetes Pods dashboard. Paying for duplicate data with a
+# broad permission is the wrong trade.
+#
+# Disabling the master as well as the dependents is deliberate: leaving it
+# enabled would keep one HTTP request per host per interval hammering an
+# endpoint that answers 403 every time, for values nothing reads.
+#
+# Done on the TEMPLATE, so it propagates to all three discovered Kubelet hosts
+# and to any node added later. Vendor template edit, so a re-import reverts it;
+# the play is idempotent, re-run afterwards.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-disable-kubelet-pods-items.yml --check --diff
+#   ansible-playbook playbooks/zabbix-disable-kubelet-pods-items.yml
+
+- name: Disable the Kubelet /pods items
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    kubelet_template: "Kubernetes Kubelet by HTTP"
+    pods_master_key: "kube.pods"
+
+  tasks:
+    - name: Resolve the Kubelet template
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: template.get
+          params:
+            output: ["templateid", "name"]
+            filter:
+              name: ["{{ kubelet_template }}"]
+          id: 1
+      register: tpl_lookup
+      check_mode: false
+      failed_when: >-
+        tpl_lookup.json.error is defined
+        or (tpl_lookup.json.result | default([]) | length) != 1
+
+    - name: List the template's items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            templateids: ["{{ tpl_lookup.json.result[0].templateid }}"]
+            output: ["itemid", "key_", "status", "master_itemid", "type"]
+          id: 1
+      register: tpl_items
+      check_mode: false
+      failed_when: tpl_items.json.error is defined
+
+    # Selected by dependency on the /pods master rather than by a hardcoded key
+    # list, so a template update that renames or adds a dependent is still
+    # covered. One of the five carries a typo in Zabbix's own shipped key
+    # ("kublet"), which a key list would be easy to get wrong.
+    - name: Select the /pods master and everything depending on it
+      ansible.builtin.set_fact:
+        pods_master: >-
+          {{ (tpl_items.json.result
+              | selectattr('key_', 'equalto', pods_master_key)
+              | list | first) | default({}, true) }}
+
+    - name: Select the items to disable
+      ansible.builtin.set_fact:
+        to_disable: >-
+          {{ (tpl_items.json.result
+              | selectattr('master_itemid', 'equalto', pods_master.itemid)
+              | list)
+             + [pods_master] }}
+      when: pods_master.itemid is defined
+
+    - name: Report what will change
+      ansible.builtin.debug:
+        msg: >-
+          {{ to_disable | default([]) | length }} item(s) on
+          {{ kubelet_template }}:
+          {{ to_disable | default([]) | map(attribute='key_') | list }};
+          already disabled:
+          {{ to_disable | default([]) | selectattr('status', 'equalto', '1') | list | length }}
+
+    - name: Disable them
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.update
+          params: >-
+            {{ to_disable
+               | selectattr('status', 'equalto', '0')
+               | map(attribute='itemid')
+               | map('community.general.dict_kv', 'itemid')
+               | map('combine', {'status': 1})
+               | list }}
+          id: 1
+      register: disable_result
+      when: >-
+        (to_disable | default([]) | selectattr('status', 'equalto', '0') | list | length) > 0
+      failed_when: disable_result.json.error is defined
+      changed_when: disable_result.json.result is defined
+
+    - name: Confirm on the discovered Kubelet hosts
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "state"]
+            selectHosts: ["host"]
+            filter:
+              state: 1
+            search:
+              error: "Forbidden"
+          id: 1
+      register: fb_verify
+      check_mode: false
+      failed_when: fb_verify.json.error is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          Forbidden items remaining fleet-wide:
+          {{ fb_verify.json.result | length }} (expected 0).
+          Per-container CPU and memory continue to collect via nodes/metrics.
