@@ -1,0 +1,166 @@
+---
+# Repoint dashboard widgets that reference a Zabbix host BY NAME after that
+# host has been renamed.
+#
+# Why this is needed at all: Zabbix widgets reference hosts two different ways,
+# and only one survives a rename.
+#
+#   - hostids.N / problems widget  -> numeric hostid, survives a rename
+#   - ds.N.hosts.N, problemhosts.N -> a host NAME PATTERN, silently matches
+#                                     nothing once the host is renamed
+#
+# Nothing errors. The graph just draws an empty axis, which looks exactly like
+# "this host has no data" rather than "this widget points at a host that does
+# not exist". Found 2026-08-25: hostid 10084, the stock "Zabbix server" host,
+# had been renamed to zabbix.home.lan so its name matched the server's actual
+# hostname - correct in itself - which blanked every graph on the shipped
+# "Zabbix server health" dashboard AND two on "Global view", while the items
+# behind them were collecting normally seconds apart. The problems widget on
+# the same dashboard kept working, because it references hostid 10084. That
+# split - problems pane fine, every graph empty - is the fingerprint of a
+# rename rather than of broken collection.
+#
+# Scope is deliberately narrow: only fields whose NAME marks them a host
+# reference are rewritten, and only where the value matches old_host_name
+# exactly. Widget titles such as "Zabbix server problems" are a widget `name`
+# attribute rather than a field value and are left alone; a blanket search and
+# replace over the dashboard JSON would have mangled them.
+#
+# These are Zabbix-shipped dashboards, so a future upgrade may reset them.
+# Re-running this play fixes them again; it is idempotent and reports zero
+# changes when nothing matches.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-rehost-dashboards.yml --check --diff
+#   ansible-playbook playbooks/zabbix-rehost-dashboards.yml
+#   ansible-playbook playbooks/zabbix-rehost-dashboards.yml \
+#     -e old_host_name='Old name' -e new_host_name='New name'
+
+- name: Repoint dashboard host references after a host rename
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    old_host_name: "Zabbix server"
+    new_host_name: "zabbix.home.lan"
+
+  tasks:
+    - name: Confirm the new host name actually exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: ["{{ new_host_name }}"]
+          id: 1
+      register: new_host_check
+      check_mode: false
+      failed_when: >-
+        new_host_check.json.error is defined
+        or (new_host_check.json.result | default([]) | length) != 1
+      # Fail loudly rather than rewriting 20 references to a second name that
+      # also matches nothing.
+
+    - name: Fetch every dashboard with its widgets
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: "extend"
+            selectPages: "extend"
+          id: 1
+      register: dash_all
+      check_mode: false
+      failed_when: dash_all.json.error is defined
+
+    - name: Identify dashboards holding stale host references
+      ansible.builtin.set_fact:
+        stale_dashboards: >-
+          {{ dash_all.json.result
+             | selectattr('pages', 'defined')
+             | selectattr('pages', 'search', old_host_name | regex_escape)
+             | list }}
+
+    - name: Report what will change
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.dashboardid }} '{{ item.name }}':
+          {{ item.pages | to_json | regex_findall('"value": "' ~ (old_host_name | regex_escape) ~ '"') | length }}
+          field(s) referencing '{{ old_host_name }}'
+      loop: "{{ stale_dashboards }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Report when there is nothing to do
+      ansible.builtin.debug:
+        msg: "No dashboard references '{{ old_host_name }}' — nothing to do."
+      when: stale_dashboards | length == 0
+
+    # The rewrite is a template rather than inline Jinja: it walks
+    # pages -> widgets -> fields and has to preserve every attribute it does
+    # not change, which is unreadable as a one-line expression.
+    - name: Repoint the stale host references
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params: "{{ lookup('ansible.builtin.template', 'zabbix-dashboard-rehost.json.j2') | from_json }}"
+          id: 1
+      vars:
+        dash: "{{ item }}"
+      register: rehost_result
+      loop: "{{ stale_dashboards }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: rehost_result.json.error is defined
+      changed_when: rehost_result.json.result is defined
+
+    - name: Re-read the dashboards to confirm
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            selectPages: "extend"
+          id: 1
+      register: dash_verify
+      check_mode: false
+      failed_when: dash_verify.json.error is defined
+
+    - name: Report the end state
+      ansible.builtin.debug:
+        msg: >-
+          Remaining references to '{{ old_host_name }}':
+          {{ dash_verify.json.result | to_json
+             | regex_findall('"value": "' ~ (old_host_name | regex_escape) ~ '"') | length }}
+          (expected 0).
+          References to '{{ new_host_name }}':
+          {{ dash_verify.json.result | to_json
+             | regex_findall('"value": "' ~ (new_host_name | regex_escape) ~ '"') | length }}

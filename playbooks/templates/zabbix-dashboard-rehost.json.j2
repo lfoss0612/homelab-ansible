@@ -1,0 +1,51 @@
+{#
+  Rebuild one dashboard's pages with host-pattern references renamed.
+
+  Only widget fields whose NAME marks them as a host reference are touched -
+  `*.hosts.N` (svggraph data sets) and `problemhosts.N`. A blanket search and
+  replace over the serialized JSON would also rewrite any unrelated field that
+  happened to hold the same string, and would corrupt widget titles such as
+  "Zabbix server problems", which are a widget's `name` attribute rather than a
+  field value and must stay as they are.
+
+  widgetid and dashboard_pageid are carried through so Zabbix updates the
+  existing widgets in place. Omitting them makes the API delete and recreate
+  every widget, which would churn IDs anything else might reference.
+-#}
+{
+  "dashboardid": "{{ dash.dashboardid }}",
+  "pages": [
+{% for page in dash.pages %}
+    {
+      "dashboard_pageid": "{{ page.dashboard_pageid }}",
+      "name": {{ page.name | to_json }},
+      "display_period": "{{ page.display_period }}",
+      "widgets": [
+{% for w in page.widgets %}
+        {
+          "widgetid": "{{ w.widgetid }}",
+          "type": {{ w.type | to_json }},
+          "name": {{ w.name | to_json }},
+          "x": "{{ w.x }}", "y": "{{ w.y }}",
+          "width": "{{ w.width }}", "height": "{{ w.height }}",
+          "view_mode": "{{ w.view_mode }}",
+          "fields": [
+{% for f in w.fields %}
+            {
+              "type": "{{ f.type }}",
+              "name": {{ f.name | to_json }},
+              "value": {{ (new_host_name
+                           if (f.value == old_host_name
+                               and (f.name is search('\.hosts\.\d+$')
+                                    or f.name is search('^problemhosts\.\d+$')))
+                           else f.value) | to_json }}
+            }{{ "," if not loop.last }}
+{% endfor %}
+          ]
+        }{{ "," if not loop.last }}
+{% endfor %}
+      ]
+    }{{ "," if not loop.last }}
+{% endfor %}
+  ]
+}
