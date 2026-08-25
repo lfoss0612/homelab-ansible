@@ -1,0 +1,415 @@
+---
+# Build the "Kubernetes Pods" Zabbix dashboard, plus the calculated items it
+# needs.
+#
+# There was no pod dashboard anywhere. Of the four dashboards on this server,
+# none is Kubernetes-related; the k8s templates DO ship four ("API server
+# overview", "Controller Manager overview", "Kubelet overview", "Scheduler
+# overview") but all four cover control-plane components, live on the
+# LLD-discovered component hosts that sit behind the accepted nodes/proxy RBAC
+# gap, and so render empty. "Kubernetes cluster state by HTTP" - the template
+# holding every pod metric - ships no dashboard at all.
+#
+# So until now the 120 pods x 17 metrics were reachable only through
+# Monitoring -> Latest data. Fine for a spot check, useless as an overview.
+#
+# CALCULATED ITEMS: the template exposes cluster-level counts for nodes,
+# deployments, jobs, cronjobs and namespaces, but NOT for pods - there is no
+# kube.pod.count. Pod totals therefore have to be aggregated from the per-pod
+# items, which is what the six calculated items below do, using a wildcard key
+# in a foreach aggregation:
+#
+#     sum(last_foreach(/k8s-master.home.lan/kube.pod.phase.running[*]))
+#
+# Both sum(...) and count(...) forms were validated against the live server
+# before this play was written (108 running of 120 total).
+#
+# These items only became possible on 2026-08-25. Pod discovery had produced
+# zero working items since the template was linked, because of the {#POD}
+# orphan-prototype defect - see zabbix-remove-orphan-pod-prototypes.yml. The
+# TODO asking for this dashboard predates that fix and could not have been
+# built before it.
+#
+# NOTE ON CLEANUP: item.delete is refused to the automation token, so a
+# mistyped calculated item cannot be removed by re-running this play - it can
+# only be updated in place or deleted through the UI. Keys are therefore
+# treated as stable identifiers: change a key here only deliberately, since the
+# old one will linger.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-kubernetes-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-kubernetes-dashboard.yml
+
+- name: Build the Kubernetes pods dashboard
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    k8s_host: "k8s-master.home.lan"
+    dashboard_name: "Kubernetes Pods"
+
+    # key, name, and the calculated expression. Aggregated from the per-pod
+    # items because the template has no pod-count equivalent.
+    pod_calc_items:
+      - key: "kube.pods.total"
+        name: "Pods: total discovered"
+        expr: "count(last_foreach(/k8s-master.home.lan/kube.pod.ready[*]))"
+      - key: "kube.pods.ready"
+        name: "Pods: ready"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pod.ready[*]))"
+      - key: "kube.pods.running"
+        name: "Pods: running"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pod.phase.running[*]))"
+      - key: "kube.pods.pending"
+        name: "Pods: pending"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pod.phase.pending[*]))"
+      - key: "kube.pods.failed"
+        name: "Pods: failed"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pod.phase.failed[*]))"
+      - key: "kube.pods.restarts"
+        name: "Pods: container restarts, total"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pod.containers_restarts[*]))"
+
+  tasks:
+    - name: Resolve the Kubernetes host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectItems: ["itemid", "key_"]
+            filter:
+              host: ["{{ k8s_host }}"]
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Create the pod aggregate calculated items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "{{ item.name }}"
+            key_: "{{ item.key }}"
+            type: 15            # 15 = Calculated
+            value_type: 3       # 3 = Numeric (unsigned)
+            delay: "1m"
+            params: "{{ item.expr }}"
+            description: >-
+              Aggregated from the per-pod items with a wildcard foreach - the
+              cluster-state template exposes no pod count of its own.
+          id: 1
+      register: calc_create
+      loop: "{{ pod_calc_items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.key not in (host_lookup.json.result[0]['items'] | map(attribute='key_') | list)
+      failed_when: calc_create.json.error is defined
+      changed_when: calc_create.json.result is defined
+
+    - name: Re-read the item ids
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            filter:
+              key_: "{{ pod_calc_items | map(attribute='key') | list
+                         + ['kube.node.count', 'kube.deployment.count',
+                            'kube.job.count', 'kube.cronjob.count'] }}"
+          id: 1
+      register: item_ids
+      check_mode: false
+      failed_when: item_ids.json.error is defined
+
+    - name: Index items by key
+      ansible.builtin.set_fact:
+        ids: >-
+          {{ dict(item_ids.json.result | map(attribute='key_')
+                  | zip(item_ids.json.result | map(attribute='itemid'))) }}
+
+    # In --check the item.create tasks skip, so any calculated item that does
+    # not exist yet cannot be referenced by the widgets below. That is inherent
+    # to create-then-reference, not a fault: run the play for real once (item
+    # creation is additive and safe), after which --check works normally.
+    - name: Assert every referenced item resolved
+      ansible.builtin.assert:
+        that:
+          - missing_keys | length == 0
+        fail_msg: >-
+          These items do not exist yet: {{ missing_keys }}.
+          {{ "Expected under --check on a first run - the create tasks skip, so run without --check once."
+             if ansible_check_mode else
+             "Unexpected outside check mode; item creation must have failed." }}
+        success_msg: "All {{ ids | length }} referenced items resolved."
+      vars:
+        missing_keys: >-
+          {{ (pod_calc_items | map(attribute='key') | list
+              + ['kube.node.count', 'kube.deployment.count',
+                 'kube.job.count', 'kube.cronjob.count'])
+             | reject('in', ids.keys() | list) | list }}
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    # Numeric item tiles MUST carry decimal_size alongside value_size, or the
+    # widget renders "Widget is not fully configured" and shows nothing at all
+    # - a silent failure that reads as "no data" rather than as an error.
+    - name: Compose the dashboard
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Pods"
+            widgets:
+              # --- Row 1: the five numbers worth seeing first -------------
+              - type: item
+                name: "Total pods"
+                x: 0
+                y: 0
+                width: 14
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.total'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "50"}
+                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "units_show", value: "0"}
+
+              - type: item
+                name: "Running"
+                x: 14
+                y: 0
+                width: 15
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.running'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "50"}
+                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "units_show", value: "0"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+
+              - type: item
+                name: "Pending"
+                x: 29
+                y: 0
+                width: 14
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.pending'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "50"}
+                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "units_show", value: "0"}
+                  # Green at zero, amber the moment anything is stuck pending.
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "FF9800"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
+
+              - type: item
+                name: "Failed"
+                x: 43
+                y: 0
+                width: 14
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.failed'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "50"}
+                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "units_show", value: "0"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
+
+              - type: item
+                name: "Container restarts"
+                x: 57
+                y: 0
+                width: 15
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.restarts'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "50"}
+                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "units_show", value: "0"}
+
+              # --- Row 2: what is actually wrong, and the trend -----------
+              - type: problems
+                name: "Pod problems"
+                x: 0
+                y: 3
+                width: 40
+                height: 9
+                fields:
+                  - {type: 3, name: "hostids.0", value: "{{ host_lookup.json.result[0].hostid }}"}
+                  # Name filter keeps this pane about pods rather than filling
+                  # with node and filesystem alerts from the same host.
+                  - {type: 1, name: "problem", value: "Pod"}
+                  - {type: 0, name: "show", value: "1"}
+                  - {type: 1, name: "reference", value: "KPPRB"}
+
+              - type: svggraph
+                name: "Pod phases over time"
+                x: 40
+                y: 3
+                width: 32
+                height: 9
+                fields:
+                  - {type: 1, name: "ds.0.hosts.0", value: "{{ k8s_host }}"}
+                  - {type: 1, name: "ds.0.items.0", value: "Pods: running"}
+                  - {type: 1, name: "ds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "ds.1.hosts.0", value: "{{ k8s_host }}"}
+                  - {type: 1, name: "ds.1.items.0", value: "Pods: pending"}
+                  - {type: 1, name: "ds.1.color", value: "FF9800"}
+                  - {type: 1, name: "ds.2.hosts.0", value: "{{ k8s_host }}"}
+                  - {type: 1, name: "ds.2.items.0", value: "Pods: failed"}
+                  - {type: 1, name: "ds.2.color", value: "F44336"}
+                  - {type: 1, name: "lefty_min", value: "0"}
+
+              # --- Row 3: cluster context, straight from the template ----
+              - type: item
+                name: "Nodes"
+                x: 0
+                y: 12
+                width: 18
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.node.count'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
+                  - {type: 0, name: "units_show", value: "0"}
+
+              - type: item
+                name: "Deployments"
+                x: 18
+                y: 12
+                width: 18
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.deployment.count'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
+                  - {type: 0, name: "units_show", value: "0"}
+
+              - type: item
+                name: "Jobs"
+                x: 36
+                y: 12
+                width: 18
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.job.count'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
+                  - {type: 0, name: "units_show", value: "0"}
+
+              - type: item
+                name: "CronJobs"
+                x: 54
+                y: 12
+                width: 18
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.cronjob.count'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
+                  - {type: 0, name: "units_show", value: "0"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else (dash_lookup.json.result[0].dashboardid | default('?'))
+          }}
