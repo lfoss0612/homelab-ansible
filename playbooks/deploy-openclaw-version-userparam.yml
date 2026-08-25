@@ -1,0 +1,54 @@
+---
+# Deploy just the Zabbix UserParameter that reports each host's installed
+# openclaw version, without running a full convergence.
+#
+# The tasks themselves live in the `common` role, so a normal convergence
+# deploys them too and a rebuilt host gets them without anyone remembering
+# this playbook. This is the targeted path for deploying them now.
+#
+# import_role, NOT include_role, is load-bearing. update-openclaw.yml reaches
+# the role through dynamic include_role/include_tasks, and a dynamic include is
+# not tag-expanded ahead of time: `--tags zabbix` evaluates the tags on the
+# INCLUDE task, finds no match, and skips the whole include - so none of the
+# role's zabbix-tagged tasks ever run. A static import inserts the role's tasks
+# at parse time with their own tags intact, which is what makes `--tags zabbix`
+# select exactly the three tasks below and nothing else:
+#
+#   - Resolve global npm prefix          (tagged zabbix for this reason)
+#   - Check for a host-level agent2 include directory
+#   - Publish the installed openclaw version as a Zabbix UserParameter
+#
+# Note there are no tags on the import itself, deliberately: tags on an
+# import_role are ADDED to every task it pulls in, which would make
+# `--tags zabbix` run the entire common role.
+#
+# The k8s nodes skip themselves - they have no /etc/zabbix/zabbix_agent2.d
+# since a3c4e75, and the task is guarded on that directory existing rather than
+# on a host list. Their equivalent is the in-cluster DaemonSet reading the same
+# package.json through /hostfs/root, which lives in homelab-gitops.
+#
+# Usage - the --tags is required, or this runs the whole common role:
+#   ansible-playbook playbooks/deploy-openclaw-version-userparam.yml --tags zabbix --check --diff
+#   ansible-playbook playbooks/deploy-openclaw-version-userparam.yml --tags zabbix
+
+- name: Deploy the openclaw version UserParameter (always-on hosts)
+  hosts: openclaw:!api_managed:!openclaw_optional
+  become: true
+
+  tasks:
+    - name: Converge the common role's Zabbix tasks
+      ansible.builtin.import_role:
+        name: openclaw.node.common
+
+# Optional hosts are normal nodes that may simply be powered off (desktop).
+# Split into its own play with ignore_unreachable so a switched-off desktop
+# does not fail the run - the same split every other fleet-wide play uses.
+- name: Deploy the openclaw version UserParameter (optional hosts)
+  hosts: openclaw_optional
+  become: true
+  ignore_unreachable: true
+
+  tasks:
+    - name: Converge the common role's Zabbix tasks
+      ansible.builtin.import_role:
+        name: openclaw.node.common
