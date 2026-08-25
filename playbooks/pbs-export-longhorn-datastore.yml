@@ -93,7 +93,14 @@
         owner: root
         group: root
         mode: "0644"
-        validate: "exportfs -s -f %s"
+        # No `validate:` here on purpose. exportfs has no file-syntax check
+        # mode - `-s` prints the current export list and `-f` flushes the
+        # kernel table, so `exportfs -s -f %s` parses the temp file path as an
+        # export name and fails with "Invalid export syntax" every time. Tried
+        # 2026-08-25; do not re-add it. Safety comes instead from the
+        # /etc/exports backup above, the fact that the line content is fixed
+        # rather than user-supplied, and the post-reload assert below that
+        # fails the play if the export is not actually live.
       notify: reload nfs exports
 
     - name: Apply now rather than waiting for the handler
