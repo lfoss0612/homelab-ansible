@@ -148,11 +148,18 @@
     group: "{{ openclaw_group }}"
     mode: "0755"
 
+# Tagged `zabbix` as well as running untagged, because the Zabbix
+# UserParameter task at the end of this file templates the path from this
+# register. Without the tag, `--tags zabbix` would skip this task and leave
+# openclaw_npm_prefix undefined — the same tag-filtering trap documented on the
+# handlers. A tagged task still runs in an untagged full run, so this only
+# widens when it fires.
 - name: Resolve global npm prefix
   ansible.builtin.command: npm prefix -g
   register: openclaw_npm_prefix
   changed_when: false
   check_mode: false
+  tags: zabbix
 
 - name: Stat the openclaw CLI path in the npm prefix
   ansible.builtin.stat:
