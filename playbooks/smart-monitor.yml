@@ -1,18 +1,24 @@
 ---
-# Deploy SMART monitoring to Proxmox hosts
+# Deploy SMART monitoring to the hosts with physical disks.
 #
 # Usage:
 #   ansible-playbook playbooks/smart-monitor.yml --check --diff
 #   ansible-playbook playbooks/smart-monitor.yml
 #
-# The script runs every 30 minutes and reports drive health to Zabbix.
-# Requires Zabbix agent to be configured on the target hosts.
+# The script runs every 30 minutes and reports drive health to Zabbix via
+# zabbix_sender. The server-side objects it feeds are created separately by
+# playbooks/smart-monitor-zabbix-setup.yml — run that one too, or every value
+# this pushes is accepted by the server and silently discarded.
 #
-# Optional: Enable smartd to execute the script on errors
+# Optional: also run the script the moment smartd notices an error
 #   ansible-playbook playbooks/smart-monitor.yml -e smart_monitor_exec_on_error=true
+#
+# Targets [smart_monitored] rather than [proxmox_hosts]: the latter omits pbs,
+# which is bare metal rather than a hypervisor, and pbs was consequently the one
+# host in the fleet with no SMART coverage whatsoever.
 
-- name: Deploy SMART monitoring to Proxmox hosts
-  hosts: proxmox_hosts
+- name: Deploy SMART monitoring
+  hosts: smart_monitored
   become: true
 
   handlers:
@@ -25,42 +31,64 @@
         name: smartmontools
         state: restarted
 
-    - name: smart_monitor_deployed
-      ansible.builtin.debug:
-        msg: "SMART monitoring script deployed"
-
   tasks:
-    - name: Verify Zabbix agent is configured
-      ansible.builtin.command: grep -E '^Server=|^Hostname=' /etc/zabbix/zabbix_agentd.conf
+    # The previous version of this play gated everything below on
+    # `grep ... /etc/zabbix/zabbix_agentd.conf` succeeding. All four hosts run
+    # agent2, so that file does not exist on any of them, and the play skipped
+    # every host while reporting success — the same hardcoded-agent1-path bug
+    # that had already killed the fleet-update notifier. Probe for the tools the
+    # script ACTUALLY needs instead of for a config file it never reads.
+    - name: Check for the tools the monitor depends on
+      ansible.builtin.command: "command -v {{ item }}"
+      loop:
+        - smartctl
+        - zabbix_sender
+      register: smart_tooling
       changed_when: false
-      register: zabbix_config
       failed_when: false
       check_mode: false
 
-    - name: Report Zabbix configuration
-      ansible.builtin.debug:
-        msg: |
-          Zabbix agent configuration:
-          {{ zabbix_config.stdout }}
-      when: zabbix_config.rc == 0
+    - name: Fail loudly when a dependency is missing
+      ansible.builtin.assert:
+        that: smart_tooling.results | selectattr('rc', 'ne', 0) | list | length == 0
+        fail_msg: >-
+          Missing on {{ inventory_hostname }}:
+          {{ smart_tooling.results | selectattr('rc', 'ne', 0)
+             | map(attribute='item') | join(', ') }}.
+          Install smartmontools / zabbix-sender before deploying. This is an
+          assert rather than a skip on purpose — a silently skipped host is
+          exactly how this play came to be a no-op on all four targets.
 
-    - name: Skip host if Zabbix agent not configured
-      ansible.builtin.debug:
-        msg: "Skipping SMART monitoring setup: Zabbix agent not found on {{ inventory_hostname }}"
-      when: zabbix_config.rc != 0
+    # Informational only. Nothing branches on the result: the script resolves the
+    # agent config itself, from a LIST of candidate paths, so that a future
+    # agent2->agent3 move cannot repeat the failure above.
+    - name: Report which agent config the script will read Hostname= from
+      ansible.builtin.shell: |
+        for c in /etc/zabbix/zabbix_agent2.conf /etc/zabbix/zabbix_agentd.conf; do
+          if [ -r "$c" ]; then echo "$c: $(sed -n 's/^[[:space:]]*Hostname=//p' "$c" | tail -1)"; fi
+        done
+      register: smart_agent_conf
+      changed_when: false
+      failed_when: false
+      check_mode: false
 
-    - name: Include SMART monitoring setup tasks
+    - name: Show the resolved Zabbix host name
+      ansible.builtin.debug:
+        msg: >-
+          {{ smart_agent_conf.stdout_lines
+             | default(['no agent config found — script will fall back to `hostname -f`']) }}
+
+    - name: Install the monitoring script, timer and service
       ansible.builtin.include_tasks: tasks/smart-monitor-setup.yml
-      when: zabbix_config.rc == 0
 
-    - name: Run initial SMART check
+    - name: Run an initial SMART check
       ansible.builtin.command: /usr/local/bin/smart-monitor
       register: smart_check_result
       changed_when: false
-      failed_when: smart_check_result.rc > 1
-      when: zabbix_config.rc == 0
+      # The script exits 0 for a failing DRIVE and non-zero only when it could
+      # not report at all, so a non-zero here is a broken monitor, not a bad disk.
+      failed_when: smart_check_result.rc != 0
 
-    - name: Show SMART check results
+    - name: Show the initial results
       ansible.builtin.debug:
-        msg: "{{ smart_check_result.stdout_lines }}"
-      when: zabbix_config.rc == 0 and smart_check_result is defined
+        msg: "{{ smart_check_result.stdout_lines | default([]) }}"

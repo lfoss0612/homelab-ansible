@@ -1,316 +1,166 @@
 ---
-# Configure Zabbix items and triggers for SMART monitoring
+# Create the server-side Zabbix objects that SMART monitoring pushes into:
+# a low-level discovery rule per host, item/trigger prototypes stamped out per
+# discovered drive, two aggregate items, and the aggregate triggers.
+#
+# Counterpart to playbooks/smart-monitor.yml, which installs the script that
+# feeds these. Both are needed: the script alone pushes values the server
+# accepts and silently discards, and this alone creates items nothing feeds.
 #
 # Usage:
+#   ansible-playbook playbooks/smart-monitor-zabbix-setup.yml --check --diff
 #   ansible-playbook playbooks/smart-monitor-zabbix-setup.yml
+#
+# Idempotent: every object is looked up before it is created, so re-running is
+# a no-op once the fleet is set up.
+#
+# ---------------------------------------------------------------------------
+# Why LLD rather than the hardcoded per-host drive lists this replaces:
+#
+# The previous version carried `drives: [sda, sdb, sdc, sdd, sde, sdf, sdg]`
+# for pve. Verified against the live host 2026-08-25, pve actually has sda-sde
+# plus nvme0 and nvme1 — so Zabbix held items for two drives that no longer
+# exist and none for the two NVMes that do, and pve-router got only the
+# aggregate item because the play had no per-drive task for it at all. The list
+# was right when it was written and rotted in silence, which is the failure mode
+# this whole area keeps repeating.
+# ---------------------------------------------------------------------------
 
 - name: Configure Zabbix for SMART monitoring
   hosts: localhost
   gather_facts: false
+  # This play only talks to an HTTP API from the control node. ansible.cfg sets
+  # become = True globally, which would sudo every one of these to root for no
+  # reason whatsoever.
+  become: false
 
   vars:
-    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api: "http://10.0.5.9/zabbix/api_jsonrpc.php"
     zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
 
-    pve_hosts:
-      - name: pve.home.lan
-        visible_name: PVE
-        ip_address: 10.0.5.4
-        drives: [sda, sdb, sdc, sdd, sde, sdf, sdg]
-      - name: pve-ai.home.lan
-        visible_name: PVE-AI
-        ip_address: 10.0.5.3
-        drives: [nvme0, nvme1]
-      - name: pve-router.home.lan
-        visible_name: PVE-Router
-        ip_address: 10.0.5.2
-        drives: [nvme0]
+    # Single source of truth: the inventory group, not a list repeated here.
+    # A host added to [smart_monitored] is picked up by both this play and
+    # smart-monitor.yml with no second edit to keep in sync.
+    smart_target_hosts: "{{ groups['smart_monitored'] | default([]) }}"
+
+    # Measured on the live fleet 2026-08-25: ATA drives sat at 46-47 C, NVMe at
+    # 62-68 C, all healthy. 55/75 leaves real headroom above normal without
+    # sitting so high the trigger can never fire. Overridable per host in the
+    # Zabbix UI without touching this file — they are host macros.
+    smart_temp_macros:
+      - macro: '{$SMART.TEMP.MAX:"ata"}'
+        value: "55"
+      - macro: '{$SMART.TEMP.MAX:"nvme"}'
+        value: "75"
+      # Fallback for {#TYPE}=unknown, i.e. a drive smartctl could not read.
+      - macro: '{$SMART.TEMP.MAX}'
+        value: "60"
+
+    smart_aggregate_items:
+      - key: "smart.status"
+        name: "SMART: worst drive status"
+        description: >-
+          0 = all drives healthy, 1 = a drive is failing or has failed
+          attributes, 2 = a drive could not be read or none were detected.
+          Worst-of across every drive on the host.
+      - key: "smart.drives.count"
+        name: "SMART: drives detected"
+        description: >-
+          Number of drives smartctl enumerated. Watched because a host that has
+          stopped seeing its disks must never look the same as a host with no
+          faults.
+
+    smart_item_prototypes:
+      - key: "smart.drive[{#DEV},status]"
+        name: "SMART {#DEV} ({#MODEL}): health status"
+        description: "0 = passed, 1 = FAILED, 2 = unreadable."
+      - key: "smart.drive[{#DEV},failed_attrs]"
+        name: "SMART {#DEV} ({#MODEL}): failed attributes"
+        description: >-
+          1 when any SMART attribute has gone below threshold (ATA WHEN_FAILED
+          column), or when an NVMe reports a critical warning or media errors.
+          Fires ahead of overall health, which stays PASSED until the drive is
+          nearly gone.
+      - key: "smart.drive[{#DEV},temperature]"
+        name: "SMART {#DEV} ({#MODEL}): temperature"
+        units: "°C"
+        description: "Composite temperature for NVMe; attribute 194/190 for ATA."
+
+    # @HOST@ is substituted with the real FQDN per host by the included tasks.
+    # A distinctive placeholder rather than a bare word, so the replacement
+    # cannot chew through an unrelated substring of an expression.
+    smart_trigger_prototypes:
+      - description: "SMART {#DEV} on @HOST@ reports FAILED"
+        expression: "last(/@HOST@/smart.drive[{#DEV},status])=1"
+        priority: 4        # High
+        comments: >-
+          The drive's own overall health self-assessment has failed. Replace it;
+          this verdict does not clear on its own.
+      - description: "SMART {#DEV} on @HOST@ has failed attributes"
+        expression: "last(/@HOST@/smart.drive[{#DEV},failed_attrs])=1"
+        priority: 4        # High
+        comments: >-
+          An individual attribute is below threshold (reallocated sectors,
+          pending sectors, NVMe media errors). This is the EARLY warning and
+          usually precedes an overall-health failure by weeks.
+      - description: "SMART {#DEV} on @HOST@ is unreadable"
+        expression: "last(/@HOST@/smart.drive[{#DEV},status])=2"
+        priority: 2        # Warning
+        comments: >-
+          smartctl enumerated the drive but could not get health data from it —
+          often a failing USB/SATA bridge rather than the disk itself. Compare
+          against the known-bad VIA VL711 enclosure before condemning a drive.
+      - description: "SMART {#DEV} on @HOST@ is over temperature"
+        expression: >-
+          last(/@HOST@/smart.drive[{#DEV},temperature])>{$SMART.TEMP.MAX:"{#TYPE}"}
+        priority: 2        # Warning
+        comments: >-
+          Threshold comes from the per-class context macro {$SMART.TEMP.MAX},
+          so ATA and NVMe are judged on different scales.
+
+    smart_aggregate_triggers:
+      - description: "SMART on @HOST@: a drive is failing"
+        expression: "last(/@HOST@/smart.status)=1"
+        priority: 4
+        comments: "Roll-up. The per-drive trigger names which one."
+      - description: "SMART on @HOST@: a drive is unreadable or none detected"
+        expression: "last(/@HOST@/smart.status)=2"
+        priority: 2
+      # The most important trigger in this file. Everything above depends on the
+      # script continuing to run; nothing above notices if it stops. The timer
+      # fires every 30 minutes, so 2h is four missed runs — long enough to ride
+      # out a reboot, short enough to catch a monitor that has quietly died.
+      # This is the check the fleet-update work had to learn the hard way, where
+      # a dead notifier looked exactly like a healthy fleet for two weeks.
+      - description: "SMART on @HOST@: monitoring has stopped reporting"
+        expression: "nodata(/@HOST@/smart.status,2h)=1"
+        priority: 3        # Average
+        manual_close: 1
+        comments: >-
+          No SMART value in 2 hours. Check smart-monitor.timer on the host and
+          `journalctl -u smart-monitor.service`. A silent monitor is
+          indistinguishable from healthy disks until you look.
 
   tasks:
-    - name: Get/create Proxmox host group
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: hostgroup.get
-          params:
-            filter:
-              name: Proxmox
-          id: 1
-      register: hostgroup_result
+    - name: Assert the inventory group exists
+      ansible.builtin.assert:
+        that: smart_target_hosts | length > 0
+        fail_msg: >-
+          [smart_monitored] is empty or missing from the inventory. This play
+          derives its targets from that group so the two SMART playbooks cannot
+          drift apart.
 
-    - name: Create Proxmox host group
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: hostgroup.create
-          params:
-            name: Proxmox
-          id: 1
-      register: hostgroup_create_result
-      failed_when: false
-
-    - name: Extract or use existing Proxmox group ID
-      set_fact:
-        proxmox_groupid: "{{ hostgroup_create_result.get('json', {}).get('result', {}).get('groupids', ['2'])[0] }}"
-      when: "hostgroup_create_result.get('json', {}).get('result', {}).get('groupids', []) | length > 0"
-
-    - name: Create/update PVE hosts in Zabbix
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: host.create
-          params:
-            host: "{{ pve_host.name }}"
-            visible_name: "{{ pve_host.visible_name }}"
-            groups:
-              - groupid: "{{ proxmox_groupid | default('2') }}"
-            interfaces:
-              - type: 1
-                main: 1
-                useip: 1
-                ip: "{{ pve_host.ip_address }}"
-                dns: "{{ pve_host.name }}"
-                port: 10050
-          id: 1
-        status_code: [200]
-      loop: "{{ pve_hosts }}"
+    - name: Configure each host
+      ansible.builtin.include_tasks: tasks/smart-zabbix-host.yml
+      loop: "{{ smart_target_hosts }}"
       loop_control:
-        loop_var: pve_host
-      register: host_create_result
-      failed_when: false
+        loop_var: smart_host
 
-    - name: Extract host IDs
-      set_fact:
-        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.get('json', {}).get('result', {}).get('hostids', [0])[0]}) }}"
-      loop: "{{ host_create_result.results }}"
-      when: "item.get('json', {}).get('result', {}).get('hostids', []) | bool"
-
-    - name: Get existing host IDs if create failed
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: host.get
-          params:
-            filter:
-              host: "{{ pve_host.name }}"
-          id: 1
-      loop: "{{ pve_hosts }}"
-      loop_control:
-        loop_var: pve_host
-      register: existing_hosts_result
-      when: pve_host.name not in (host_ids | default({}))
-
-    - name: Update host_ids with existing hosts
-      set_fact:
-        host_ids: "{{ host_ids | default({}) | combine({item.pve_host.name: item.get('json', {}).get('result', [{}])[0].get('hostid', '')}) }}"
-      loop: "{{ existing_hosts_result.results }}"
-      when: "item.get('json', {}).get('result', []) | length > 0"
-
-    - name: Create SMART status items
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: item.create
-          params:
-            name: "SMART status"
-            key_: "smart.status"
-            hostid: "{{ host_ids[pve_host.name] }}"
-            type: 2
-            value_type: 3
-          id: 1
-      loop: "{{ pve_hosts }}"
-      loop_control:
-        loop_var: pve_host
-      failed_when: false
-
-    - name: Create per-drive SMART items for PVE
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: item.create
-          params:
-            name: "{{ item.name }}"
-            key_: "{{ item.key }}"
-            hostid: "{{ host_ids['pve.home.lan'] }}"
-            type: 2
-            value_type: 3
-            units: "{{ item.units | default('') }}"
-          id: 1
-      vars:
-        items:
-          - name: "SMART status - sda"
-            key: "smart.drive.sda.status"
-          - name: "SMART temperature - sda"
-            key: "smart.drive.sda.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sda"
-            key: "smart.drive.sda.failed_attrs"
-          - name: "SMART status - sdb"
-            key: "smart.drive.sdb.status"
-          - name: "SMART temperature - sdb"
-            key: "smart.drive.sdb.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sdb"
-            key: "smart.drive.sdb.failed_attrs"
-          - name: "SMART status - sdc"
-            key: "smart.drive.sdc.status"
-          - name: "SMART temperature - sdc"
-            key: "smart.drive.sdc.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sdc"
-            key: "smart.drive.sdc.failed_attrs"
-          - name: "SMART status - sdd"
-            key: "smart.drive.sdd.status"
-          - name: "SMART temperature - sdd"
-            key: "smart.drive.sdd.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sdd"
-            key: "smart.drive.sdd.failed_attrs"
-          - name: "SMART status - sde"
-            key: "smart.drive.sde.status"
-          - name: "SMART temperature - sde"
-            key: "smart.drive.sde.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sde"
-            key: "smart.drive.sde.failed_attrs"
-          - name: "SMART status - sdf"
-            key: "smart.drive.sdf.status"
-          - name: "SMART temperature - sdf"
-            key: "smart.drive.sdf.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sdf"
-            key: "smart.drive.sdf.failed_attrs"
-          - name: "SMART status - sdg"
-            key: "smart.drive.sdg.status"
-          - name: "SMART temperature - sdg"
-            key: "smart.drive.sdg.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - sdg"
-            key: "smart.drive.sdg.failed_attrs"
-      loop: "{{ items }}"
-      failed_when: false
-
-    - name: Create per-drive SMART items for PVE-AI
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: item.create
-          params:
-            name: "{{ item.name }}"
-            key_: "{{ item.key }}"
-            hostid: "{{ host_ids['pve-ai.home.lan'] }}"
-            type: 2
-            value_type: 3
-            units: "{{ item.units | default('') }}"
-          id: 1
-      vars:
-        items:
-          - name: "SMART status - nvme0"
-            key: "smart.drive.nvme0.status"
-          - name: "SMART temperature - nvme0"
-            key: "smart.drive.nvme0.temperature"
-            units: "°C"
-          - name: "SMART failed attributes - nvme0"
-            key: "smart.drive.nvme0.failed_attrs"
-      loop: "{{ items }}"
-      failed_when: false
-
-    - name: Create SMART failure triggers
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: trigger.create
-          params:
-            description: "SMART drive failure on {{ pve_host.name }}"
-            expression: "last(/{{ pve_host.name }}/smart.status)=1"
-            severity: 4
-          id: 1
-      loop: "{{ pve_hosts }}"
-      loop_control:
-        loop_var: pve_host
-      failed_when: false
-
-    - name: Create SMART error triggers
-      ansible.builtin.uri:
-        url: "{{ zabbix_url }}/api_jsonrpc.php"
-        method: POST
-        body_format: json
-        headers:
-          Authorization: "Bearer {{ zabbix_api_token }}"
-        body:
-          jsonrpc: "2.0"
-          method: trigger.create
-          params:
-            description: "SMART monitoring error on {{ pve_host.name }}"
-            expression: "last(/{{ pve_host.name }}/smart.status)=2"
-            severity: 3
-          id: 1
-      loop: "{{ pve_hosts }}"
-      loop_control:
-        loop_var: pve_host
-      failed_when: false
-
-  post_tasks:
     - name: Summary
       ansible.builtin.debug:
-        msg: |
-          ✓ Zabbix SMART monitoring setup complete!
-
-          Created/Updated hosts:
-          - pve.home.lan (7 drives: sda-sdg)
-          - pve-ai.home.lan (1 drive: nvme0)
-
-          Items created per host:
-          - smart.status (overall health)
-          - smart.drive.{device}.status (per-drive)
-          - smart.drive.{device}.temperature (per-drive, in °C)
-          - smart.drive.{device}.failed_attrs (per-drive)
-
-          Triggers created per host:
-          - SMART drive failure (High severity)
-          - SMART monitoring error (Medium severity)
-
-          Verify in Zabbix frontend:
-          1. Configuration > Hosts > select host
-          2. Items tab: should see all SMART items
-          3. Monitoring > Problems: view active triggers
+        msg: >-
+          Configured {{ smart_target_hosts | length }} host(s):
+          {{ smart_target_hosts | join(', ') }}.
+          Per-drive items appear once the host's next smart-monitor run pushes
+          smart.discovery — within 30 minutes, or immediately via
+          `systemctl start smart-monitor.service`.

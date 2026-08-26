@@ -1,0 +1,375 @@
+---
+# Create the SMART discovery rule, prototypes, aggregate items and triggers for
+# ONE Zabbix host. Included per host by playbooks/smart-monitor-zabbix-setup.yml,
+# which owns the variable definitions used here.
+#
+# Every step is get-then-create rather than blind create: the API errors on a
+# duplicate key, and a playbook that only works the first time is a playbook
+# nobody dares re-run.
+#
+# `smart_host` is the FQDN, and must equal both the Zabbix host name and the
+# Hostname= the agent config carries — zabbix_sender addresses values by that
+# name and the server discards anything it cannot match.
+
+- name: "{{ smart_host }} — resolve the Zabbix host"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: host.get
+      params:
+        output: ["hostid", "host"]
+        filter:
+          host: ["{{ smart_host }}"]
+      id: 1
+  register: smart_host_lookup
+  check_mode: false
+  failed_when: >-
+    smart_host_lookup.json.error is defined
+    or (smart_host_lookup.json.result | default([]) | length) != 1
+
+- name: "{{ smart_host }} — set the host id"
+  ansible.builtin.set_fact:
+    smart_hostid: "{{ smart_host_lookup.json.result[0].hostid }}"
+
+# --- temperature thresholds -------------------------------------------------
+# Context macros, so one trigger prototype serves both drive classes: the
+# expression reads {$SMART.TEMP.MAX:"{#TYPE}"} and Zabbix picks the value
+# matching that drive's discovered {#TYPE}. Spinning rust and NVMe have very
+# different normal ranges — measured 2026-08-25, pbs sda at 46 C and its KIOXIA
+# nvme0 at 68 C, both healthy — so a single fleet-wide number would either cry
+# wolf on every NVMe or never fire on a cooking hard disk.
+
+- name: "{{ smart_host }} — read existing SMART macros"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: usermacro.get
+      params:
+        output: ["hostmacroid", "macro", "value"]
+        hostids: ["{{ smart_hostid }}"]
+      id: 1
+  register: smart_macro_lookup
+  check_mode: false
+  failed_when: smart_macro_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create missing temperature macros"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: usermacro.create
+      params:
+        hostid: "{{ smart_hostid }}"
+        macro: "{{ item.macro }}"
+        value: "{{ item.value }}"
+      id: 1
+  loop: "{{ smart_temp_macros }}"
+  loop_control:
+    label: "{{ item.macro }}={{ item.value }}"
+  when: item.macro not in (smart_macro_lookup.json.result | default([]) | map(attribute='macro') | list)
+  register: smart_macro_create
+  changed_when: smart_macro_create.json.result is defined
+  failed_when: smart_macro_create.json.error is defined
+
+# Thresholds are the one thing here that genuinely gets retuned, so they are
+# reconciled rather than only created — otherwise changing a value in the
+# playbook would silently do nothing on a host that already had the macro.
+# `usermacro.delete` is refused to this token (verified 2026-08-25) but
+# `.update` is granted, so update is also the only correction available.
+- name: "{{ smart_host }} — correct temperature macros that drifted"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: usermacro.update
+      params:
+        hostmacroid: "{{ smart_existing_macros | selectattr('macro', 'eq', item.macro) | map(attribute='hostmacroid') | first }}"
+        value: "{{ item.value }}"
+      id: 1
+  vars:
+    smart_existing_macros: "{{ smart_macro_lookup.json.result | default([]) }}"
+  loop: "{{ smart_temp_macros }}"
+  loop_control:
+    label: "{{ item.macro }} -> {{ item.value }}"
+  when:
+    - smart_existing_macros | selectattr('macro', 'eq', item.macro) | list | length == 1
+    - (smart_existing_macros | selectattr('macro', 'eq', item.macro) | map(attribute='value') | first) != item.value
+  register: smart_macro_update
+  changed_when: smart_macro_update.json.result is defined
+  failed_when: smart_macro_update.json.error is defined
+
+# --- aggregate trapper items ------------------------------------------------
+
+- name: "{{ smart_host }} — read existing SMART items"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: item.get
+      params:
+        output: ["itemid", "key_"]
+        hostids: ["{{ smart_hostid }}"]
+        search:
+          key_: "smart."
+      id: 1
+  register: smart_item_lookup
+  check_mode: false
+  failed_when: smart_item_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create the aggregate items"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: item.create
+      params:
+        hostid: "{{ smart_hostid }}"
+        name: "{{ item.name }}"
+        key_: "{{ item.key }}"
+        type: 2               # Zabbix trapper
+        value_type: 3         # numeric unsigned
+        description: "{{ item.description }}"
+      id: 1
+  loop: "{{ smart_aggregate_items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.key not in (smart_item_lookup.json.result | default([]) | map(attribute='key_') | list)
+  register: smart_agg_create
+  changed_when: smart_agg_create.json.result is defined
+  failed_when: smart_agg_create.json.error is defined
+
+# --- discovery rule ---------------------------------------------------------
+
+- name: "{{ smart_host }} — look for the discovery rule"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: discoveryrule.get
+      params:
+        output: ["itemid", "key_"]
+        hostids: ["{{ smart_hostid }}"]
+        filter:
+          key_: ["smart.discovery"]
+      id: 1
+  register: smart_lld_lookup
+  check_mode: false
+  failed_when: smart_lld_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create the discovery rule"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: discoveryrule.create
+      params:
+        hostid: "{{ smart_hostid }}"
+        name: "SMART drive discovery"
+        key_: "smart.discovery"
+        type: 2               # Zabbix trapper — the script pushes the payload
+        # Zabbix DISABLES resources a discovery stops returning rather than
+        # deleting them, so a pulled disk leaves a disabled, non-collecting item
+        # behind for 30 days. That is deliberate: it keeps the history readable
+        # after a swap. It also means the raw "unsupported items" count is the
+        # wrong thing to alert on — measure {state:1, status:0}.
+        lifetime: "30d"
+        description: >-
+          Fed by /usr/local/bin/smart-monitor (homelab-ansible
+          scripts/smart-monitor.sh) every 30 minutes via zabbix_sender.
+          See docs/smart-monitoring.md.
+      id: 1
+  register: smart_lld_create
+  when: (smart_lld_lookup.json.result | default([]) | length) == 0
+  changed_when: smart_lld_create.json.result is defined
+  failed_when: smart_lld_create.json.error is defined
+
+# Two set_facts rather than one ternary. `a | length > 0 | ternary(...)` looks
+# right but Jinja binds the filter tighter than the comparison, so it silently
+# evaluates as `length > (0 | ternary(...))` — and ternary would evaluate the
+# create branch even when the rule already existed.
+- name: "{{ smart_host }} — settle the discovery rule id (pre-existing)"
+  ansible.builtin.set_fact:
+    smart_ruleid: "{{ smart_lld_lookup.json.result[0].itemid }}"
+  when: (smart_lld_lookup.json.result | default([]) | length) > 0
+
+- name: "{{ smart_host }} — settle the discovery rule id (just created)"
+  ansible.builtin.set_fact:
+    smart_ruleid: "{{ smart_lld_create.json.result.itemids[0] }}"
+  when: (smart_lld_lookup.json.result | default([]) | length) == 0
+
+- name: "{{ smart_host }} — assert we have a discovery rule id"
+  ansible.builtin.assert:
+    that: smart_ruleid | length > 0
+    fail_msg: "Could not resolve or create the smart.discovery rule on {{ smart_host }}."
+
+# --- item prototypes --------------------------------------------------------
+
+- name: "{{ smart_host }} — read existing item prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.get
+      params:
+        output: ["itemid", "key_"]
+        discoveryids: ["{{ smart_ruleid }}"]
+      id: 1
+  register: smart_proto_lookup
+  check_mode: false
+  failed_when: smart_proto_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create item prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.create
+      params:
+        hostid: "{{ smart_hostid }}"
+        ruleid: "{{ smart_ruleid }}"
+        name: "{{ item.name }}"
+        key_: "{{ item.key }}"
+        type: 2
+        value_type: 3
+        units: "{{ item.units | default('') }}"
+        description: "{{ item.description }}"
+      id: 1
+  loop: "{{ smart_item_prototypes }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.key not in (smart_proto_lookup.json.result | default([]) | map(attribute='key_') | list)
+  register: smart_proto_create
+  changed_when: smart_proto_create.json.result is defined
+  failed_when: smart_proto_create.json.error is defined
+
+# --- trigger prototypes -----------------------------------------------------
+
+- name: "{{ smart_host }} — read existing trigger prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: triggerprototype.get
+      params:
+        output: ["triggerid", "description"]
+        discoveryids: ["{{ smart_ruleid }}"]
+      id: 1
+  register: smart_trigproto_lookup
+  check_mode: false
+  failed_when: smart_trigproto_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create trigger prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: triggerprototype.create
+      params:
+        description: "{{ item.description }}"
+        expression: "{{ item.expression | replace('@HOST@', smart_host) }}"
+        priority: "{{ item.priority }}"
+        manual_close: "{{ item.manual_close | default(0) }}"
+        comments: "{{ item.comments | default('') }}"
+      id: 1
+  loop: "{{ smart_trigger_prototypes }}"
+  loop_control:
+    label: "{{ item.description }}"
+  when: item.description not in (smart_trigproto_lookup.json.result | default([]) | map(attribute='description') | list)
+  register: smart_trigproto_create
+  changed_when: smart_trigproto_create.json.result is defined
+  failed_when: smart_trigproto_create.json.error is defined
+
+# --- aggregate triggers -----------------------------------------------------
+
+- name: "{{ smart_host }} — read existing triggers"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: trigger.get
+      params:
+        output: ["triggerid", "description"]
+        hostids: ["{{ smart_hostid }}"]
+      id: 1
+  register: smart_trigger_lookup
+  check_mode: false
+  failed_when: smart_trigger_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create aggregate triggers"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: trigger.create
+      params:
+        description: "{{ item.description }}"
+        expression: "{{ item.expression | replace('@HOST@', smart_host) }}"
+        priority: "{{ item.priority }}"
+        manual_close: "{{ item.manual_close | default(0) }}"
+        comments: "{{ item.comments | default('') }}"
+      id: 1
+  loop: "{{ smart_aggregate_triggers }}"
+  loop_control:
+    label: "{{ item.description }}"
+  when: item.description not in (smart_trigger_lookup.json.result | default([]) | map(attribute='description') | list)
+  register: smart_trigger_create
+  changed_when: smart_trigger_create.json.result is defined
+  failed_when: smart_trigger_create.json.error is defined

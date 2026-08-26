@@ -1,222 +1,174 @@
 # SMART Drive Monitoring via Zabbix
 
-This document describes the SMART (Self-Monitoring, Analysis and Reporting Technology) monitoring setup that sends drive health alerts to Zabbix from Proxmox hosts.
+Disk health for the four hosts with physical disks — `pbs`, `pve`, `pve-ai`,
+`pve-router` — pushed into Zabbix as low-level discovery plus trapper values, so
+failing hardware surfaces as an alert instead of via a monthly manual check.
 
-## Overview
+## The two halves, and why you need both
 
-The SMART monitoring solution consists of:
+| | Playbook | Creates |
+|---|---|---|
+| Host side | `playbooks/smart-monitor.yml` | `/usr/local/bin/smart-monitor`, its systemd service and 30-minute timer |
+| Server side | `playbooks/smart-monitor-zabbix-setup.yml` | the discovery rule, item/trigger prototypes, aggregate items and triggers |
 
-1. **Monitoring Script** (`scripts/smart-monitor.sh`) — Runs on each Proxmox host, checks all drives via `smartctl`, and reports metrics to Zabbix using `zabbix_sender`.
-
-2. **Systemd Timer** (`smart-monitor.timer`) — Executes the monitoring script every 30 minutes.
-
-3. **Zabbix Agent** — Already configured on PVE hosts (Server=10.0.5.9).
-
-4. **Zabbix Items** (server-side) — Receive the metrics sent by `zabbix_sender` and trigger alerts.
-
-## Deployment
-
-Deploy to all Proxmox hosts:
+Running only the host side pushes values the server accepts and then silently
+discards, because no matching item exists. Running only the server side creates
+items nothing ever feeds. **Neither half fails loudly on its own** — that is the
+characteristic failure of this whole area, so run both:
 
 ```bash
 cd /opt/ansible
 sudo -n -H -u ansible ansible-playbook playbooks/smart-monitor.yml --check --diff
 sudo -n -H -u ansible ansible-playbook playbooks/smart-monitor.yml
+sudo -n -H -u ansible ansible-playbook playbooks/smart-monitor-zabbix-setup.yml
 ```
 
-### Optional: Configure smartd to Execute on Errors
+## Which hosts
 
-By default, the monitoring script runs every 30 minutes via a systemd timer. To also execute the script immediately when smartd detects an error:
+The `[smart_monitored]` inventory group, **not** `[proxmox_hosts]`. Membership is
+a monitoring decision rather than a topology one: `pbs` is bare metal rather than
+a hypervisor, so it does not belong in the Proxmox group — and being outside it
+is exactly why `pbs` had no SMART coverage at all until 2026-08-25, despite being
+the host under the most disk pressure in the fleet.
 
-```bash
-sudo -n -H -u ansible ansible-playbook playbooks/smart-monitor.yml \
-  -e smart_monitor_exec_on_error=true
+**Do not add a VM.** Virtual disks expose no SMART data — verified on `omv`,
+where every `/dev/sd*` returns an empty model and an empty health line — so the
+result is items that can never collect. That is worse than no monitoring,
+because it looks like monitoring.
+
+## What gets created
+
+Per-drive objects come from **low-level discovery**, not from a list in the
+playbook. The script sends a `smart.discovery` payload describing what it
+actually found:
+
+```json
+[{"{#DEV}":"sda","{#TYPE}":"ata","{#MODEL}":"WDC WD101EFBX-68B0AN0"},
+ {"{#DEV}":"nvme0","{#TYPE}":"nvme","{#MODEL}":"KBG50ZNS512G NVMe KIOXIA 512GB"}]
 ```
 
-This modifies `/etc/smartmontools/smartd.conf` to invoke the script when errors occur, enabling real-time alerts.
+Zabbix stamps out one set of items and triggers per entry. Swap a disk and the
+items follow within 30 minutes, with no playbook edit.
 
-## Metrics Sent to Zabbix
+> This replaced hardcoded per-host drive lists, and the reason is instructive.
+> The old lists said `pve` had `sda`–`sdg`. It actually has `sda`–`sde` plus
+> `nvme0` and `nvme1`, so Zabbix held items for two drives that no longer existed
+> and none for the two NVMes that did, while `pve-router` had only the aggregate
+> item because the play had no per-drive task for it. The lists were correct when
+> written and rotted in silence.
 
-The script sends the following metrics for each drive (e.g., `/dev/sda` → `sda`):
+### Items
 
-| Metric | Type | Values | Description |
-|--------|------|--------|-------------|
-| `smart.status` | Integer | 0, 1, 2 | Overall status: 0=healthy, 1=failure, 2=error |
-| `smart.drive.{dev}.status` | Integer | 0, 1, 2 | Per-drive status: 0=passed, 1=failed, 2=error |
-| `smart.drive.{dev}.temperature` | Integer | °C | Drive temperature in Celsius |
-| `smart.drive.{dev}.failed_attrs` | Integer | 0, 1 | Whether drive has failed SMART attributes |
+| Key | Meaning |
+|---|---|
+| `smart.status` | Worst-of across all drives: 0 healthy, 1 failing, 2 unreadable/none |
+| `smart.drives.count` | How many drives `smartctl --scan` found |
+| `smart.drive[{#DEV},status]` | Per drive: 0 passed, 1 FAILED, 2 unreadable |
+| `smart.drive[{#DEV},failed_attrs]` | 1 when an attribute is below threshold, or NVMe reports critical warning / media errors |
+| `smart.drive[{#DEV},temperature]` | °C |
 
-## Zabbix Configuration
+`failed_attrs` is the one to care about. Overall health stays `PASSED` until a
+drive is nearly gone, whereas a reallocated-sector count crossing its threshold
+usually precedes that by weeks.
 
-### 1. Create Host for PVE (if not already present)
+### Triggers
 
-In Zabbix frontend, create a host for each Proxmox node:
+Per drive: FAILED health (High), failed attributes (High), unreadable (Warning),
+over temperature (Warning). Aggregate: a drive is failing (High), a drive is
+unreadable (Warning), and —
 
-- **Hostname:** `pve.home.lan` (or `pve-ai.home.lan`, `pve-router.home.lan`)
-- **Visible name:** PVE (or PVE-AI, PVE-Router)
-- **Host groups:** Proxmox (or create as needed)
-- **Agent interface:** 10.0.5.4:10050 (update IP for each host)
-- **Templates:** (optional) Linux by Zabbix agent (for additional OS metrics)
+**`nodata(/<host>/smart.status,2h)=1` — monitoring has stopped reporting.**
 
-### 2. Create Items for SMART Metrics
+This is the most important trigger of the set. Every other one depends on the
+script continuing to run, and none of them notice if it stops. The timer fires
+every 30 minutes, so two hours is four missed runs: long enough to ride out a
+reboot, short enough to catch a monitor that has quietly died. The fleet-update
+notifier had to learn this the hard way, where a dead notifier was
+indistinguishable from a healthy fleet for two weeks.
 
-For each Proxmox host, create these items. **Note:** Items are "trapper" type, meaning they receive values pushed via `zabbix_sender`, not pulled by the agent.
+### Temperature thresholds
 
-#### Overall SMART Status Item
+Context macros, set per host, so one trigger prototype serves both drive classes:
 
-- **Name:** SMART status
-- **Type:** Trapper
-- **Key:** `smart.status`
-- **Data type:** Numeric (unsigned)
-- **Description:** Overall SMART health: 0=healthy, 1=issue, 2=error
+| Macro | Default | Applies to |
+|---|---|---|
+| `{$SMART.TEMP.MAX:"ata"}` | 55 | spinning disks and SATA SSDs |
+| `{$SMART.TEMP.MAX:"nvme"}` | 75 | NVMe |
+| `{$SMART.TEMP.MAX}` | 60 | fallback, `{#TYPE}` unknown |
 
-#### Per-Drive Items (example for `/dev/sda`)
+The two scales are not interchangeable. Measured across the fleet 2026-08-25,
+healthy ATA drives sat at 46–47 °C while healthy NVMe ran 62–68 °C — `pbs`'s
+KIOXIA idles at 68 °C. A single fleet-wide number would either cry wolf on every
+NVMe or never fire on a cooking hard disk. Override per host in the Zabbix UI;
+the playbook reconciles the value if you change it in the playbook instead.
 
-For each detected drive, create items. Drives are identified by their short names (`sda`, `sdb`, `sdc`, `sdd`).
-
-**Drive Status Item**
-
-- **Name:** SMART status - sda
-- **Type:** Trapper
-- **Key:** `smart.drive.sda.status`
-- **Data type:** Numeric (unsigned)
-- **Description:** Drive status: 0=passed, 1=failed, 2=error
-
-**Drive Temperature Item**
-
-- **Name:** SMART temperature - sda
-- **Type:** Trapper
-- **Key:** `smart.drive.sda.temperature`
-- **Data type:** Numeric (unsigned)
-- **Units:** °C
-- **Description:** Drive temperature
-
-**Drive Failed Attributes Item**
-
-- **Name:** SMART failed attributes - sda
-- **Type:** Trapper
-- **Key:** `smart.drive.sda.failed_attrs`
-- **Data type:** Numeric (unsigned)
-- **Description:** Whether drive has failed attributes: 0=none, 1=present
-
-### 3. Create Triggers for Alerts
-
-Create triggers to alert when SMART issues are detected:
-
-#### Trigger: Drive Health Failed
-
-- **Name:** SMART drive failure on {HOST.NAME}
-- **Severity:** High
-- **Expression:** `{<hostname>:smart.status.last()} = 1`
-- **Recovery:** `{<hostname>:smart.status.last()} = 0`
-- **Description:** A drive is reporting SMART failures
-
-#### Trigger: Drive Overheating (Example)
-
-- **Name:** SMART drive overheating: {HOST.NAME}
-- **Severity:** Medium
-- **Expression:** `{<hostname>:smart.drive.sda.temperature.last()} > 50` (adjust threshold)
-- **Recovery:** `{<hostname>:smart.drive.sda.temperature.last()} <= 45`
-- **Description:** Drive temperature exceeds safe threshold
-
-#### Trigger: SMART Tool Error
-
-- **Name:** SMART monitoring error on {HOST.NAME}
-- **Severity:** Medium
-- **Expression:** `{<hostname>:smart.status.last()} = 2`
-- **Recovery:** `{<hostname>:smart.status.last()} < 2`
-- **Description:** SMART monitoring script encountered an error
-
-## Manual Testing
-
-Test the setup without waiting for the timer:
+## Manual testing
 
 ```bash
-# Run the monitoring script manually
-sudo /usr/local/bin/smart-monitor
-
-# Check the systemd timer status
-systemctl status smart-monitor.timer
+sudo /usr/local/bin/smart-monitor          # prints a per-drive table, then pushes
 systemctl list-timers smart-monitor.timer
-
-# View recent runs in the journal
-journalctl -u smart-monitor.service -n 20 --follow
-```
-
-## Troubleshooting
-
-### Script fails to send to Zabbix
-
-Check that the Zabbix server IP and port are correct:
-
-```bash
-grep -E '^Server=|^Port=' /etc/zabbix/zabbix_agentd.conf
-```
-
-The script defaults to `10.0.5.9:10051`. If different, update the environment variables in `smart-monitor.service`.
-
-### smartctl returns no data
-
-Run smartctl directly to diagnose:
-
-```bash
-sudo smartctl --scan
-sudo smartctl -a /dev/sda
-```
-
-If it returns an error, check that smartmontools is installed and the drives are detected:
-
-```bash
-sudo systemctl status smartmontools
-sudo smartctl --version
-```
-
-### Timer not running
-
-Check the timer status:
-
-```bash
-systemctl status smart-monitor.timer
-systemctl list-timers --all smart-monitor.timer
-```
-
-To debug timer execution:
-
-```bash
-journalctl -u smart-monitor.timer -n 20
 journalctl -u smart-monitor.service -n 20
 ```
 
-### Zabbix not receiving metrics
+The script prints what it found and logs the `zabbix_sender` result. It exits
+non-zero only when it could not *report* — a failing drive is a normal outcome to
+report and exits 0, so a red `smart-monitor.service` means a broken monitor, not
+a bad disk.
 
-Verify `zabbix_sender` connectivity:
+## Troubleshooting
+
+### Values are sent but nothing appears in Zabbix
+
+The server accepts the connection and then discards values it has no item for,
+so read the counters rather than the exit status. The script does this for you
+and warns:
+
+```
+WARNING: Zabbix discarded values sent as host 'pve.home.lan'.
+```
+
+Two causes, in order of likelihood:
+
+1. `smart-monitor-zabbix-setup.yml` has not been run for that host.
+2. The name the values are sent under does not match the Zabbix host name. The
+   script takes it from `Hostname=` in the agent config, trying
+   `/etc/zabbix/zabbix_agent2.conf` then `/etc/zabbix/zabbix_agentd.conf`.
+
+That path is a **list on purpose**. All four hosts run agent2; a hardcoded
+`zabbix_agentd.conf` is what silently disabled the fleet-update notifier after
+the agent2 migration, and the same hardcoded path in the old version of
+`smart-monitor.yml` made the deploy skip all four hosts while reporting success.
+
+### Per-drive items are missing
+
+They only exist after the host has pushed a `smart.discovery` payload. Force it:
 
 ```bash
-/usr/bin/zabbix_sender -z 10.0.5.9 -p 10051 -s "pve.home.lan" -k "smart.status" -o 0 -v
+systemctl start smart-monitor.service
 ```
 
-Expected output shows the value was accepted by the Zabbix server.
+Then check Data collection → Hosts → *host* → Discovery rules → SMART drive
+discovery.
 
-## Architecture
+### A removed drive's items are still there
 
-```
-Proxmox Host (e.g., pve.home.lan)
-├── /dev/sda, /dev/sdb, /dev/sdc, /dev/sdd (drives)
-├── smartd daemon (system service)
-├── smart-monitor.timer (systemd timer, every 30min)
-│   └── smart-monitor.service (runs script)
-│       └── /usr/local/bin/smart-monitor (script)
-│           ├── Runs: smartctl -a /dev/sdX
-│           ├── Parses SMART status
-│           ├── Sends metrics via zabbix_sender
-│           └── Reports to Zabbix Server (10.0.5.9:10051)
-└── zabbix_agentd (already configured)
-    └── Hostname: pve.home.lan
-```
+Expected. Zabbix **disables** resources a discovery stops returning rather than
+deleting them (`lifetime: 30d`), which keeps history readable across a swap. The
+consequence is that the raw unsupported-item count is the wrong thing to alert
+on — measure `{state: 1, status: 0}`, unsupported *and enabled*.
 
-## See Also
+### Deleting objects
 
-- [smartmontools documentation](https://www.smartmontools.org/)
-- [smartctl man page](https://www.smartmontools.org/wiki/Smartctl)
-- [Zabbix Trapper Items](https://www.zabbix.com/documentation/current/en/manual/config/items/itemtypes/trapper)
-- [zabbix_sender man page](https://www.zabbix.com/documentation/current/en/manual/appendix/commands/zabbix_sender)
+`discoveryrule.delete`, `itemprototype.delete` and `usermacro.delete` are all
+**refused** to the API token these playbooks use (verified 2026-08-25), while
+`.create` and `.update` are granted. Anything that genuinely needs deleting has
+to go through the UI or a wider token; the playbooks are written to create or
+update, never to require a delete.
+
+## Known gap
+
+The `Seagate ST2000DL003` with an active SMART failure — the drive that motivated
+this work — is **not on any of these four hosts**. It was not found on `pbs`,
+`pve`, `pve-ai` or `pve-router` on 2026-08-25, and `omv` exposes no SMART data
+through its virtual disks. Wherever that drive is attached, this setup does not
+currently watch it.
