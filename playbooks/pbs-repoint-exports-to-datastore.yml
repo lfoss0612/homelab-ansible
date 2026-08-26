@@ -1,0 +1,196 @@
+---
+# Repoint the argocd and scripts NFS exports from the full ext4 volume
+# (/mnt/backups) at the ZFS mirror (/mnt/datastore), where their contents were
+# copied on 2026-08-26.
+#
+#   before   /mnt/backups/argocd     ->  after   /mnt/datastore/argocd
+#   before   /mnt/backups/scripts    ->  after   /mnt/datastore/scripts
+#
+# The copies were verified first: a `find -printf "%p %s"` listing of every
+# regular file under each pair of directories is byte-for-byte identical
+# (10 files argocd, 5 files scripts). `du` disagrees only because the ZFS side
+# is compressed.
+#
+# REPLACE, NOT ADD - deliberately, and unlike
+# playbooks/pbs-export-longhorn-datastore.yml which was purely additive. The
+# old paths are removed in the same pass, so a client cannot silently keep
+# reading the stale ext4 copy. The consequence is accepted and not subtle:
+#
+#   - pve-router has 10.0.5.5:/mnt/backups/scripts mounted at /mnt/scripts
+#     RIGHT NOW. That mount breaks the moment this runs and must be remounted
+#     against the new path. pve-router hosts the OPNsense VM the whole house
+#     network runs on, but /mnt/scripts is not on any boot or routing path -
+#     the blast radius is the mount itself, not the router.
+#   - k8s-master carries the argocd mount in /etc/fstab only; it is not
+#     mounted at the moment, so nothing breaks until something mounts it.
+#
+# Both client-side /etc/fstab entries still point at /mnt/backups/... and are
+# NOT touched here - this play is the server half only.
+#
+# fsids are carried over unchanged (3/13 argocd, 4/14 scripts) rather than
+# renumbered: the export identity is the same, only its backing path moved.
+# Because the backing filesystem genuinely changes (ext4 -> zfs) under a
+# reused fsid, any client still holding the old mount gets ESTALE rather than
+# a silent switch. That is the desired failure - loud, and fixed by a remount.
+#
+# NOT TEMPLATED, for the same reason the longhorn play wasn't: /etc/exports on
+# pbs is not otherwise Ansible-managed and carries /srv/nfs/template, which
+# pve, pve-ai and pve-router mount at /mnt/pve/template right now. lineinfile
+# touches two lines and cannot disturb the others.
+#
+# `switches` is deliberately absent. /mnt/backups/switches was never exported
+# at all - it is in neither /etc/exports nor `exportfs -v` - so there is no
+# export to repoint. Creating one would be a new export, not this change.
+#
+# Usage:
+#   ansible-playbook playbooks/pbs-repoint-exports-to-datastore.yml --check --diff
+#   ansible-playbook playbooks/pbs-repoint-exports-to-datastore.yml
+
+- name: Repoint the argocd and scripts exports at the ZFS mirror
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    # `clients` reproduces the existing client lists verbatim. The 10.0.3.0/24
+    # entries are carried across unexamined: no host on that network has an
+    # active NFS connection to pbs, but dropping them is a separate decision
+    # from moving the path, and this play makes one change at a time.
+    export_moves:
+      - name: argocd
+        old_path: /mnt/backups/argocd
+        new_path: /mnt/datastore/argocd
+        clients: "10.2.5.2/32(fsid=3,rw,sync,no_root_squash) 10.0.3.0/24(fsid=13,rw,sync,no_root_squash)"
+      - name: scripts
+        old_path: /mnt/backups/scripts
+        new_path: /mnt/datastore/scripts
+        clients: "10.0.5.0/24(fsid=4,rw,sync,no_root_squash) 10.0.3.0/24(fsid=14,rw,sync,no_root_squash)"
+
+    # The one filesystem all the new paths must resolve to. See the mountpoint
+    # assert below for why this is checked by backing device rather than by
+    # findmnt reporting the path itself as a mountpoint.
+    datastore_pool: backup10tb
+
+  tasks:
+    - name: Assert each new path exists and is a directory
+      ansible.builtin.stat:
+        path: "{{ item.new_path }}"
+      loop: "{{ export_moves }}"
+      loop_control:
+        label: "{{ item.new_path }}"
+      register: new_path_stat
+      failed_when: not (new_path_stat.stat.exists | default(false) and new_path_stat.stat.isdir | default(false))
+      changed_when: false
+
+    # Unlike longhorn_backups, these two are NOT ZFS datasets of their own -
+    # they are plain directories inside the backup10tb root dataset, so
+    # `findmnt --target` reports the mountpoint as /mnt/datastore, not as the
+    # directory itself. Asserting "is a mountpoint" (as the longhorn play does)
+    # would therefore fail here even though the path is correct.
+    #
+    # What still has to be true is that the path is served by the ZFS pool and
+    # not by some unmounted stand-in directory: if backup10tb ever failed to
+    # mount, /mnt/datastore/argocd would resolve to an empty directory on the
+    # root filesystem and this play would happily export nothing.
+    - name: Confirm each new path is backed by the ZFS pool, not an unmounted stand-in
+      ansible.builtin.command: findmnt --noheadings --output SOURCE,FSTYPE --target "{{ item.new_path }}"
+      loop: "{{ export_moves }}"
+      loop_control:
+        label: "{{ item.new_path }}"
+      register: new_path_mount
+      changed_when: false
+      failed_when: >-
+        new_path_mount.rc != 0
+        or 'zfs' not in new_path_mount.stdout
+        or datastore_pool not in new_path_mount.stdout
+
+    - name: Refuse to export an empty directory
+      ansible.builtin.find:
+        paths: "{{ item.new_path }}"
+        file_type: file
+        recurse: true
+      loop: "{{ export_moves }}"
+      loop_control:
+        label: "{{ item.new_path }}"
+      register: new_path_files
+      failed_when: new_path_files.matched | default(0) == 0
+      changed_when: false
+
+    - name: Repoint the export at the new path
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        # Matches EITHER path on purpose. Anchoring on old_path alone would
+        # make this play non-idempotent in the worst way: on a second run the
+        # old path is gone, the regexp misses, and lineinfile APPENDS a
+        # duplicate export instead of leaving the file alone. Matching the new
+        # path too means a re-run replaces the line with itself.
+        regexp: '^({{ item.old_path | regex_escape }}|{{ item.new_path | regex_escape }})\s'
+        line: "{{ item.new_path }} {{ item.clients }}"
+        # Only consulted if the regexp matches nothing at all (someone having
+        # already hand-removed the line); keeps the append in the right section.
+        insertafter: '^# Backups'
+        owner: root
+        group: root
+        mode: "0644"
+        # lineinfile's own backup, rather than a separate copy task, so that a
+        # no-op re-run writes nothing at all. A date-stamped copy task collided
+        # with the backup pbs-export-longhorn-datastore.yml already writes on
+        # the same day, and silently kept the older file; a time-stamped one
+        # avoided the collision but then wrote a fresh .bak on EVERY run and
+        # never reported green. This backs up only when a line genuinely
+        # changes, and the first of the two loop iterations captures the true
+        # pre-change file.
+        backup: true
+        # No `validate:` here on purpose - see the note in
+        # pbs-export-longhorn-datastore.yml. exportfs has no file-syntax check
+        # mode, so `exportfs -s -f %s` reads the temp path as an export name
+        # and fails every time. Tried 2026-08-25; do not re-add it.
+      loop: "{{ export_moves }}"
+      loop_control:
+        label: "{{ item.old_path }} -> {{ item.new_path }}"
+      notify: reload nfs exports
+
+    - name: Apply now rather than waiting for the handler
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read back the active exports
+      ansible.builtin.command: exportfs -v
+      register: active_exports
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm each new export is live and the old one is gone
+      ansible.builtin.assert:
+        that:
+          - item.new_path in active_exports.stdout
+          - item.old_path not in active_exports.stdout
+        fail_msg: >-
+          Export for {{ item.name }} is wrong after reload: expected
+          {{ item.new_path }} present and {{ item.old_path }} absent in
+          `exportfs -v`. Output: {{ active_exports.stdout }}
+        success_msg: "{{ item.name }}: {{ item.new_path }} is exported, {{ item.old_path }} is withdrawn."
+      loop: "{{ export_moves }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not ansible_check_mode
+
+    # /srv/nfs/template is mounted at /mnt/pve/template on three hypervisors
+    # and has nothing to do with this change. If it went missing, `exportfs -ra`
+    # or the edit did something it should not have.
+    - name: Confirm the unrelated Proxmox template export survived
+      ansible.builtin.assert:
+        that:
+          - "'/srv/nfs/template' in active_exports.stdout"
+        fail_msg: "/srv/nfs/template disappeared from the export table. Restore /etc/exports from the .bak file on pbs."
+        success_msg: "/srv/nfs/template is untouched."
+      when: not ansible_check_mode
+
+    - name: Show the export table
+      ansible.builtin.debug:
+        msg: "{{ active_exports.stdout_lines }}"
+
+  handlers:
+    - name: reload nfs exports
+      # -ra re-exports from /etc/exports without dropping existing client
+      # mounts, so the three Proxmox hosts holding /mnt/pve/template and the
+      # Longhorn clients on /mnt/datastore/longhorn_backups are undisturbed.
+      ansible.builtin.command: exportfs -ra
