@@ -52,12 +52,20 @@
     mode: '0644'
   notify: systemd_daemon_reload
 
+# Skipped under --check on purpose. The unit file above has not actually been
+# written in check mode, so systemd cannot find the timer and the task fails
+# with "Could not find the requested service smart-monitor.timer" on any host
+# that does not already have it — i.e. every NEW host, which is precisely when
+# a clean dry run matters most. A dry run that always fails on a new host
+# teaches people to skim past failures, which is the habit this whole area
+# already suffered from.
 - name: Enable and start SMART monitoring timer
   ansible.builtin.systemd_service:
     name: smart-monitor.timer
     enabled: true
     state: started
     daemon_reload: true
+  when: not ansible_check_mode
 
 - name: Configure smartd to execute on errors (optional)
   ansible.builtin.lineinfile:
