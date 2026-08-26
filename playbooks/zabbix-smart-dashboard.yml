@@ -81,6 +81,34 @@
       - threshold: "75"
         color: "F44336"
 
+    # ---------------------------------------------------------------------
+    # Per-cell label for the three "every drive" honeycombs.
+    #
+    # Left unset, Zabbix's own default is {HOST.NAME} — the SAME text on
+    # every cell for a given host, so pve's 7 drives all read "pve.home.lan"
+    # with no way to tell sda from nvme0. Verified live on dashboard 404
+    # 2026-08-25: no primary_label field was ever set, so this default was
+    # in effect from the start.
+    #
+    # {{HOST.NAME}.regsub(...)} is ZABBIX macro-function syntax, resolved
+    # server-side, not Jinja — but "{{" / "}}" is also Ansible's own Jinja
+    # delimiter, and here neither macro has a literal "}}" pair for Jinja to
+    # close on, so unwrapped this fails exactly like the {#DEV} LLD macros
+    # did (see smart-monitor-zabbix-setup.yml): {% raw %} is required.
+    #
+    # regsub("^([^.]+).*", "\1") on {HOST.NAME} strips ".home.lan" (FQDN ->
+    # short name). regsub("^SMART (\S+).*", "\1") on {ITEM.NAME} pulls the
+    # device id back out of the name this same playbook set in
+    # smart-monitor-zabbix-setup.yml ("SMART sda (WDC ...): health status"
+    # -> "sda") — \S+ stops at the first space, before the model in
+    # parentheses, which is why the model is never captured.
+    #
+    # Single source of truth: one var, reused by all three widgets, so a
+    # future change to either regsub pattern cannot update two of three and
+    # miss the third.
+    smart_drive_cell_label: >-
+      {% raw %}{{HOST.NAME}.regsub("^([^.]+).*", "\1")}/{{ITEM.NAME}.regsub("^SMART (\S+).*", "\1")}{% endraw %}
+
   tasks:
     - name: Resolve the host group
       ansible.builtin.uri:
@@ -175,6 +203,7 @@
                 fields:
                   - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
                   - {type: 1, name: "items.0", value: "{{ pattern_health }}"}
+                  - {type: 1, name: "primary_label", value: "{{ smart_drive_cell_label }}"}
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
                   - {type: 1, name: "thresholds.0.threshold", value: "0"}
                   - {type: 1, name: "thresholds.1.color", value: "F44336"}
@@ -195,6 +224,7 @@
                 fields:
                   - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
                   - {type: 1, name: "items.0", value: "{{ pattern_failed }}"}
+                  - {type: 1, name: "primary_label", value: "{{ smart_drive_cell_label }}"}
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
                   - {type: 1, name: "thresholds.0.threshold", value: "0"}
                   - {type: 1, name: "thresholds.1.color", value: "F44336"}
@@ -210,6 +240,7 @@
                 fields:
                   - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
                   - {type: 1, name: "items.0", value: "{{ pattern_temperature }}"}
+                  - {type: 1, name: "primary_label", value: "{{ smart_drive_cell_label }}"}
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
                   - {type: 1, name: "thresholds.0.threshold", value: "0"}
                   - {type: 1, name: "thresholds.1.color", value: "FF9800"}
