@@ -43,6 +43,11 @@ MOUNT_POINT="${MOUNT_POINT:-/mnt/k8s-etcd-backup-nfs}"
 RKE2_SERVER_DIR="${RKE2_SERVER_DIR:-/var/lib/rancher/rke2/server}"
 HOST_TAG="${HOST_TAG:-$(hostname -s)}"
 
+# 183 days ~= 6 months. Applies ONLY to the off-node copy on pbs, never to
+# RKE2's own local retention (already correctly handled by RKE2 itself, at
+# its own default of 5 snapshots -- not this script's concern).
+RETENTION_DAYS="${RETENTION_DAYS:-183}"
+
 log() { printf '%s\n' "$*" >&2; }
 
 cleanup() {
@@ -74,10 +79,9 @@ mkdir -p "$dest_snapshots" "$dest_serverdir"
 # -a preserves ownership and permissions, which matters here specifically:
 # the private keys under tls*/ and cred/ are 0600 and must stay that way.
 # --numeric-ids avoids remapping through name lookups across hosts.
-# No --delete: this is a growing off-node history, not a mirror. Capacity is
-# trivial (checked 2026-08-25: ~1.1 MB for server-config, tens of MB per
-# snapshot) against 6+ TB free, so retaining more history than RKE2's own
-# on-node retention of 5 is a feature, not something to prune here.
+# No --delete: this is a growing off-node history, not a mirror -- retaining
+# more than RKE2's own local 5-snapshot window is the point. Age-based
+# retention (6 months) is handled separately, below, after the sync.
 rc=0
 
 log "Syncing etcd snapshots..."
@@ -88,10 +92,46 @@ rsync -a --numeric-ids \
 	--exclude=db \
 	"$RKE2_SERVER_DIR/" "$dest_serverdir/" || rc=1
 
+# --- retention on the OFF-NODE copy only -----------------------------------
+#
+# rsync above runs with no --delete, so left alone this archive grows forever
+# -- deliberately, so it always holds MORE history than RKE2's own local
+# 5-snapshot window. This caps that growth at 6 months rather than removing
+# the accumulation entirely.
+#
+# Only runs when the sync above succeeded: pruning old, already-safely-copied
+# entries is independent of whether THIS run's transfer worked, but skipping
+# it on failure keeps the failure mode simple -- one bad run costs a skipped
+# prune cycle, not a partially-synced destination with stale entries removed
+# out from under it.
+#
+# `-mindepth 1 -maxdepth 1` operates on each top-level entry as a unit (a
+# whole etcd-snapshot-* file, or a whole tls-<timestamp>/ directory), not on
+# files buried inside one -- `-mtime` on a directory reflects when ITS
+# CONTENTS last changed, so pruning by the top-level entry's own age is what
+# actually corresponds to "this backup is over 6 months old", and `-exec rm
+# -rf` handles either a plain file or a directory as one unit either way.
+if [ "$rc" -eq 0 ]; then
+	log "Pruning off-node history older than ${RETENTION_DAYS}d..."
+
+	# Snapshots: prune the whole etcd-snapshots tree by age. Also clears out
+	# artifacts like an empty directory left by a long-past failed snapshot
+	# attempt -- confirmed 2026-08-26 that one such leftover from 2026-02-10
+	# exists on this host and RKE2's own retention never cleaned it up.
+	find "$dest_snapshots" -mindepth 1 -maxdepth 1 -mtime "+${RETENTION_DAYS}" -exec rm -rf {} + || rc=1
+
+	# Credentials: only the HISTORICAL tls-<timestamp>/ directories are dated
+	# history subject to retention. The glob `tls-*` cannot match the bare
+	# `tls` directory (no dash), so the CURRENT live tls/, cred/, etc/,
+	# manifests/ and token are never touched by this -- there is nothing to
+	# prune there, only current state to keep.
+	find "$dest_serverdir" -mindepth 1 -maxdepth 1 -name 'tls-*' -mtime "+${RETENTION_DAYS}" -exec rm -rf {} + || rc=1
+fi
+
 if [ "$rc" -eq 0 ]; then
 	log "OK: etcd snapshots and server config synced to $NFS_SERVER:$NFS_EXPORT"
 else
-	log "ERROR: rsync reported a failure -- see the messages above."
+	log "ERROR: rsync or retention pruning reported a failure -- see the messages above."
 fi
 
 exit "$rc"
