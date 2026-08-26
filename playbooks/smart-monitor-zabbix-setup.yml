@@ -85,21 +85,27 @@
           stopped seeing its disks must never look the same as a host with no
           faults.
 
+    # ---------------------------------------------------------------------
+    # {% raw %} is not decoration. Zabbix LLD macros are written {#DEV}, and
+    # `{#` is JINJA COMMENT SYNTAX -- Ansible parses "smart.drive[{#DEV}..."
+    # as the start of a comment and dies with "Missing end of comment tag".
+    # Every scalar below that contains a {#MACRO} has to be escaped this way.
+    # ---------------------------------------------------------------------
     smart_item_prototypes:
-      - key: "smart.drive[{#DEV},status]"
-        name: "SMART {#DEV} ({#MODEL}): health status"
+      - key: "{% raw %}smart.drive[{#DEV},status]{% endraw %}"
+        name: "{% raw %}SMART {#DEV} ({#MODEL}): health status{% endraw %}"
         valuemap: "SMART status"
         description: "0 = passed, 1 = FAILED, 2 = unreadable."
-      - key: "smart.drive[{#DEV},failed_attrs]"
-        name: "SMART {#DEV} ({#MODEL}): failed attributes"
+      - key: "{% raw %}smart.drive[{#DEV},failed_attrs]{% endraw %}"
+        name: "{% raw %}SMART {#DEV} ({#MODEL}): failed attributes{% endraw %}"
         valuemap: "SMART attribute state"
         description: >-
           1 when any SMART attribute has gone below threshold (ATA WHEN_FAILED
           column), or when an NVMe reports a critical warning or media errors.
           Fires ahead of overall health, which stays PASSED until the drive is
           nearly gone.
-      - key: "smart.drive[{#DEV},temperature]"
-        name: "SMART {#DEV} ({#MODEL}): temperature"
+      - key: "{% raw %}smart.drive[{#DEV},temperature]{% endraw %}"
+        name: "{% raw %}SMART {#DEV} ({#MODEL}): temperature{% endraw %}"
         units: "°C"
         description: "Composite temperature for NVMe; attribute 194/190 for ATA."
 
@@ -107,29 +113,29 @@
     # A distinctive placeholder rather than a bare word, so the replacement
     # cannot chew through an unrelated substring of an expression.
     smart_trigger_prototypes:
-      - description: "SMART {#DEV} on @HOST@ reports FAILED"
-        expression: "last(/@HOST@/smart.drive[{#DEV},status])=1"
+      - description: "{% raw %}SMART {#DEV} on @HOST@ reports FAILED{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},status])=1{% endraw %}"
         priority: 4        # High
         comments: >-
           The drive's own overall health self-assessment has failed. Replace it;
           this verdict does not clear on its own.
-      - description: "SMART {#DEV} on @HOST@ has failed attributes"
-        expression: "last(/@HOST@/smart.drive[{#DEV},failed_attrs])=1"
+      - description: "{% raw %}SMART {#DEV} on @HOST@ has failed attributes{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},failed_attrs])=1{% endraw %}"
         priority: 4        # High
         comments: >-
           An individual attribute is below threshold (reallocated sectors,
           pending sectors, NVMe media errors). This is the EARLY warning and
           usually precedes an overall-health failure by weeks.
-      - description: "SMART {#DEV} on @HOST@ is unreadable"
-        expression: "last(/@HOST@/smart.drive[{#DEV},status])=2"
+      - description: "{% raw %}SMART {#DEV} on @HOST@ is unreadable{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},status])=2{% endraw %}"
         priority: 2        # Warning
         comments: >-
           smartctl enumerated the drive but could not get health data from it —
           often a failing USB/SATA bridge rather than the disk itself. Compare
           against the known-bad VIA VL711 enclosure before condemning a drive.
-      - description: "SMART {#DEV} on @HOST@ is over temperature"
+      - description: "{% raw %}SMART {#DEV} on @HOST@ is over temperature{% endraw %}"
         expression: >-
-          last(/@HOST@/smart.drive[{#DEV},temperature])>{$SMART.TEMP.MAX:"{#TYPE}"}
+          {% raw %}last(/@HOST@/smart.drive[{#DEV},temperature])>{$SMART.TEMP.MAX:"{#TYPE}"}{% endraw %}
         priority: 2        # Warning
         comments: >-
           Threshold comes from the per-class context macro {$SMART.TEMP.MAX},
