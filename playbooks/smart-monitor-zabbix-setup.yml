@@ -113,27 +113,27 @@
     # A distinctive placeholder rather than a bare word, so the replacement
     # cannot chew through an unrelated substring of an expression.
     smart_trigger_prototypes:
-      - description: "{% raw %}SMART {#DEV} on @HOST@ reports FAILED{% endraw %}"
+      - description: "{% raw %}SMART {#DEV} on {HOST.NAME} reports FAILED{% endraw %}"
         expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},status])=1{% endraw %}"
         priority: 4        # High
         comments: >-
           The drive's own overall health self-assessment has failed. Replace it;
           this verdict does not clear on its own.
-      - description: "{% raw %}SMART {#DEV} on @HOST@ has failed attributes{% endraw %}"
+      - description: "{% raw %}SMART {#DEV} on {HOST.NAME} has failed attributes{% endraw %}"
         expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},failed_attrs])=1{% endraw %}"
         priority: 4        # High
         comments: >-
           An individual attribute is below threshold (reallocated sectors,
           pending sectors, NVMe media errors). This is the EARLY warning and
           usually precedes an overall-health failure by weeks.
-      - description: "{% raw %}SMART {#DEV} on @HOST@ is unreadable{% endraw %}"
+      - description: "{% raw %}SMART {#DEV} on {HOST.NAME} is unreadable{% endraw %}"
         expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},status])=2{% endraw %}"
         priority: 2        # Warning
         comments: >-
           smartctl enumerated the drive but could not get health data from it —
           often a failing USB/SATA bridge rather than the disk itself. Compare
           against the known-bad VIA VL711 enclosure before condemning a drive.
-      - description: "{% raw %}SMART {#DEV} on @HOST@ is over temperature{% endraw %}"
+      - description: "{% raw %}SMART {#DEV} on {HOST.NAME} is over temperature{% endraw %}"
         expression: >-
           {% raw %}last(/@HOST@/smart.drive[{#DEV},temperature])>{$SMART.TEMP.MAX:"{#TYPE}"}{% endraw %}
         priority: 2        # Warning
@@ -142,11 +142,11 @@
           so ATA and NVMe are judged on different scales.
 
     smart_aggregate_triggers:
-      - description: "SMART on @HOST@: a drive is failing"
+      - description: "SMART on {HOST.NAME}: a drive is failing"
         expression: "last(/@HOST@/smart.status)=1"
         priority: 4
         comments: "Roll-up. The per-drive trigger names which one."
-      - description: "SMART on @HOST@: a drive is unreadable or none detected"
+      - description: "SMART on {HOST.NAME}: a drive is unreadable or none detected"
         expression: "last(/@HOST@/smart.status)=2"
         priority: 2
       # The most important trigger in this file. Everything above depends on the
@@ -155,7 +155,7 @@
       # out a reboot, short enough to catch a monitor that has quietly died.
       # This is the check the fleet-update work had to learn the hard way, where
       # a dead notifier looked exactly like a healthy fleet for two weeks.
-      - description: "SMART on @HOST@: monitoring has stopped reporting"
+      - description: "SMART on {HOST.NAME}: monitoring has stopped reporting"
         expression: "nodata(/@HOST@/smart.status,2h)=1"
         priority: 3        # Average
         manual_close: 1
