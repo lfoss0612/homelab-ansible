@@ -38,8 +38,13 @@
     # every host while reporting success — the same hardcoded-agent1-path bug
     # that had already killed the fleet-update notifier. Probe for the tools the
     # script ACTUALLY needs instead of for a config file it never reads.
+    # `shell`, not `command`: `command -v` is a SHELL BUILTIN, and the command
+    # module executes the binary directly with no shell, so it can never
+    # succeed — it reported both tools missing on all four hosts, which was
+    # false (smartctl is /usr/sbin/smartctl, zabbix_sender is
+    # /usr/bin/zabbix_sender, on every one of them).
     - name: Check for the tools the monitor depends on
-      ansible.builtin.command: "command -v {{ item }}"
+      ansible.builtin.shell: "command -v {{ item }}"
       loop:
         - smartctl
         - zabbix_sender
