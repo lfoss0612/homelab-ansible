@@ -1,0 +1,69 @@
+---
+# Install the etcd/server-config backup script, timer and service.
+# Included by playbooks/k8s-etcd-backup.yml, which owns the variables used
+# here (nfs_server, nfs_export, backup_script_dest).
+
+- name: Deploy the etcd backup script
+  ansible.builtin.copy:
+    src: ../scripts/k8s-etcd-backup.sh
+    dest: "{{ backup_script_dest }}"
+    mode: "0700"
+    owner: root
+    group: root
+  notify: systemd_daemon_reload
+
+- name: Create the etcd backup service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=Copy etcd snapshots and RKE2 server config to pbs
+      Documentation=file://{{ backup_script_dest }}
+      # Runs independently of RKE2's own snapshot job on purpose - this only
+      # copies whatever snapshots already exist. If it runs between two
+      # snapshot cycles it simply re-syncs the same files (idempotent, cheap).
+      After=network-online.target rke2-server.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      Environment="NFS_SERVER={{ k8s_backup_nfs_server }}"
+      Environment="NFS_EXPORT={{ k8s_backup_nfs_export }}"
+      ExecStart={{ backup_script_dest }}
+      StandardOutput=journal
+      StandardError=journal
+    dest: /etc/systemd/system/k8s-etcd-backup.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: systemd_daemon_reload
+
+- name: Create the etcd backup timer
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=Periodically copy etcd snapshots and RKE2 server config to pbs
+
+      [Timer]
+      OnBootSec=10min
+      # Hourly comfortably beats RKE2's own 12h snapshot cadence without being
+      # wasteful - the script is idempotent and each run costs a few seconds
+      # once already synced, so precise alignment with the snapshot cron buys
+      # nothing over just checking often.
+      OnUnitActiveSec=1h
+      AccuracySec=1min
+
+      [Install]
+      WantedBy=timers.target
+    dest: /etc/systemd/system/k8s-etcd-backup.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: systemd_daemon_reload
+
+- name: Enable and start the timer
+  ansible.builtin.systemd_service:
+    name: k8s-etcd-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode

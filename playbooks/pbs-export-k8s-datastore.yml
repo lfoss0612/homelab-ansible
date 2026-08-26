@@ -1,0 +1,155 @@
+---
+# Create and export the k8s_backups dataset on the ZFS mirror, so k8s-master's
+# etcd snapshots and RKE2 server credential material have an off-node copy.
+#
+# Sits alongside the other datastores on backup10tb:
+#   host_backups, photo_backups, vm_backups, longhorn_backups, k8s_backups
+#
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: RKE2's automatic etcd snapshots
+# (/var/lib/rancher/rke2/server/db/snapshots, every 12h, retention 5) live on
+# the SAME disk as the etcd data they protect. On this cluster there is
+# exactly one control-plane node - k8s-master - so a snapshot that never
+# leaves that host protects against etcd corrupting itself, but not against
+# the host or its disk failing outright, which is the actual "critical
+# failure" this was built for.
+#
+# WHAT ELSE GOES HERE, AND WHY IT IS NOT JUST THE SNAPSHOTS: an etcd snapshot
+# alone cannot rebuild a cluster. Checked live on k8s-master 2026-08-26:
+#   - tls/ plus THREE historical tls-<timestamp>/ directories from past cert
+#     rotations. RKE2's own restore docs require the tls state that matches
+#     the snapshot being restored; keeping only the current tls/ risks a
+#     mismatch against an older snapshot, so all of them are backed up rather
+#     than guessing which one pairs with which snapshot.
+#   - cred/encryption-config.json and encryption-state.json - the keys that
+#     decrypt Kubernetes Secrets stored INSIDE the etcd snapshot. Without
+#     these, a restored snapshot's Secrets are permanently unreadable, which
+#     defeats the point of the backup for most of what actually matters in
+#     it. This is the item most likely to be missed by copying "just tls/".
+#   - token (the cluster join secret) and the small etc/, manifests/ dirs.
+# The whole server/ directory is backed up EXCEPT db/ (the live etcd data
+# itself, already covered by the snapshot mechanism and not a valid
+# point-in-time copy if taken while etcd is running) - deliberately not a
+# hand-picked subdirectory list, so a future RKE2 version adding a new
+# credential file under server/ is not silently missed. Total size checked
+# 2026-08-26: ~1.1 MB. Capacity is not a consideration here.
+# ---------------------------------------------------------------------------
+#
+# THIS EXPORT IS MORE SENSITIVE THAN THE OTHERS ON THIS HOST. It will hold the
+# cluster's CA private keys and Secret-encryption keys - the same class of
+# material as the OPNsense internal CA key already called out as sensitive in
+# this repo's CLAUDE.md. no_root_squash is still required (the backup script
+# writes as root, matching every other export here), but that means this
+# export is read-write to any root user on the k8s node network by design,
+# same tradeoff already accepted for the other exports.
+#
+# ADDITIVE, NOT TEMPLATED - deliberately, matching
+# pbs-export-longhorn-datastore.yml. /etc/exports is not otherwise
+# Ansible-managed and already carries exports three Proxmox hypervisors
+# depend on; lineinfile adds one line and cannot disturb the others.
+#
+# Exported to 10.2.5.0/24 only - the Kubernetes node network, the same scope
+# already used for the longhorn_backups export.
+#
+# fsid=6 is the next free value. Existing real exports use 1-5 and 11-14.
+#
+# Usage:
+#   ansible-playbook playbooks/pbs-export-k8s-datastore.yml --check --diff
+#   ansible-playbook playbooks/pbs-export-k8s-datastore.yml
+
+- name: Create and export the k8s_backups dataset from pbs
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    k8s_backups_dataset: backup10tb/k8s_backups
+    k8s_backups_path: /mnt/datastore/k8s_backups
+    k8s_backups_export_clients: "10.2.5.0/24(fsid=6,rw,sync,no_root_squash)"
+
+  tasks:
+    - name: Check whether the dataset already exists
+      ansible.builtin.command: "zfs list -H -o name {{ k8s_backups_dataset }}"
+      register: dataset_check
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Create the dataset
+      ansible.builtin.command: "zfs create {{ k8s_backups_dataset }}"
+      when: dataset_check.rc != 0
+
+    # 0700, not the 0755 the other datastores inherit from the pool default -
+    # this one holds private key material, so the directory itself should not
+    # be world-readable even before NFS's own ACL is considered.
+    - name: Lock down the dataset's local permissions
+      ansible.builtin.file:
+        path: "{{ k8s_backups_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # Exporting a path that is not a mountpoint silently exports the PARENT
+    # filesystem's directory instead - same check as the longhorn export,
+    # same reason: it would put this backup on the wrong volume with no error.
+    - name: Confirm it is actually a ZFS mountpoint, not just a directory
+      ansible.builtin.command: findmnt --noheadings --output SOURCE,FSTYPE --target "{{ k8s_backups_path }}"
+      register: dataset_mount
+      changed_when: false
+      failed_when: >-
+        dataset_mount.rc != 0
+        or 'zfs' not in dataset_mount.stdout
+        or 'k8s_backups' not in dataset_mount.stdout
+
+    - name: Back up /etc/exports before touching it
+      ansible.builtin.copy:
+        src: /etc/exports
+        dest: "/etc/exports.bak-{{ ansible_date_time.date }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+
+    - name: Add the k8s_backups export
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        regexp: '^{{ k8s_backups_path | regex_escape }}\s'
+        line: "{{ k8s_backups_path }} {{ k8s_backups_export_clients }}"
+        insertafter: '^# Backups'
+        owner: root
+        group: root
+        mode: "0644"
+        # No `validate:` - exportfs has no file-syntax check mode. See the
+        # identical note in pbs-export-longhorn-datastore.yml; same trap,
+        # same reason it is not repeated here.
+      notify: reload nfs exports
+
+    - name: Apply now rather than waiting for the handler
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read back the active exports
+      ansible.builtin.command: exportfs -v
+      register: active_exports
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm the new export is live
+      ansible.builtin.assert:
+        that:
+          - k8s_backups_path in active_exports.stdout
+        fail_msg: >-
+          {{ k8s_backups_path }} is not in `exportfs -v` output after reload.
+          Output: {{ active_exports.stdout }}
+        success_msg: "{{ k8s_backups_path }} is exported and live."
+      when: not ansible_check_mode
+
+    - name: Show the export table
+      ansible.builtin.debug:
+        msg: "{{ active_exports.stdout_lines }}"
+
+  handlers:
+    - name: reload nfs exports
+      # -ra re-exports everything from /etc/exports without dropping existing
+      # client mounts, so the other exports' active clients are undisturbed.
+      ansible.builtin.command: exportfs -ra

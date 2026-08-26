@@ -1,0 +1,76 @@
+---
+# Deploy the etcd/server-config backup to pbs on every RKE2 control-plane node.
+#
+# Targets [k8s_master] specifically, not [k8s] or [k8s_workers]: the etcd
+# snapshots and server/ credential material this backs up only exist on RKE2
+# SERVER (control-plane) nodes. Worker nodes have their own, differently-laid-
+# out agent state and no etcd role at all - running this against a worker
+# would just fail the initial directory check in the script, harmlessly, but
+# there is no reason to try.
+#
+# Depends on playbooks/pbs-export-k8s-datastore.yml having created and
+# exported the k8s_backups dataset first - run that one before this one.
+#
+# Usage:
+#   ansible-playbook playbooks/k8s-etcd-backup.yml --check --diff
+#   ansible-playbook playbooks/k8s-etcd-backup.yml
+#
+# Idempotent. Manual test without waiting for the timer:
+#   systemctl start k8s-etcd-backup.service
+#   journalctl -u k8s-etcd-backup.service -n 30
+
+- name: Deploy the etcd/server-config backup to pbs
+  hosts: k8s_master
+  become: true
+
+  vars:
+    backup_script_dest: /usr/local/sbin/k8s-etcd-backup
+    k8s_backup_nfs_server: "10.0.5.5"
+    k8s_backup_nfs_export: "/mnt/datastore/k8s_backups"
+
+  handlers:
+    - name: systemd_daemon_reload
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  tasks:
+    - name: Confirm this is an RKE2 server node before deploying anything
+      ansible.builtin.stat:
+        path: /var/lib/rancher/rke2/server/db/snapshots
+      register: rke2_snapshot_dir
+      failed_when: not (rke2_snapshot_dir.stat.isdir | default(false))
+
+    # `command -v` is a shell builtin; ansible.builtin.command runs the binary
+    # directly with no shell and can never find it. Same bug already caught
+    # once tonight in smart-monitor.yml - shell, not command, for this check.
+    - name: Check for the NFS client tooling the script needs
+      ansible.builtin.shell: "command -v mount.nfs4"
+      register: nfs4_tool
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Fail loudly when NFSv4 client support is missing
+      ansible.builtin.assert:
+        that: nfs4_tool.rc == 0
+        fail_msg: >-
+          mount.nfs4 not found on {{ inventory_hostname }}. Install
+          nfs-common (or equivalent) before deploying this backup.
+
+    - name: Install the backup script, timer and service
+      ansible.builtin.include_tasks: tasks/k8s-etcd-backup-setup.yml
+
+    - name: Run an initial backup now, rather than waiting up to an hour
+      ansible.builtin.command: "{{ backup_script_dest }}"
+      environment:
+        NFS_SERVER: "{{ k8s_backup_nfs_server }}"
+        NFS_EXPORT: "{{ k8s_backup_nfs_export }}"
+      register: initial_backup
+      changed_when: false
+      failed_when: initial_backup.rc != 0
+      when: not ansible_check_mode
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: "{{ initial_backup.stderr_lines | default([]) }}"
+      when: not ansible_check_mode
