@@ -116,6 +116,83 @@
   changed_when: smart_macro_update.json.result is defined
   failed_when: smart_macro_update.json.error is defined
 
+# --- value maps -------------------------------------------------------------
+# Without these every status reads as a bare 0/1/2 — in the item list, in alert
+# messages, in dashboard cells and in graphs alike. Value maps are per-host in
+# Zabbix 6+, so each host needs its own copy.
+# `valuemap.delete` is refused to this token even now that get/create are
+# granted, so these are create-only; a wrong mapping has to be fixed by update
+# or in the UI.
+
+- name: "{{ smart_host }} — read existing value maps"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: valuemap.get
+      params:
+        output: ["valuemapid", "name"]
+        hostids: ["{{ smart_hostid }}"]
+      id: 1
+  register: smart_vm_lookup
+  check_mode: false
+  failed_when: smart_vm_lookup.json.error is defined
+
+- name: "{{ smart_host }} — create missing value maps"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: valuemap.create
+      params:
+        hostid: "{{ smart_hostid }}"
+        name: "{{ item.name }}"
+        mappings: "{{ item.mappings }}"
+      id: 1
+  loop: "{{ smart_valuemaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.name not in (smart_vm_lookup.json.result | default([]) | map(attribute='name') | list)
+  register: smart_vm_create
+  changed_when: smart_vm_create.json.result is defined
+  failed_when: smart_vm_create.json.error is defined
+
+- name: "{{ smart_host }} — re-read value maps so every id is known"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: valuemap.get
+      params:
+        output: ["valuemapid", "name"]
+        hostids: ["{{ smart_hostid }}"]
+      id: 1
+  register: smart_vm_final
+  check_mode: false
+  failed_when: smart_vm_final.json.error is defined
+
+# name -> id, so the item definitions can name a value map instead of carrying
+# an id that differs on every host.
+- name: "{{ smart_host }} — index value maps by name"
+  ansible.builtin.set_fact:
+    smart_valuemap_ids: >-
+      {{ dict(smart_vm_final.json.result | default([])
+              | map(attribute='name') | zip(
+              smart_vm_final.json.result | default([])
+              | map(attribute='valuemapid'))) }}
+
 # --- aggregate trapper items ------------------------------------------------
 
 - name: "{{ smart_host }} — read existing SMART items"
@@ -154,6 +231,7 @@
         key_: "{{ item.key }}"
         type: 2               # Zabbix trapper
         value_type: 3         # numeric unsigned
+        valuemapid: "{{ smart_valuemap_ids.get(item.valuemap | default(''), 0) }}"
         description: "{{ item.description }}"
       id: 1
   loop: "{{ smart_aggregate_items }}"
@@ -274,6 +352,7 @@
         type: 2
         value_type: 3
         units: "{{ item.units | default('') }}"
+        valuemapid: "{{ smart_valuemap_ids.get(item.valuemap | default(''), 0) }}"
         description: "{{ item.description }}"
       id: 1
   loop: "{{ smart_item_prototypes }}"

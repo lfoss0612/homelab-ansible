@@ -102,6 +102,35 @@ KIOXIA idles at 68 °C. A single fleet-wide number would either cry wolf on ever
 NVMe or never fire on a cooking hard disk. Override per host in the Zabbix UI;
 the playbook reconciles the value if you change it in the playbook instead.
 
+## Dashboard
+
+`playbooks/zabbix-smart-dashboard.yml` builds **SMART Drive Health**: active SMART
+problems across the fleet, a per-host roll-up, and three honeycombs — one cell per
+drive for health, failed attributes and temperature — plus a temperature history
+graph.
+
+```bash
+sudo -n -H -u ansible ansible-playbook playbooks/zabbix-smart-dashboard.yml
+```
+
+Its widgets select items **by name pattern** (`SMART *: temperature`), not by id,
+because per-drive items are stamped out by discovery and do not exist when the
+playbook runs. Two consequences:
+
+- A swapped disk appears on the dashboard by itself, with no edit.
+- **Renaming an item prototype silently empties the matching widget.** The
+  prototype names in `smart-monitor-zabbix-setup.yml` and the patterns in the
+  dashboard playbook have to change together. It presents as a blank panel, never
+  as an error.
+
+The temperature honeycomb uses one class-agnostic colour scale (amber at 60 °C,
+red at 75 °C), so healthy NVMe shows amber at its normal 62–68 °C. That panel is
+for spotting the outlier in a grid; deciding what is actually out of spec is the
+*trigger's* job, and those use the per-class macros above.
+
+Statuses render as `OK` / `FAILED` / `Unreadable` rather than `0` / `1` / `2`,
+via per-host value maps the setup playbook creates.
+
 ## Manual testing
 
 ```bash
@@ -159,11 +188,12 @@ on — measure `{state: 1, status: 0}`, unsupported *and enabled*.
 
 ### Deleting objects
 
-`discoveryrule.delete`, `itemprototype.delete` and `usermacro.delete` are all
-**refused** to the API token these playbooks use (verified 2026-08-25), while
-`.create` and `.update` are granted. Anything that genuinely needs deleting has
-to go through the UI or a wider token; the playbooks are written to create or
-update, never to require a delete.
+Every `*.delete` method tried so far — `discoveryrule.delete`,
+`itemprototype.delete`, `usermacro.delete`, `valuemap.delete` — is **refused** to
+the API token these playbooks use, while `.create` and `.update` are granted
+(verified 2026-08-25). Anything that genuinely needs deleting has to go through
+the UI or a wider token; the playbooks are written to create or update, and never
+to require a delete.
 
 ## Known gap
 

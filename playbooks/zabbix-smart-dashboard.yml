@@ -1,0 +1,293 @@
+---
+# Build the "SMART Drive Health" Zabbix dashboard.
+#
+# Answers one question at a glance: is every physical disk in the fleet healthy,
+# and if not, which one. Before this there was no SMART dashboard at all — and
+# for most of the time SMART "monitoring" existed there was nothing to put on
+# one, since only 4 of 28 items had ever collected a value.
+#
+# Depends on playbooks/smart-monitor-zabbix-setup.yml having created the
+# discovery rule, and on each host having pushed at least one smart.discovery
+# payload. Until that happens the honeycombs render empty — the items they match
+# do not exist yet. That is not a dashboard fault; run smart-monitor.service.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-smart-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-smart-dashboard.yml
+#
+# Idempotent: creates the dashboard, or replaces its pages in place if it already
+# exists, keeping the same dashboardid and URL.
+#
+# ---------------------------------------------------------------------------
+# Widgets select items by PATTERN, not by item id or exact name.
+#
+# That is forced by low-level discovery: per-drive items are created by Zabbix
+# from prototypes, so their ids do not exist when this playbook runs and their
+# names carry the drive and model ("SMART sda (WDC WD101EFBX-68B0AN0):
+# temperature"). Patterns also mean a swapped disk appears on the dashboard by
+# itself, with no edit here.
+#
+# The consequence to remember: RENAMING AN ITEM PROTOTYPE IN
+# smart-monitor-zabbix-setup.yml SILENTLY EMPTIES THE MATCHING WIDGET. The
+# prototype names and the patterns below have to change together. Same coupling
+# as the fleet dashboard, and it presents the same way — a blank panel, never an
+# error.
+# ---------------------------------------------------------------------------
+
+- name: Build the SMART drive health dashboard
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_api: "http://10.0.5.9/zabbix/api_jsonrpc.php"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "SMART Drive Health"
+
+    # Scoped to a broad group ON PURPOSE, rather than to the four SMART hosts.
+    # No host group matches those four: "Linux servers" holds all 14 fleet hosts
+    # and "Proxmox Servers" holds the three PVE nodes but not pbs, which is bare
+    # metal. Scoping wide and letting the ITEM PATTERN do the real filtering is
+    # both simpler and self-maintaining — a host that has no SMART items
+    # contributes nothing, and a host that gains them appears with no edit here.
+    fleet_group_name: "Linux servers"
+
+    # Must match the item names in smart-monitor-zabbix-setup.yml. See header.
+    pattern_health: "SMART *: health status"
+    pattern_temperature: "SMART *: temperature"
+    pattern_failed: "SMART *: failed attributes"
+    name_rollup: "SMART: worst drive status"
+
+    # Thresholds colour a cell when value >= threshold, so these are read
+    # bottom-up. 0/1/2 = OK / FAILED / unreadable.
+    thresholds_health:
+      - threshold: "0"
+        color: "4CAF50"   # green  — passed
+      - threshold: "1"
+        color: "F44336"   # red    — FAILED
+      - threshold: "2"
+        color: "FF9800"   # amber  — unreadable
+    # Deliberately class-agnostic, unlike the ALERTS. A honeycomb cannot pick a
+    # different scale per drive type, so this shows NVMe amber at its normal
+    # 62-68 C. Judging whether that is actually too hot is the trigger's job,
+    # via the per-class {$SMART.TEMP.MAX:"{#TYPE}"} macros — this panel is for
+    # spotting the outlier in a grid, not for deciding what is out of spec.
+    thresholds_temperature:
+      - threshold: "0"
+        color: "4CAF50"
+      - threshold: "60"
+        color: "FF9800"
+      - threshold: "75"
+        color: "F44336"
+
+  tasks:
+    - name: Resolve the host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ fleet_group_name }}"]
+          id: 1
+      register: smart_group
+      check_mode: false
+      failed_when: >-
+        smart_group.json.error is defined
+        or (smart_group.json.result | default([]) | length) != 1
+
+    - name: Set the group id
+      ansible.builtin.set_fact:
+        smart_groupid: "{{ smart_group.json.result[0].groupid }}"
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: smart_dash_lookup
+      check_mode: false
+      failed_when: smart_dash_lookup.json.error is defined
+
+    - name: Assemble the page
+      ansible.builtin.set_fact:
+        smart_dashboard_pages:
+          - name: "Drive health"
+            widgets:
+              # What is wrong right now. Every SMART trigger description starts
+              # with "SMART", so one substring filter catches per-drive and
+              # aggregate alike.
+              - type: problems
+                name: "Active SMART problems"
+                x: 0
+                y: 0
+                width: 72
+                height: 4
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
+                  - {type: 1, name: "problem", value: "SMART"}
+                  - {type: 0, name: "show_lines", value: 15}
+                  - {type: 1, name: "reference", value: "SMTPR"}
+
+              # Per-host roll-up: four cells, one per host with disks.
+              - type: honeycomb
+                name: "Host roll-up"
+                x: 0
+                y: 4
+                width: 24
+                height: 7
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
+                  - {type: 1, name: "items.0", value: "{{ name_rollup }}"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
+                  - {type: 1, name: "thresholds.2.color", value: "FF9800"}
+                  - {type: 1, name: "thresholds.2.threshold", value: "2"}
+                  - {type: 1, name: "reference", value: "SMTRU"}
+
+              # One cell per DRIVE across every host — the "health of all the
+              # drives" view proper.
+              - type: honeycomb
+                name: "Every drive — health (green OK / red FAILED / amber unreadable)"
+                x: 24
+                y: 4
+                width: 48
+                height: 7
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
+                  - {type: 1, name: "items.0", value: "{{ pattern_health }}"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
+                  - {type: 1, name: "thresholds.2.color", value: "FF9800"}
+                  - {type: 1, name: "thresholds.2.threshold", value: "2"}
+                  - {type: 1, name: "reference", value: "SMTHC"}
+
+              # The early-warning signal. Overall health stays PASSED until a
+              # drive is nearly gone; a threshold-crossing attribute usually
+              # precedes that by weeks, so this panel is the one that buys time.
+              - type: honeycomb
+                name: "Every drive — failed attributes (the early warning)"
+                x: 0
+                y: 11
+                width: 24
+                height: 7
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
+                  - {type: 1, name: "items.0", value: "{{ pattern_failed }}"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
+                  - {type: 1, name: "reference", value: "SMTFA"}
+
+              - type: honeycomb
+                name: "Every drive — temperature (amber 60C+, red 75C+; NVMe idles warm)"
+                x: 24
+                y: 11
+                width: 48
+                height: 7
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ smart_groupid }}"}
+                  - {type: 1, name: "items.0", value: "{{ pattern_temperature }}"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "FF9800"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "60"}
+                  - {type: 1, name: "thresholds.2.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.2.threshold", value: "75"}
+                  - {type: 1, name: "reference", value: "SMTTC"}
+
+              # Trend matters more than any single reading: a drive warming
+              # steadily over weeks is a failing fan or a dying bearing, and no
+              # threshold catches that.
+              - type: svggraph
+                name: "Temperature history — all drives"
+                x: 0
+                y: 18
+                width: 72
+                height: 7
+                fields:
+                  - {type: 1, name: "ds.0.hosts.0", value: "*"}
+                  - {type: 1, name: "ds.0.items.0", value: "{{ pattern_temperature }}"}
+                  - {type: 0, name: "righty", value: 0}
+                  - {type: 1, name: "reference", value: "SMTGR"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            pages: "{{ smart_dashboard_pages }}"
+          id: 1
+      register: smart_dash_create
+      when: (smart_dash_lookup.json.result | default([]) | length) == 0
+      changed_when: smart_dash_create.json.result is defined
+      failed_when: smart_dash_create.json.error is defined
+
+    # Replaces the pages wholesale rather than diffing widgets: the dashboard is
+    # defined entirely by this file, so the playbook is the source of truth and a
+    # hand-edit in the UI is meant to be overwritten. Keeps the same dashboardid,
+    # so bookmarks and the URL survive.
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ smart_dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ smart_dashboard_pages }}"
+          id: 1
+      register: smart_dash_update
+      when: (smart_dash_lookup.json.result | default([]) | length) > 0
+      changed_when: smart_dash_update.json.result is defined
+      failed_when: smart_dash_update.json.error is defined
+
+    # Not a ternary: `x | length > 0 | ternary(...)` binds the filter tighter
+    # than the comparison and quietly evaluates as `length > (0 | ternary(...))`.
+    - name: Settle the dashboard id
+      ansible.builtin.set_fact:
+        smart_dashboardid: >-
+          {{ smart_dash_lookup.json.result[0].dashboardid
+             if (smart_dash_lookup.json.result | default([]) | length) > 0
+             else smart_dash_create.json.result.dashboardids[0] }}
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ dashboard_name }} →
+          http://10.0.5.9/zabbix/zabbix.php?action=dashboard.view&dashboardid={{ smart_dashboardid }}

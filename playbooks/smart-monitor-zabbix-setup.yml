@@ -56,9 +56,24 @@
       - macro: '{$SMART.TEMP.MAX}'
         value: "60"
 
+    # Value maps, so a status reads as OK / FAILED / Unreadable rather than as a
+    # bare 0, 1 or 2 — in the item list, in alert messages and in dashboard cells
+    # alike. Created per host, because Zabbix 6+ scopes value maps to a host.
+    smart_valuemaps:
+      - name: "SMART status"
+        mappings:
+          - {type: 0, value: "0", newvalue: "OK"}
+          - {type: 0, value: "1", newvalue: "FAILED"}
+          - {type: 0, value: "2", newvalue: "Unreadable"}
+      - name: "SMART attribute state"
+        mappings:
+          - {type: 0, value: "0", newvalue: "OK"}
+          - {type: 0, value: "1", newvalue: "Failed attribute"}
+
     smart_aggregate_items:
       - key: "smart.status"
         name: "SMART: worst drive status"
+        valuemap: "SMART status"
         description: >-
           0 = all drives healthy, 1 = a drive is failing or has failed
           attributes, 2 = a drive could not be read or none were detected.
@@ -73,9 +88,11 @@
     smart_item_prototypes:
       - key: "smart.drive[{#DEV},status]"
         name: "SMART {#DEV} ({#MODEL}): health status"
+        valuemap: "SMART status"
         description: "0 = passed, 1 = FAILED, 2 = unreadable."
       - key: "smart.drive[{#DEV},failed_attrs]"
         name: "SMART {#DEV} ({#MODEL}): failed attributes"
+        valuemap: "SMART attribute state"
         description: >-
           1 when any SMART attribute has gone below threshold (ATA WHEN_FAILED
           column), or when an NVMe reports a critical warning or media errors.
