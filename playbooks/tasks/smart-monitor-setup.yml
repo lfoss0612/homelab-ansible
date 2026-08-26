@@ -10,7 +10,6 @@
     mode: '0755'
     owner: root
     group: root
-  notify: smart_monitor_deployed
 
 - name: Create SMART monitoring timer
   ansible.builtin.copy:
