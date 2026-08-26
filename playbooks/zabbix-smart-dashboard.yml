@@ -279,15 +279,31 @@
 
     # Not a ternary: `x | length > 0 | ternary(...)` binds the filter tighter
     # than the comparison and quietly evaluates as `length > (0 | ternary(...))`.
-    - name: Settle the dashboard id
+    # Split in two, and both guarded, because under --check the create task is
+    # skipped and its registered result is a plain dict with no .json at all —
+    # reading through it raises rather than falling back to a default, so the
+    # dry run failed on a brand-new dashboard. Same shape as the discovery-rule
+    # id in tasks/smart-zabbix-host.yml.
+    - name: Settle the dashboard id (pre-existing)
       ansible.builtin.set_fact:
-        smart_dashboardid: >-
-          {{ smart_dash_lookup.json.result[0].dashboardid
-             if (smart_dash_lookup.json.result | default([]) | length) > 0
-             else smart_dash_create.json.result.dashboardids[0] }}
+        smart_dashboardid: "{{ smart_dash_lookup.json.result[0].dashboardid }}"
+      when: (smart_dash_lookup.json.result | default([]) | length) > 0
+
+    - name: Settle the dashboard id (just created)
+      ansible.builtin.set_fact:
+        smart_dashboardid: "{{ smart_dash_create.json.result.dashboardids[0] }}"
+      when:
+        - (smart_dash_lookup.json.result | default([]) | length) == 0
+        - smart_dash_create.json is defined
 
     - name: Report the dashboard URL
       ansible.builtin.debug:
         msg: >-
           {{ dashboard_name }} →
           http://10.0.5.9/zabbix/zabbix.php?action=dashboard.view&dashboardid={{ smart_dashboardid }}
+      when: smart_dashboardid is defined
+
+    - name: Note that the dashboard would be created
+      ansible.builtin.debug:
+        msg: "{{ dashboard_name }} does not exist yet and would be created by a real run."
+      when: smart_dashboardid is not defined
