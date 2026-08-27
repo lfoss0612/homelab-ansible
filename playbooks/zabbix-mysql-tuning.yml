@@ -1,0 +1,208 @@
+---
+# Tune the Zabbix MySQL backend on zabbix.home.lan
+#
+# zabbix.home.lan (VM 101 on pve-router) runs MySQL 8.0 on stock Debian/Ubuntu
+# defaults. Measured 2026-08-26, that meant:
+#
+#   innodb_buffer_pool_size          134217728   128 MB, in front of an 8.5 GB DB
+#   innodb_redo_log_capacity         104857600   100 MB
+#   innodb_flush_log_at_trx_commit   1           fsync on every commit
+#   innodb_flush_method              fsync       double-buffers through the guest page cache
+#
+# The VM had ~6 GB of its 8 GB free at the time, so this was never memory
+# pressure -- InnoDB was simply configured not to use memory it already had.
+#
+# Why this matters beyond MySQL: VM 101's writes were 4.13 MB/s of the 6.77 MB/s
+# hitting pve-router's single NVMe (the other VM on that disk is OPNsense, at
+# 0.032 MB/s -- it is not a factor). Of the device's busy time, nearly all was
+# cache-flush ops, ~119/sec, i.e. one fsync per commit. The counters show page
+# writes beating redo writes 47:1 (405 GB vs 8.5 GB lifetime), so the dominant
+# cost is dirty-page flushing, not logging: with a 128 MB pool that is 37% dirty,
+# a hot page is evicted, written back, re-read and re-dirtied over and over,
+# where a 3 GB pool holds it resident and writes it once per checkpoint.
+#
+# NOT a fix for the NVMe's temperature. That drive sits at 85.85 C on its
+# controller sensor with the chassis at 27.8 C, while being ~92% idle over its
+# lifetime (Controller Busy Time 25,833 min of 348,120). That is a heat-removal
+# problem and needs a heatsink reseat / airflow, not fewer writes. This playbook
+# is about write endurance and DB throughput only.
+#
+# Sizing: buffer pool must be a multiple of
+# innodb_buffer_pool_chunk_size * innodb_buffer_pool_instances (128 MB * 1 here)
+# or MySQL silently rounds up. 3G = 24 chunks exactly.
+#
+# 3G rather than 4G because VM 101 is memory: 8192 / balloon: 6144 -- the balloon
+# is a *minimum*, so the guest can legitimately sit at ~6.5 GB, and it has
+# Swap: 0. At 6.5 GB total with ~1.6 GB of non-mysqld RSS, a 4G pool (~4.5 GB
+# resident) leaves no margin and the failure mode is an OOM kill, not swapping.
+# To go to 4G, pin the VM's memory first -- `qm set 101 --balloon 0` on
+# pve-router, which needs -e confirm_pve_router=true -- then override
+# zabbix_innodb_buffer_pool_size below.
+#
+# Uses raw `mysql` CLI via root's unix_socket auth rather than community.mysql,
+# matching playbooks/configure-mysql-monitoring.yml and the stated preference in
+# collections/requirements.yml to avoid a third-party collection for a few tasks.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-mysql-tuning.yml --check --diff
+#   ansible-playbook playbooks/zabbix-mysql-tuning.yml
+#
+# Under --check the SET GLOBAL tasks report "skipping" -- that is the command
+# module having no check mode, NOT the `when` evaluating false. The read task
+# below carries check_mode: false precisely so the `when` conditions are still
+# evaluated against real values during a dry run, and the config-file diff is
+# accurate. See CLAUDE.md, "command tasks always report skipping under --check".
+
+- name: Tune InnoDB on the Zabbix MySQL backend
+  hosts: zabbix.home.lan
+  become: true
+
+  vars:
+    # Override per-host in host_vars/zabbix.home.lan.yml if the VM's memory
+    # allocation changes. Values are bytes, as SET GLOBAL expects.
+    zabbix_innodb_buffer_pool_size: 3221225472    # 3G  = 24 * 128 MB chunks
+    zabbix_innodb_redo_log_capacity: 1073741824   # 1G  (was 100 MB)
+    zabbix_innodb_flush_log_at_trx_commit: 2      # fsync ~1/s instead of per commit
+
+    zabbix_mysql_conf: /etc/mysql/mysql.conf.d/zz-zabbix-tuning.cnf
+
+    # Only settings that are dynamic in MySQL 8.0.30+ belong here, so a normal
+    # run needs no restart. innodb_flush_method is deliberately absent -- it is
+    # read-only at runtime and applies from the config file at next restart.
+    zabbix_innodb_dynamic:
+      - name: innodb_buffer_pool_size
+        value: "{{ zabbix_innodb_buffer_pool_size }}"
+      - name: innodb_redo_log_capacity
+        value: "{{ zabbix_innodb_redo_log_capacity }}"
+      - name: innodb_flush_log_at_trx_commit
+        value: "{{ zabbix_innodb_flush_log_at_trx_commit }}"
+
+  tasks:
+    - name: Confirm MySQL is reachable over root's unix socket
+      ansible.builtin.command:
+        cmd: mysql -N -B -e "SELECT VERSION()"
+      register: zbx_mysql_version
+      changed_when: false
+      check_mode: false
+
+    # innodb_redo_log_capacity supersedes innodb_log_file_size from 8.0.30 on,
+    # and only the former actually takes effect. Fail loudly rather than write a
+    # config file whose keys the running server would ignore.
+    - name: Assert MySQL is new enough for innodb_redo_log_capacity
+      ansible.builtin.assert:
+        that:
+          - zbx_mysql_version.stdout is version('8.0.30', '>=')
+        fail_msg: >-
+          MySQL {{ zbx_mysql_version.stdout }} predates innodb_redo_log_capacity
+          (8.0.30+). Use innodb_log_file_size instead, which needs a restart.
+
+    # The buffer pool must be a whole number of chunks * instances or MySQL
+    # rounds up silently, leaving the running value different from the declared
+    # one and this play permanently "changed".
+    - name: Read the buffer pool chunk size and instance count
+      ansible.builtin.command:
+        cmd: >-
+          mysql -N -B -e "SELECT @@GLOBAL.innodb_buffer_pool_chunk_size,
+          @@GLOBAL.innodb_buffer_pool_instances"
+      register: zbx_pool_geometry
+      changed_when: false
+      check_mode: false
+
+    - name: Assert the requested buffer pool size is a whole number of chunks
+      ansible.builtin.assert:
+        that:
+          - (zabbix_innodb_buffer_pool_size | int)
+            % ((zbx_pool_geometry.stdout.split()[0] | int)
+               * (zbx_pool_geometry.stdout.split()[1] | int)) == 0
+        fail_msg: >-
+          zabbix_innodb_buffer_pool_size ({{ zabbix_innodb_buffer_pool_size }})
+          is not a multiple of chunk_size * instances
+          ({{ zbx_pool_geometry.stdout.split()[0] }} *
+          {{ zbx_pool_geometry.stdout.split()[1] }}). MySQL would round it up.
+
+    # mysql.conf.d is included AFTER conf.d in /etc/mysql/my.cnf, and files
+    # within a directory load alphabetically -- so this must sort after the
+    # distro's own mysqld.cnf to win. Hence the zz- prefix.
+    #
+    # Deliberately NOT using SET PERSIST for any of this: that writes
+    # /var/lib/mysql/mysqld-auto.cnf, which MySQL reads after every !includedir
+    # and which would therefore silently override this Ansible-managed file.
+    - name: Install the InnoDB tuning drop-in
+      ansible.builtin.copy:
+        dest: "{{ zabbix_mysql_conf }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by playbooks/zabbix-mysql-tuning.yml -- do not edit by hand.
+          #
+          # Loaded after /etc/mysql/mysql.conf.d/mysqld.cnf (alphabetical order
+          # within the last !includedir), so these win over the distro defaults.
+          [mysqld]
+          innodb_buffer_pool_size        = {{ zabbix_innodb_buffer_pool_size }}
+          innodb_redo_log_capacity       = {{ zabbix_innodb_redo_log_capacity }}
+          innodb_flush_log_at_trx_commit = {{ zabbix_innodb_flush_log_at_trx_commit }}
+
+          # Restart-only. With a multi-GB buffer pool the guest page cache is
+          # just a second copy of pages InnoDB already holds -- and the host
+          # caches them a third time in ZFS ARC. O_DIRECT drops the guest-side
+          # copy. Applies at the next MySQL restart; this play does not restart
+          # MySQL, because that stops Zabbix collection.
+          innodb_flush_method            = O_DIRECT
+
+    - name: Read the running values of the dynamic settings
+      ansible.builtin.command:
+        cmd: mysql -N -B -e "SELECT @@GLOBAL.{{ item.name }}"
+      loop: "{{ zabbix_innodb_dynamic }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: zbx_innodb_running
+      changed_when: false
+      # Must still run under --check, or every `when` below sees an undefined
+      # stdout and the dry run reports nothing useful.
+      check_mode: false
+
+    - name: Apply the dynamic settings to the running server
+      ansible.builtin.command:
+        cmd: mysql -e "SET GLOBAL {{ item.item.name }} = {{ item.item.value }}"
+      loop: "{{ zbx_innodb_running.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout | trim != item.item.value | string
+      changed_when: true
+
+    # Growing the pool is asynchronous and done in chunks. Without this the play
+    # can finish while the resize is still running, and the verification below
+    # reads a stale value.
+    - name: Wait for the buffer pool resize to finish
+      ansible.builtin.command:
+        cmd: >-
+          mysql -N -B -e "SELECT VARIABLE_VALUE FROM
+          performance_schema.global_status WHERE
+          VARIABLE_NAME='Innodb_buffer_pool_resize_status_code'"
+      register: zbx_resize
+      until: zbx_resize.stdout | trim in ['0', '']
+      retries: 30
+      delay: 5
+      changed_when: false
+      check_mode: false
+
+    - name: Read back the effective values
+      ansible.builtin.command:
+        cmd: >-
+          mysql -N -B -e "SELECT @@GLOBAL.innodb_buffer_pool_size,
+          @@GLOBAL.innodb_redo_log_capacity,
+          @@GLOBAL.innodb_flush_log_at_trx_commit,
+          @@GLOBAL.innodb_flush_method"
+      register: zbx_innodb_effective
+      changed_when: false
+      check_mode: false
+
+    - name: Report the effective configuration
+      ansible.builtin.debug:
+        msg:
+          - "buffer_pool_size        = {{ zbx_innodb_effective.stdout.split()[0] }}"
+          - "redo_log_capacity       = {{ zbx_innodb_effective.stdout.split()[1] }}"
+          - "flush_log_at_trx_commit = {{ zbx_innodb_effective.stdout.split()[2] }}"
+          - "flush_method            = {{ zbx_innodb_effective.stdout.split()[3] }}
+             (O_DIRECT applies at next MySQL restart)"
