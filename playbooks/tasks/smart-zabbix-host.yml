@@ -484,6 +484,10 @@
       params:
         output: ["triggerid", "description", "expression"]
         discoveryids: ["{{ smart_ruleid }}"]
+        # Without this the API returns the internal reference form -- literally
+        # "{57610}=1" -- which no comparison against a readable expression can
+        # ever match, so the update task below fired on every single run.
+        expandExpression: true
       id: 1
   register: smart_trigproto_lookup
   check_mode: false
@@ -495,8 +499,17 @@
 # leaving every expression pointing at smart.drive[{#DEV},...] -- triggers
 # referencing items that no longer get created. Verified on pbs 2026-08-26.
 #
-# Compared with whitespace stripped, because Zabbix returns the expression in
-# its own normalised form and a literal comparison would report changed forever.
+# Idempotency is checked on the ITEM KEY the expression references, not on the
+# whole expression. expandExpression resolves user macros as well as item
+# references, so the over-temperature prototype comes back as ">60" rather than
+# '>{$SMART.TEMP.MAX:"{#TYPE}"}' and a full comparison can never match -- that
+# is what made this task report changed on every run before.
+#
+# The limitation is deliberate and worth knowing: this reconciles the key a
+# trigger points at, which is what a key migration needs, but it will NOT
+# notice an edit to the rest of an expression (a threshold or comparison
+# changed by hand in the UI). Reconciling that needs the unexpanded form, which
+# the API only exposes as opaque {57610} references.
 - name: "{{ smart_host }} — update trigger prototype expressions that changed"
   ansible.builtin.uri:
     url: "{{ zabbix_api }}"
@@ -521,11 +534,11 @@
     - (smart_trigproto_lookup.json.result | default([])
        | selectattr('description', 'equalto', item.description)
        | list | length) > 0
-    - (smart_trigproto_lookup.json.result | default([])
-       | selectattr('description', 'equalto', item.description)
-       | map(attribute='expression') | list | first
-       | regex_replace('\s+', ''))
-      != (item.expression | replace('@HOST@', smart_host) | regex_replace('\s+', ''))
+    - (item.expression | regex_search('smart\.drive\[[^\]]*\]')) is not none
+    - (item.expression | regex_search('smart\.drive\[[^\]]*\]'))
+      not in (smart_trigproto_lookup.json.result | default([])
+              | selectattr('description', 'equalto', item.description)
+              | map(attribute='expression') | list | first)
   register: smart_trigproto_update
   changed_when: smart_trigproto_update.json.result is defined
   failed_when: smart_trigproto_update.json.error is defined
