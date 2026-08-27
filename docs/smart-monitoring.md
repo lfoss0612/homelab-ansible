@@ -43,12 +43,41 @@ playbook. The script sends a `smart.discovery` payload describing what it
 actually found:
 
 ```json
-[{"{#DEV}":"sda","{#TYPE}":"ata","{#MODEL}":"WDC WD101EFBX-68B0AN0"},
- {"{#DEV}":"nvme0","{#TYPE}":"nvme","{#MODEL}":"KBG50ZNS512G NVMe KIOXIA 512GB"}]
+[{"{#SERIAL}":"VH0SA7DM","{#DEV}":"sda","{#TYPE}":"ata","{#MODEL}":"WDC WD101EFBX-68B0AN0"},
+ {"{#SERIAL}":"X26C85V4E6CK","{#DEV}":"nvme0","{#TYPE}":"nvme","{#MODEL}":"KBG50ZNS512G NVMe KIOXIA 512GB"}]
 ```
 
 Zabbix stamps out one set of items and triggers per entry. Swap a disk and the
 items follow within 30 minutes, with no playbook edit.
+
+### Keys use `{#SERIAL}`; names use `{#DEV}`
+
+This split is load-bearing, and reversing it reintroduces a real bug. The key is
+the item's identity, so it has to be stable. `pbs`'s four bulk drives are
+USB-attached and their kernel letters are handed out in enumeration order at
+boot: a reboot on 2026-08-26 moved a WD Blue SA510 from `sde` to `sdd`, and with
+`{#DEV}` as the key Zabbix read that as one drive vanishing and another
+appearing — auto-disabling the `sde` items with all their history stranded and
+creating empty `sdd` ones.
+
+The name is display-only, and **Zabbix rewrites a discovered item's name when a
+macro value changes**. So a re-lettered drive keeps its itemid and its history
+while the label follows the new letter. Verified against the live server rather
+than assumed: a discovery payload moving `sda`→`sdX` under an unchanged serial
+left the itemids intact and rewrote the names.
+
+`playbooks/zabbix-smart-dashboard.yml` therefore needs no knowledge of any of
+this — its honeycomb `primary_label` is
+`{{ITEM.NAME}.regsub("^SMART (\S+).*", "\1")}`, which reads the letter back out
+of the NAME and never touches the key.
+
+Serial is the only identifier that is uniform across drive classes: model is
+`Device Model` on ATA but `Model Number` on NVMe, and the WWN is `LU WWN Device
+Id` vs `IEEE EUI-64`, with embedded spaces on both. **The risk to check before
+trusting this on a new host is a USB bridge that reports a generic or empty
+serial** — two of those would merge into one item, which is worse than the bug
+being fixed. The script falls back to the device name and logs loudly when a
+serial is missing or duplicated.
 
 > This replaced hardcoded per-host drive lists, and the reason is instructive.
 > The old lists said `pve` had `sda`–`sdg`. It actually has `sda`–`sde` plus
@@ -63,9 +92,9 @@ items follow within 30 minutes, with no playbook edit.
 |---|---|
 | `smart.status` | Worst-of across all drives: 0 healthy, 1 failing, 2 unreadable/none |
 | `smart.drives.count` | How many drives `smartctl --scan` found |
-| `smart.drive[{#DEV},status]` | Per drive: 0 passed, 1 FAILED, 2 unreadable |
-| `smart.drive[{#DEV},failed_attrs]` | 1 when an attribute is below threshold, or NVMe reports critical warning / media errors |
-| `smart.drive[{#DEV},temperature]` | °C |
+| `smart.drive[{#SERIAL},status]` | Per drive: 0 passed, 1 FAILED, 2 unreadable |
+| `smart.drive[{#SERIAL},failed_attrs]` | 1 when an attribute is below threshold, or NVMe reports critical warning / media errors |
+| `smart.drive[{#SERIAL},temperature]` | °C |
 
 `failed_attrs` is the one to care about. Overall health stays `PASSED` until a
 drive is nearly gone, whereas a reallocated-sector count crossing its threshold
