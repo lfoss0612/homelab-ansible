@@ -1,0 +1,238 @@
+---
+# Create the server-side Zabbix objects that OOM-kill monitoring pushes into:
+# a trapper count item, a trapper text item for the most recent event, and two
+# triggers per host.
+#
+# Counterpart to playbooks/oom-kill-monitor.yml, which installs the script
+# that feeds these. Both are needed — see that playbook's header.
+#
+# Usage:
+#   ansible-playbook playbooks/oom-kill-monitor-zabbix-setup.yml --check --diff
+#   ansible-playbook playbooks/oom-kill-monitor-zabbix-setup.yml
+#
+# Idempotent: every object is looked up before it is created, so re-running is
+# a no-op once the fleet is set up.
+#
+# Trigger design, same self-clearing shape as
+# playbooks/zabbix-fleet-update-item.yml — the two failure modes of a monitor
+# like this are "it found something" and "it stopped running", and they need
+# different mechanisms:
+#   - "OOM-killer fired"       last(...)>0     raises when the script reports
+#                                              a new kill, and CLEARS itself on
+#                                              the next run (5 minutes later)
+#                                              once the count is back to 0.
+#                                              The event stays in Zabbix's
+#                                              history even after it clears —
+#                                              this is a notification, not a
+#                                              standing condition.
+#   - "stopped reporting"      nodata(...)=1   the important one. A dead timer
+#                                              sends NOTHING, so last() can
+#                                              never see it — only nodata()
+#                                              can. This is precisely the gap
+#                                              that let the fleet-update
+#                                              failure and the OOM-kill itself
+#                                              both go unnoticed.
+
+- name: Create the OOM-kill trapper items and triggers in Zabbix
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    # Single source of truth: the inventory group, not a list repeated here.
+    oom_target_hosts: "{{ groups['oom_monitored'] | default([]) }}"
+
+    oom_count_key: "system.oom.count"
+    oom_event_key: "system.oom.last_event"
+
+    # Rides out a reboot (which can take several minutes on these hosts —
+    # they're hypervisors) without a false "monitoring stopped" page, while
+    # still catching a genuinely dead timer the same day. Tighter than SMART's
+    # 2h because this runs every 5 minutes, not every 30.
+    nodata_window: "1h"
+
+  tasks:
+    - name: Assert the inventory group exists
+      ansible.builtin.assert:
+        that: oom_target_hosts | length > 0
+        fail_msg: >-
+          [oom_monitored] is empty or missing from the inventory. This play
+          derives its targets from that group so it cannot drift from
+          playbooks/oom-kill-monitor.yml.
+
+    - name: Look up the Zabbix hosts
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ oom_target_hosts }}"
+            selectItems: ["key_"]
+          id: 1
+      register: oom_host_lookup
+      check_mode: false
+      failed_when: oom_host_lookup.json.error is defined
+
+    - name: Warn about target hosts with no matching Zabbix host
+      ansible.builtin.debug:
+        msg: >-
+          NOT IN ZABBIX (skipped): {{ oom_target_hosts
+          | difference(oom_host_lookup.json.result | map(attribute='host') | list) }}
+      when: >-
+        oom_target_hosts
+        | difference(oom_host_lookup.json.result | map(attribute='host') | list)
+        | length > 0
+
+    - name: Create the count item where missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "OOM-killer: kills since last check"
+            key_: "{{ oom_count_key }}"
+            type: 2            # 2 = Zabbix trapper
+            value_type: 3      # 3 = Numeric (unsigned)
+            history: "400d"
+            trends: "90d"
+            description: >-
+              Pushed every 5 minutes by oom-kill-monitor.timer. Number of new
+              "Out of memory: Killed process" lines seen in the kernel journal
+              since the previous run — almost always 0. Surfaced 2026-08-27:
+              the kernel killed VM 105 (k8s-worker) on pve.home.lan on
+              2026-08-24 with zero alerting anywhere. See
+              scripts/oom-kill-monitor.sh for the incident and the parsing.
+          id: 1
+      register: oom_count_create
+      loop: "{{ oom_host_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.host }}"
+      when: oom_count_key not in (item['items'] | map(attribute='key_') | list)
+      failed_when: oom_count_create.json.error is defined
+      changed_when: oom_count_create.json.result is defined
+
+    - name: Create the last-event item where missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "OOM-killer: most recent kill"
+            key_: "{{ oom_event_key }}"
+            type: 2
+            value_type: 4      # 4 = Text
+            history: "400d"
+            trends: "0"        # text items don't trend
+            description: >-
+              Only sent when a kill is found (the item otherwise keeps its
+              previous value between runs). Format:
+              "<timestamp> pid=<pid> comm=<process> rss=<GB>G memcg=<cgroup>".
+              memcg is /qemu.slice/<VMID>.scope for a VM — cross-reference with
+              `qm config <VMID>` on the host to identify which guest.
+          id: 1
+      register: oom_event_create
+      loop: "{{ oom_host_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.host }}"
+      when: oom_event_key not in (item['items'] | map(attribute='key_') | list)
+      failed_when: oom_event_create.json.error is defined
+      changed_when: oom_event_create.json.result is defined
+
+    - name: Check which OOM triggers already exist
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description"]
+            hostids: "{{ oom_host_lookup.json.result | map(attribute='hostid') | list }}"
+            search:
+              description: "OOM-kill"
+          id: 1
+      register: oom_trigger_lookup
+      check_mode: false
+      failed_when: oom_trigger_lookup.json.error is defined
+
+    - name: Create the per-host triggers
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "{{ item.1.description }}"
+            expression: "{{ item.1.expression | replace('@HOST@', item.0.host) }}"
+            priority: "{{ item.1.priority }}"
+            manual_close: "{{ item.1.manual_close | default(0) }}"
+            comments: "{{ item.1.comments }}"
+          id: 1
+      register: oom_trigger_create
+      loop: "{{ oom_host_lookup.json.result | product(oom_trigger_defs) | list }}"
+      loop_control:
+        label: "{{ item.0.host }}: {{ item.1.description | replace('@HOST@', item.0.host) }}"
+      vars:
+        oom_trigger_defs:
+          - description: "OOM-kill on @HOST@: the kernel killed a process for memory"
+            expression: "last(/@HOST@/{{ oom_count_key }})>0"
+            priority: 4          # High — this has already taken down a live
+                                  # Kubernetes node once (VM 105, 2026-08-24).
+            comments: >-
+              Check the OOM-killer: most recent kill item on this host for
+              which process/VM. Self-clearing: the count resets to 0 on the
+              next 5-minute run, so this reflects "a kill just happened", not
+              a standing condition — the event itself stays in Zabbix's
+              history after it clears.
+          - description: "OOM-kill monitoring on @HOST@ has stopped reporting"
+            expression: "nodata(/@HOST@/{{ oom_count_key }},{{ nodata_window }})=1"
+            priority: 3          # Average
+            manual_close: 1
+            comments: >-
+              No value in {{ nodata_window }}. Check oom-kill-monitor.timer on
+              the host and `journalctl -u oom-kill-monitor.service`. A dead
+              monitor is indistinguishable from "no kills happening" until you
+              look — the exact gap that let the 2026-08-24 kill go unnoticed.
+      when: >-
+        (item.1.description | replace('@HOST@', item.0.host))
+        not in (oom_trigger_lookup.json.result | map(attribute='description') | list)
+      failed_when: oom_trigger_create.json.error is defined
+      changed_when: oom_trigger_create.json.result is defined
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          Configured {{ oom_host_lookup.json.result | length }} of
+          {{ oom_target_hosts | length }} target host(s).
+          Items appear once each host's next oom-kill-monitor run pushes a
+          value — within 5 minutes, or immediately via
+          `systemctl start oom-kill-monitor.service`.

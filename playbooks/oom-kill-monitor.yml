@@ -1,0 +1,74 @@
+---
+# Deploy kernel OOM-kill monitoring to the hosts most exposed to memory
+# overcommit: the hypervisors, plus pbs since it runs the same style of
+# always-on workload.
+#
+# Usage:
+#   ansible-playbook playbooks/oom-kill-monitor.yml --check --diff
+#   ansible-playbook playbooks/oom-kill-monitor.yml
+#
+# The script runs every 5 minutes and reports to Zabbix via zabbix_sender. The
+# server-side objects it feeds are created separately by
+# playbooks/oom-kill-monitor-zabbix-setup.yml — run that one too, or every
+# value this pushes is accepted by the server and silently discarded (the
+# same two-halves trap docs/smart-monitoring.md already documents).
+#
+# Targets [oom_monitored], NOT [smart_monitored] — the two currently have
+# identical membership (pbs/pve/pve-ai/pve-router) but are different
+# questions: one is "does this host have a physical disk", the other is "is
+# this host exposed to memory overcommit". They are expected to diverge —
+# the VMs most likely to grow into this are k8s-worker and k8s-worker-2,
+# neither of which has anything to do with SMART.
+#
+# Surfaced 2026-08-27: the kernel OOM-killer killed VM 105 (k8s-worker) on
+# pve.home.lan on 2026-08-24 20:00:07, and nothing alerted before, during, or
+# after. See scripts/oom-kill-monitor.sh for the full incident detail.
+
+- name: Deploy OOM-kill monitoring
+  hosts: oom_monitored
+  become: true
+
+  handlers:
+    - name: systemd_daemon_reload
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  tasks:
+    # Same fix as smart-monitor.yml needed: `command -v` is a shell builtin,
+    # so it has to run under `shell`, not `command` (which executes the binary
+    # directly with no shell and can never find a builtin).
+    - name: Check for the tools the monitor depends on
+      ansible.builtin.shell: "command -v {{ item }}"
+      loop:
+        - journalctl
+        - zabbix_sender
+      register: oom_tooling
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Fail loudly when a dependency is missing
+      ansible.builtin.assert:
+        that: oom_tooling.results | selectattr('rc', 'ne', 0) | list | length == 0
+        fail_msg: >-
+          Missing on {{ inventory_hostname }}:
+          {{ oom_tooling.results | selectattr('rc', 'ne', 0)
+             | map(attribute='item') | join(', ') }}.
+          journalctl ships with systemd; zabbix_sender needs the
+          zabbix-sender package.
+
+    - name: Install the monitoring script, timer and service
+      ansible.builtin.include_tasks: tasks/oom-kill-monitor-setup.yml
+
+    - name: Run an initial OOM-kill check
+      ansible.builtin.command: /usr/local/bin/oom-kill-monitor
+      register: oom_check_result
+      changed_when: false
+      # Finding a past OOM-kill is a normal, expected report, not a monitor
+      # failure — the script itself only exits non-zero when it could not
+      # report at all (see its own exit-status comment).
+      failed_when: oom_check_result.rc != 0
+
+    - name: Show the initial result
+      ansible.builtin.debug:
+        msg: "{{ oom_check_result.stderr_lines | default([]) }}"

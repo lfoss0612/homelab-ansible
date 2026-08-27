@@ -1,0 +1,66 @@
+---
+# Deploy OOM-kill monitoring to send alerts to Zabbix
+# Usage: include_tasks tasks/oom-kill-monitor-setup.yml
+# or in a playbook: - include_tasks: tasks/oom-kill-monitor-setup.yml
+
+- name: Deploy OOM-kill monitoring script
+  ansible.builtin.copy:
+    src: ../scripts/oom-kill-monitor.sh
+    dest: /usr/local/bin/oom-kill-monitor
+    mode: '0755'
+    owner: root
+    group: root
+
+# Every 5 minutes, not 30 like SMART: a repeat kill matters within minutes,
+# not the next half hour, and each run is a cheap incremental journalctl read.
+- name: Create OOM-kill monitoring timer
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=Run OOM-kill monitoring check
+      Documentation=man:systemd.timer(5)
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=5min
+      AccuracySec=1s
+
+      [Install]
+      WantedBy=timers.target
+    dest: /etc/systemd/system/oom-kill-monitor.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: systemd_daemon_reload
+
+- name: Create OOM-kill monitoring service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=OOM-kill monitoring and Zabbix reporting
+      Documentation=file:///usr/local/bin/oom-kill-monitor
+
+      [Service]
+      Type=oneshot
+      Environment="ZABBIX_SERVER=10.0.5.9"
+      Environment="ZABBIX_PORT=10051"
+      ExecStart=/usr/local/bin/oom-kill-monitor
+      StandardOutput=journal
+      StandardError=journal
+    dest: /etc/systemd/system/oom-kill-monitor.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: systemd_daemon_reload
+
+# Skipped under --check for the same reason as SMART's equivalent task: the
+# unit file has not actually been written in check mode, so a dry run on a
+# brand-new host would fail with "Could not find the requested service" —
+# exactly when a clean dry run matters most.
+- name: Enable and start OOM-kill monitoring timer
+  ansible.builtin.systemd_service:
+    name: oom-kill-monitor.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode
