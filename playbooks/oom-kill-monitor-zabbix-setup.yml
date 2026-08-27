@@ -191,7 +191,7 @@
           jsonrpc: "2.0"
           method: trigger.create
           params:
-            description: "{{ item.1.description }}"
+            description: "{{ item.1.description | replace('@HOST@', item.0.host) }}"
             expression: "{{ item.1.expression | replace('@HOST@', item.0.host) }}"
             priority: "{{ item.1.priority }}"
             manual_close: "{{ item.1.manual_close | default(0) }}"
