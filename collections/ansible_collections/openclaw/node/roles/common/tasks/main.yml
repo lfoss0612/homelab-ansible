@@ -358,6 +358,95 @@
   notify: restart systemd-resolved
   tags: dns
 
+# ---------------------------------------------------------------------------
+# Public resolvers listed as SIBLINGS of the internal one.
+#
+# The three tasks above all test `openclaw_dns_resolver not in <line>` — they
+# catch a config pointing at the wrong resolver, and skip one that names the
+# right resolver alongside 8.8.8.8. That gap is what broke the fleet:
+#
+#   openclaw  DNS=10.0.5.1 8.8.8.8 8.8.4.4 1.1.1.1   (resolved.conf)
+#             DNS=10.0.5.1 / DNS=8.8.8.8              (10-ens18.network)
+#
+# systemd-resolved treats siblings as interchangeable and fails over between
+# them. Once it lands on 8.8.8.8 — which knows nothing about .home.lan — every
+# internal name returns NXDOMAIN *silently*, and it stays there. One brief
+# Unbound hiccup turns into a host that is quietly broken indefinitely.
+#
+# Measured 2026-08-26: 7 of 14 hosts carried public entries; `openclaw` and
+# `pve` were already stuck resolving openclaw.home.lan to nothing, and the
+# weekly convergence had failed on 08-16 (DNS) and 08-23 for ten days.
+#
+# FallbackDNS is NOT a failover and must not be used as one — man 5
+# resolved.conf: "only used if no other DNS server information is known". With
+# any DNS= set it is never consulted, even if that server is dead. No healthy
+# host on this fleet sets it, so it is removed rather than repurposed.
+#
+# External resolution is unaffected: the resolver is OPNsense's Unbound, which
+# recurses upstream. Verified on the five hosts already in this configuration —
+# github.com and deb.debian.org both resolve on all of them.
+# ---------------------------------------------------------------------------
+- name: Find systemd-networkd .network files
+  ansible.builtin.find:
+    paths: /etc/systemd/network
+    patterns: "*.network"
+  register: openclaw_networkd_files
+  when: "'systemd-networkd.service' in ansible_facts.services"
+  tags: dns
+
+- name: Check which .network files already name the correct resolver
+  ansible.builtin.command: grep -qxF 'DNS={{ openclaw_dns_resolver }}' {{ item.path }}
+  loop: "{{ openclaw_networkd_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: openclaw_networkd_has_resolver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: dns
+
+# Guarded on the file ALSO containing the correct resolver. Stripping the
+# public entries from a file that names only 8.8.8.8 would leave the link with
+# no DNS at all, which is a worse failure than the one being fixed.
+- name: Drop public DNS entries from .network files that name the resolver
+  ansible.builtin.lineinfile:
+    path: "{{ item.item.path }}"
+    regexp: '^DNS=(?!{{ openclaw_dns_resolver | regex_escape }}\s*$)'
+    state: absent
+  loop: "{{ openclaw_networkd_has_resolver.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path | default('n/a') }}"
+  when:
+    - item.rc is defined
+    - item.rc == 0
+  notify: reload systemd-networkd
+  tags: dns
+
+# Rewritten, never deleted. On a host where resolved.conf is the only source of
+# DNS, removing the line would fall through to FallbackDNS or the compiled-in
+# list — i.e. straight to public servers, the exact bug being fixed. Guarded on
+# the line already existing so this never ADDS a global override to a host
+# correctly taking its DNS from DHCP (omv, k8s-*).
+- name: Reduce a global DNS override to the resolver alone
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/resolved.conf
+    regexp: '^DNS='
+    line: "DNS={{ openclaw_dns_resolver }}"
+  when:
+    - "'systemd-resolved.service' in ansible_facts.services"
+    - openclaw_resolved_conf_dns.rc == 0
+  notify: restart systemd-resolved
+  tags: dns
+
+- name: Remove FallbackDNS so it cannot become a silent public failover
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/resolved.conf
+    regexp: '^FallbackDNS='
+    state: absent
+  when: "'systemd-resolved.service' in ansible_facts.services"
+  notify: restart systemd-resolved
+  tags: dns
+
 # The gateway case: a stale self-referential /etc/hosts entry (predating a
 # routing change) shadowing what DNS would otherwise correctly resolve.
 #

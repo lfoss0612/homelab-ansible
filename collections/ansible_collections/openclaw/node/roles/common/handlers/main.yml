@@ -33,6 +33,18 @@
     state: restarted
   tags: dns
 
+# A DNS= edit in a .network file does nothing until networkd re-reads it, and
+# resolved only learns the new per-link servers once networkd pushes them.
+#
+# Deliberately `networkctl reload`, NOT `systemctl restart systemd-networkd`:
+# the restart can bounce interfaces, and on pve-router those interfaces are
+# vmbr0/vmbr1 -- the bridges the OPNsense VM's taps sit on, i.e. the whole
+# house network. reload re-applies configuration in place.
+- name: reload systemd-networkd
+  ansible.builtin.command: networkctl reload
+  when: "'systemd-networkd.service' in ansible_facts.services"
+  tags: dns
+
 # agent2 parses UserParameters at startup, so a new drop-in does nothing until
 # the agent restarts. Tagged to match the task that notifies it — handlers are
 # tag-filtered too, so an untagged handler is silently dropped from a
