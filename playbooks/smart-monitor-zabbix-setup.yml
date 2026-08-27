@@ -91,12 +91,30 @@
     # as the start of a comment and dies with "Missing end of comment tag".
     # Every scalar below that contains a {#MACRO} has to be escaped this way.
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # KEYS use {#SERIAL}; NAMES use {#DEV}. This split is the whole point.
+    #
+    # The key is the item's identity, so it must be stable. pbs's four bulk
+    # drives are USB-attached and their kernel letters are handed out in
+    # enumeration order at boot: a reboot on 2026-08-26 moved a WD Blue SA510
+    # from sde to sdd, and because the key was {#DEV}, Zabbix read that as one
+    # drive vanishing and another appearing -- auto-disabling the sde items with
+    # their history stranded and creating empty sdd ones.
+    #
+    # The name is display-only, and Zabbix rewrites a discovered item's name
+    # when a macro value changes. So a re-lettered drive keeps its item, its
+    # itemid and its history, while the name follows the new letter.
+    #
+    # Nothing in zabbix-smart-dashboard.yml needs to change: its honeycomb
+    # primary_label is {{ITEM.NAME}.regsub("^SMART (\S+).*", "\1")}, which reads
+    # the letter back out of the NAME set here and never touches the key.
+    # ---------------------------------------------------------------------
     smart_item_prototypes:
-      - key: "{% raw %}smart.drive[{#DEV},status]{% endraw %}"
+      - key: "{% raw %}smart.drive[{#SERIAL},status]{% endraw %}"
         name: "{% raw %}SMART {#DEV} ({#MODEL}): health status{% endraw %}"
         valuemap: "SMART status"
         description: "0 = passed, 1 = FAILED, 2 = unreadable."
-      - key: "{% raw %}smart.drive[{#DEV},failed_attrs]{% endraw %}"
+      - key: "{% raw %}smart.drive[{#SERIAL},failed_attrs]{% endraw %}"
         name: "{% raw %}SMART {#DEV} ({#MODEL}): failed attributes{% endraw %}"
         valuemap: "SMART attribute state"
         description: >-
@@ -104,7 +122,7 @@
           column), or when an NVMe reports a critical warning or media errors.
           Fires ahead of overall health, which stays PASSED until the drive is
           nearly gone.
-      - key: "{% raw %}smart.drive[{#DEV},temperature]{% endraw %}"
+      - key: "{% raw %}smart.drive[{#SERIAL},temperature]{% endraw %}"
         name: "{% raw %}SMART {#DEV} ({#MODEL}): temperature{% endraw %}"
         units: "°C"
         description: "Composite temperature for NVMe; attribute 194/190 for ATA."
@@ -114,20 +132,20 @@
     # cannot chew through an unrelated substring of an expression.
     smart_trigger_prototypes:
       - description: "{% raw %}SMART {#DEV} on {HOST.NAME} reports FAILED{% endraw %}"
-        expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},status])=1{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/smart.drive[{#SERIAL},status])=1{% endraw %}"
         priority: 4        # High
         comments: >-
           The drive's own overall health self-assessment has failed. Replace it;
           this verdict does not clear on its own.
       - description: "{% raw %}SMART {#DEV} on {HOST.NAME} has failed attributes{% endraw %}"
-        expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},failed_attrs])=1{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/smart.drive[{#SERIAL},failed_attrs])=1{% endraw %}"
         priority: 4        # High
         comments: >-
           An individual attribute is below threshold (reallocated sectors,
           pending sectors, NVMe media errors). This is the EARLY warning and
           usually precedes an overall-health failure by weeks.
       - description: "{% raw %}SMART {#DEV} on {HOST.NAME} is unreadable{% endraw %}"
-        expression: "{% raw %}last(/@HOST@/smart.drive[{#DEV},status])=2{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/smart.drive[{#SERIAL},status])=2{% endraw %}"
         priority: 2        # Warning
         comments: >-
           smartctl enumerated the drive but could not get health data from it —
@@ -135,7 +153,7 @@
           against the known-bad VIA VL711 enclosure before condemning a drive.
       - description: "{% raw %}SMART {#DEV} on {HOST.NAME} is over temperature{% endraw %}"
         expression: >-
-          {% raw %}last(/@HOST@/smart.drive[{#DEV},temperature])>{$SMART.TEMP.MAX:"{#TYPE}"}{% endraw %}
+          {% raw %}last(/@HOST@/smart.drive[{#SERIAL},temperature])>{$SMART.TEMP.MAX:"{#TYPE}"}{% endraw %}
         priority: 2        # Warning
         comments: >-
           Threshold comes from the per-class context macro {$SMART.TEMP.MAX},

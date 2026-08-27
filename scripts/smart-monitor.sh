@@ -80,6 +80,51 @@ json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 queue() { printf -- '- %s %s\n' "$1" "$2" >> "$BATCH"; }
 
+# Zabbix item-key parameters treat , [ ] and whitespace specially. Real serials
+# are alphanumeric (verified across all 15 monitored drives 2026-08-26), but a
+# USB bridge is free to invent anything, so everything outside a safe set is
+# collapsed rather than trusted. MUST be applied identically to the discovery
+# payload and to the trapper keys -- a mismatch creates items that exist and are
+# never fed, which this repo has been bitten by before and which fails silently.
+sanitize_id() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/_\{1,\}$//'; }
+
+# --- stable per-drive identity ----------------------------------------------
+#
+# The LLD key is the drive SERIAL, not the kernel device letter. pbs's four bulk
+# drives are USB-attached, so their letters are handed out in enumeration order
+# at boot: on 2026-08-26 a reboot moved a WD Blue SA510 from sde to sdd, which
+# Zabbix read as "old drive gone, new drive appeared" -- it auto-disabled the
+# sde items with all their history stranded and created empty sdd ones.
+#
+# {#DEV} is still sent, and the item NAMES still use it, so the dashboard's
+# honeycomb labels keep reading "pbs/sdd". Zabbix updates a discovered item's
+# name when a macro value changes, so a re-lettered drive keeps its identity
+# and its history while the label follows the new letter.
+#
+# Falls back to the device letter when the serial is missing or collides with
+# one already seen this run. The letter is unique by construction, so the
+# fallback is always safe -- but it reintroduces the churn above, hence the
+# loud log rather than a silent substitution.
+drive_id() {
+	local short="$1" serial="$2" id
+	id=$(sanitize_id "$serial")
+	if [ -z "$id" ]; then
+		log "WARNING: $short reports no usable serial; falling back to the device"
+		log "         name, which is not stable across reboots on USB enclosures."
+		printf '%s' "$short"
+		return
+	fi
+	if grep -qxF "$id" "$WORK_DIR/seen_ids" 2>/dev/null; then
+		log "WARNING: serial '$id' is reported by more than one drive ($short)."
+		log "         Falling back to the device name for it. Two enclosures"
+		log "         sharing a serial would otherwise merge into one item."
+		printf '%s' "$short"
+		return
+	fi
+	printf '%s\n' "$id" >> "$WORK_DIR/seen_ids"
+	printf '%s' "$id"
+}
+
 # --- per-drive collection ---------------------------------------------------
 #
 # smartctl --scan reports a -d type, but it is NOT passed through to -a here.
@@ -91,7 +136,7 @@ check_drive() {
 	local dev="$1"
 	local short="${dev##*/}"
 	local out="$WORK_DIR/$short.txt"
-	local class status temp failed model
+	local class status temp failed model serial id
 
 	if ! smartctl -a "$dev" > "$out" 2>&1; then
 		# Non-zero is normal for smartctl -- its exit status is a bitmask and
@@ -100,15 +145,20 @@ check_drive() {
 		# health line out of it.
 		if ! grep -qE 'self-assessment test result|SMART Health Status' "$out"; then
 			log "ERROR: smartctl could not read $dev"
-			queue "smart.drive[$short,status]" 2
+			# A failed health read usually still yields the identity section, so
+			# try for the serial anyway: keeping the same key across a drive that
+			# goes unreadable and comes back is the whole point of keying on it.
+			serial=$(grep -m1 -E '^Serial Number:' "$out" | sed 's/^[^:]*:[[:space:]]*//')
+			id=$(drive_id "$short" "$serial")
+			queue "smart.drive[$id,status]" 2
 			ANY_UNREADABLE=1
 			printf '%s\tunreadable\t-\t-\n' "$short" >> "$REPORT"
 			# Still discovered, deliberately. A drive that cannot be read needs
 			# its items to EXIST so the status=2 above lands somewhere and can be
 			# alerted on; dropping it from discovery would send that value to a
 			# nonexistent item and the server would discard it silently.
-			printf '{"{#DEV}":"%s","{#TYPE}":"unknown","{#MODEL}":"unreadable"}\n' \
-				"$(json_escape "$short")" >> "$WORK_DIR/lld"
+			printf '{"{#SERIAL}":"%s","{#DEV}":"%s","{#TYPE}":"unknown","{#MODEL}":"unreadable"}\n' \
+				"$(json_escape "$id")" "$(json_escape "$short")" >> "$WORK_DIR/lld"
 			DRIVE_COUNT=$((DRIVE_COUNT + 1))
 			return
 		fi
@@ -122,6 +172,13 @@ check_drive() {
 
 	model=$(grep -m1 -E '^(Device Model|Model Number):' "$out" | sed 's/^[^:]*:[[:space:]]*//')
 	[ -n "$model" ] || model="unknown"
+
+	# Same field name on ATA and NVMe, unlike model (Device Model / Model Number)
+	# and unlike the WWN, which is "LU WWN Device Id" on ATA and "IEEE EUI-64" on
+	# NVMe and carries embedded spaces on both. Serial is the only identifier
+	# that is uniform, unique and key-safe across every drive class here.
+	serial=$(grep -m1 -E '^Serial Number:' "$out" | sed 's/^[^:]*:[[:space:]]*//')
+	id=$(drive_id "$short" "$serial")
 
 	# Health verdict. PASSED/FAILED covers ATA and NVMe; SCSI drives use a
 	# different sentence, so both are matched.
@@ -176,15 +233,15 @@ check_drive() {
 		ANY_UNREADABLE=1
 	fi
 
-	queue "smart.drive[$short,status]" "$status"
-	queue "smart.drive[$short,failed_attrs]" "$failed"
+	queue "smart.drive[$id,status]" "$status"
+	queue "smart.drive[$id,failed_attrs]" "$failed"
 	if [ -n "$temp" ]; then
-		queue "smart.drive[$short,temperature]" "$temp"
+		queue "smart.drive[$id,temperature]" "$temp"
 	fi
 
 	printf '%s\t%s\t%s\t%s\n' "$short" "$status" "${temp:--}" "$failed" >> "$REPORT"
-	printf '{"{#DEV}":"%s","{#TYPE}":"%s","{#MODEL}":"%s"}\n' \
-		"$(json_escape "$short")" "$class" "$(json_escape "$model")" >> "$WORK_DIR/lld"
+	printf '{"{#SERIAL}":"%s","{#DEV}":"%s","{#TYPE}":"%s","{#MODEL}":"%s"}\n' \
+		"$(json_escape "$id")" "$(json_escape "$short")" "$class" "$(json_escape "$model")" >> "$WORK_DIR/lld"
 	DRIVE_COUNT=$((DRIVE_COUNT + 1))
 }
 
@@ -193,6 +250,7 @@ check_drive() {
 ZABBIX_HOST=$(resolve_hostname)
 : > "$REPORT"
 : > "$WORK_DIR/lld"
+: > "$WORK_DIR/seen_ids"
 
 if ! command -v smartctl >/dev/null 2>&1; then
 	log "smartctl not installed — nothing to report"
