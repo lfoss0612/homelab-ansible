@@ -1,0 +1,48 @@
+---
+# host_vars/pve-ai.home.lan.yml
+
+# --- Ballooning ---------------------------------------------------------------
+#
+# Surfaced 2026-08-27 while investigating pve.home.lan's OOM-kill (see
+# host_vars/pve.home.lan.yml): this host's only VM, 100 (k8s-worker-2, the RTX
+# 5090 passthrough host), carried `balloon: 0` -- hard-pinned, zero elasticity,
+# and sitting at ~100% of its declared 48G continuously for over a month
+# (Zabbix trigger "Proxmox VE: VM [pve-ai/k8s-worker-2] high memory usage" open
+# since 2026-07-18).
+#
+# Verified live before choosing a number, not guessed:
+#   - Actual current usage ~19.6G of 48G declared (free -m), dominated by
+#     llama-server at 9.03G RSS -- almost all of it genuine anonymous memory
+#     (RssAnon 8.47G via /proc/<pid>/status), not page cache.
+#   - The currently loaded model (qwen3:4b, 5.3G) is FULLY VRAM-resident
+#     (Ollama's /api/ps: size_vram == size) -- confirms VRAM offload is working
+#     as intended for normal-sized models. llama-server's 9G host-side overhead
+#     is best explained by its own compute/context buffers (-c 32768 -b 1024
+#     -ub 1024 in its command line), not model-size CPU spillover.
+#   - deepseek-r1:70b (42.5G) and codellama:70b (38.9G) both exceed the RTX
+#     5090's 32G VRAM and are expected to keep spilling to CPU when loaded
+#     (homelab-vault TODO.md, "LiteLLM") -- infrequently, by design, not
+#     something this floor is sized to prevent.
+#
+# balloon: 24576 is NOT sized against the deepseek-r1:70b worst case --
+# ballooning's floor is a guaranteed MINIMUM, not a ceiling, so an infrequent
+# large-model load can still balloon the VM up toward the unchanged 48G
+# maximum. 24576 covers verified normal usage (~19.6G) with real margin,
+# including room for a second concurrent small/medium model
+# (OLLAMA_MAX_LOADED_MODELS=2), while freeing ~24G for a planned additional
+# k8s worker VM on this host. That new VM is expected to draw down this VM's
+# balloon toward its floor during normal operation -- deliberate, not a risk to
+# design around -- so give IT a real balloon floor too when it's created, not a
+# hard pin like this one had, or the elasticity only works in one direction.
+#
+# `balloon` is not in the protected-key denylist
+# (playbooks/tasks/proxmox-assert-safe-keys.yml lists it among the allowed
+# runtime keys). pve-ai carries no proxmox_protected_vmids, so this applies
+# with a plain `ansible-playbook playbooks/proxmox-config.yml`, no confirm
+# flags. Verify live the same way as pve's VM 105 pilot: `pvesh get
+# /nodes/pve-ai/qemu/100/status/current` should show balloon_min=24576 with
+# the VM's uptime unchanged (no restart) after applying.
+proxmox_qm_config:
+  - vmid: 100   # k8s-worker-2 -- RTX 5090 passthrough, LiteLLM/Ollama host
+    settings:
+      balloon: 24576   # memory 49152 (unchanged)
