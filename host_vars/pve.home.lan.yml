@@ -39,37 +39,37 @@ openclaw_exec_allowlist_extra:
 # both the one that crashed and the one that actually needs the least most of
 # the time (its own pod memory REQUESTS sum to 382Mi -- verified 2026-08-27).
 #
-# Staged rollout, deliberately: VM 105 alone first, applied and verified live
-# (qm monitor's balloon target actually moves, VM uptime unchanged -- no
-# restart involved) before the other six are uncommented below and applied in
-# a follow-up run. `balloon` is not in the protected-key denylist
+# Staged rollout: VM 105 was applied and verified live first (2026-08-27) --
+# pvesh status/current showed balloon_min=8192 landed and the live balloon
+# target sitting at 22376 (above the floor, since the host had room at the
+# time), VM uptime unchanged throughout, confirming this applies via QMP with
+# no restart. The other six below were then enabled and applied the same way.
+# `balloon` is not in the protected-key denylist
 # (playbooks/tasks/proxmox-assert-safe-keys.yml lists it among the allowed
 # runtime keys) and pve carries no proxmox_protected_vmids, so this applies with
 # a plain `ansible-playbook playbooks/proxmox-config.yml`, no confirm flags.
 proxmox_qm_config:
+  - vmid: 102   # omv
+    settings:
+      balloon: 3072   # memory 4096, RSS was ~3.5-3.6G -- little slack, small floor cut
+  - vmid: 103   # k8s-master -- carries etcd; conservative floor
+    settings:
+      balloon: 12288  # memory 16384
+  - vmid: 104   # desktop -- interactively used; conservative floor
+    settings:
+      balloon: 12288  # memory 16384
   - vmid: 105   # k8s-worker -- the VM the kernel killed on 2026-08-24
     settings:
       balloon: 8192   # memory 24576. Pod memory requests sum to 382Mi; RSS
                        # after its post-crash reboot has stayed under 7G. The
                        # 24G ceiling is unchanged for whenever it is legitimately
                        # needed -- this only lowers what the host can reclaim.
-
-  # --- staged for the next run, after 105 is verified -------------------------
-  # - vmid: 102   # omv
-  #   settings:
-  #     balloon: 3072   # memory 4096, RSS was ~3.5-3.6G -- little slack, small floor cut
-  # - vmid: 103   # k8s-master -- carries etcd; conservative floor
-  #   settings:
-  #     balloon: 12288  # memory 16384
-  # - vmid: 104   # desktop -- interactively used; conservative floor
-  #   settings:
-  #     balloon: 12288  # memory 16384
-  # - vmid: 109   # vscode
-  #   settings:
-  #     balloon: 2048   # memory 4096
-  # - vmid: 111   # openclaw
-  #   settings:
-  #     balloon: 3072   # memory 8192, RSS was ~2G -- real slack here
-  # - vmid: 112   # haos -- home automation; conservative floor
-  #   settings:
-  #     balloon: 3072   # memory 4096
+  - vmid: 109   # vscode
+    settings:
+      balloon: 2048   # memory 4096
+  - vmid: 111   # openclaw
+    settings:
+      balloon: 3072   # memory 8192, RSS was ~2G -- real slack here
+  - vmid: 112   # haos -- home automation; conservative floor
+    settings:
+      balloon: 3072   # memory 4096
