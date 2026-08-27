@@ -327,7 +327,80 @@
       jsonrpc: "2.0"
       method: itemprototype.get
       params:
-        output: ["itemid", "key_"]
+        output: ["itemid", "key_", "name", "status"]
+        discoveryids: ["{{ smart_ruleid }}"]
+      id: 1
+  register: smart_proto_lookup
+  check_mode: false
+  failed_when: smart_proto_lookup.json.error is defined
+
+# ---------------------------------------------------------------------------
+# Matching is by NAME with a key update, not by key alone.
+#
+# The original logic was `when: item.key not in <existing keys>`, which is
+# correct only while keys never change. When smart.drive[{#DEV},...] became
+# smart.drive[{#SERIAL},...] on 2026-08-26, every host got a SECOND set of
+# prototypes instead of an updated one -- verified on pbs, whose rule ended up
+# with 6 where it should have had 3, the old three still enabled and still
+# stamping out items keyed on the device letter.
+#
+# That cannot be cleaned up with itemprototype.delete: the automation token is
+# refused that method (see homelab-vault TODO.md, the same blocker as the
+# orphaned Kubernetes prototypes). .update IS granted, which is why the fix has
+# to be an in-place key change plus a disable pass, never a delete.
+#
+# Order matters: skip if the desired key already exists, otherwise re-key the
+# prototype that shares the name. Doing it the other way round would try to set
+# a key that already exists on the rule and the API would reject the whole call.
+# ---------------------------------------------------------------------------
+- name: "{{ smart_host }} — set prototype lookup facts"
+  ansible.builtin.set_fact:
+    smart_proto_existing: "{{ smart_proto_lookup.json.result | default([]) }}"
+    smart_proto_wanted_keys: "{{ smart_item_prototypes | map(attribute='key') | list }}"
+
+- name: "{{ smart_host }} — re-key item prototypes whose key changed"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.update
+      params:
+        itemid: >-
+          {{ (smart_proto_existing
+              | selectattr('name', 'equalto', item.name)
+              | rejectattr('key_', 'in', smart_proto_wanted_keys)
+              | map(attribute='itemid') | list | first) }}
+        key_: "{{ item.key }}"
+      id: 1
+  loop: "{{ smart_item_prototypes }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - item.key not in (smart_proto_existing | map(attribute='key_') | list)
+    - (smart_proto_existing
+       | selectattr('name', 'equalto', item.name)
+       | rejectattr('key_', 'in', smart_proto_wanted_keys)
+       | list | length) > 0
+  register: smart_proto_rekey
+  changed_when: smart_proto_rekey.json.result is defined
+  failed_when: smart_proto_rekey.json.error is defined
+
+- name: "{{ smart_host }} — re-read item prototypes after any re-key"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.get
+      params:
+        output: ["itemid", "key_", "name", "status"]
         discoveryids: ["{{ smart_ruleid }}"]
       id: 1
   register: smart_proto_lookup
@@ -363,6 +436,39 @@
   changed_when: smart_proto_create.json.result is defined
   failed_when: smart_proto_create.json.error is defined
 
+# Disable, never delete -- itemprototype.delete is refused to this token. Any
+# smart.drive prototype left on the rule that is not one of the wanted keys is
+# a leftover from a key change; enabled, it keeps stamping out a parallel set of
+# items keyed on the device letter, which is exactly the bug being fixed.
+# Disabled they collect nothing, but they do still exist and still need a manual
+# UI deletion -- tracked in homelab-vault TODO.md next to the same blocker on
+# the orphaned Kubernetes prototypes.
+- name: "{{ smart_host }} — disable leftover prototypes from an old key scheme"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.update
+      params:
+        itemid: "{{ item.itemid }}"
+        status: 1
+      id: 1
+  loop: >-
+    {{ smart_proto_lookup.json.result | default([])
+       | selectattr('key_', 'search', '^smart\.drive\[')
+       | rejectattr('key_', 'in', smart_proto_wanted_keys)
+       | selectattr('status', 'equalto', '0')
+       | list }}
+  loop_control:
+    label: "{{ item.key_ }}"
+  register: smart_proto_disable
+  changed_when: smart_proto_disable.json.result is defined
+  failed_when: smart_proto_disable.json.error is defined
+
 # --- trigger prototypes -----------------------------------------------------
 
 - name: "{{ smart_host }} — read existing trigger prototypes"
@@ -376,12 +482,53 @@
       jsonrpc: "2.0"
       method: triggerprototype.get
       params:
-        output: ["triggerid", "description"]
+        output: ["triggerid", "description", "expression"]
         discoveryids: ["{{ smart_ruleid }}"]
       id: 1
   register: smart_trigproto_lookup
   check_mode: false
   failed_when: smart_trigproto_lookup.json.error is defined
+
+# Same defect as the item prototypes, and easier to miss: trigger prototypes are
+# matched by DESCRIPTION, and the descriptions deliberately still say {#DEV}. So
+# when the item keys moved to {#SERIAL} the create task below simply skipped,
+# leaving every expression pointing at smart.drive[{#DEV},...] -- triggers
+# referencing items that no longer get created. Verified on pbs 2026-08-26.
+#
+# Compared with whitespace stripped, because Zabbix returns the expression in
+# its own normalised form and a literal comparison would report changed forever.
+- name: "{{ smart_host }} — update trigger prototype expressions that changed"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: triggerprototype.update
+      params:
+        triggerid: >-
+          {{ (smart_trigproto_lookup.json.result | default([])
+              | selectattr('description', 'equalto', item.description)
+              | map(attribute='triggerid') | list | first) }}
+        expression: "{{ item.expression | replace('@HOST@', smart_host) | trim }}"
+      id: 1
+  loop: "{{ smart_trigger_prototypes }}"
+  loop_control:
+    label: "{{ item.description }}"
+  when:
+    - (smart_trigproto_lookup.json.result | default([])
+       | selectattr('description', 'equalto', item.description)
+       | list | length) > 0
+    - (smart_trigproto_lookup.json.result | default([])
+       | selectattr('description', 'equalto', item.description)
+       | map(attribute='expression') | list | first
+       | regex_replace('\s+', ''))
+      != (item.expression | replace('@HOST@', smart_host) | regex_replace('\s+', ''))
+  register: smart_trigproto_update
+  changed_when: smart_trigproto_update.json.result is defined
+  failed_when: smart_trigproto_update.json.error is defined
 
 - name: "{{ smart_host }} — create trigger prototypes"
   ansible.builtin.uri:
