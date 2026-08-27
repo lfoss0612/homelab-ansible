@@ -123,11 +123,15 @@ if [ -s "$WORK_DIR/journal.out" ]; then
 	while IFS= read -r line; do
 		case "$line" in
 			*task_memcg=*)
-				LAST_MEMCG=$(printf '%s\n' "$line" | awk '{
-					for (i=1;i<=NF;i++) if ($i ~ /^task_memcg=/) {
-						split($i,a,"="); v=a[2]; sub(/,$/,"",v); print v; exit
-					}
-				}')
+				# NOT split on whitespace like the fields below: the real line has
+				# no spaces at all in this section --
+				#   ...cpuset=qemu.slice,mems_allowed=0,global_oom,task_memcg=/qemu.slice/105.scope,task=kvm,pid=5487,uid=0
+				# -- so task_memcg= is buried mid-field, comma-delimited, not its
+				# own awk field. Verified live 2026-08-27: the field-splitting
+				# version above silently found nothing and every event reported
+				# memcg=unknown. sed substring capture instead, stopping at the
+				# next comma.
+				LAST_MEMCG=$(printf '%s\n' "$line" | sed -n 's/.*task_memcg=\([^,]*\).*/\1/p')
 				;;
 			*"Out of memory: Killed process"*)
 				read -r TS PID COMM RSS_KB <<-EOF
