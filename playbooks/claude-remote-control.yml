@@ -1,0 +1,114 @@
+---
+# Install the Claude Code remote-control agent as a systemd service.
+#
+# Usage:
+#   ansible-playbook playbooks/claude-remote-control.yml --check --diff
+#   ansible-playbook playbooks/claude-remote-control.yml
+#
+# Captures a unit created by hand on `desktop` on 2026-08-28 so it survives a
+# rebuild, per the repo's one rule: anything done on a host gets expressed as a
+# playbook here rather than left as a local edit.
+#
+# Unlike every other service this repo installs, this one does NOT run as root:
+# it runs as the interactive user `lfoss`, and its ExecStart lives in that
+# user's home (`~/.local/bin/claude`), installed and updated by the Claude Code
+# installer — not by apt, and not by Ansible. So this play asserts the binary is
+# present rather than installing it: a missing binary means Claude Code has not
+# been installed on the host yet, which is a person's job, not this play's.
+# Ansible still needs root here, to write into /etc/systemd/system.
+#
+# Targets [claude_remote_control], currently `desktop` alone. desktop is also in
+# [openclaw_optional], so it is legitimately powered off part of the time — but
+# this play is explicit-invocation-only and is deliberately NOT wired into the
+# weekly convergence timer, so an unreachable host is a real failure worth
+# seeing here, not a red timer. If this ever joins the timer, it must take the
+# same strict/`ignore_unreachable` split every fleet play uses.
+
+- name: Deploy the Claude Code remote control service
+  hosts: claude_remote_control
+  become: true
+
+  vars:
+    # Defaults describe desktop. Override in host_vars if a second host ever
+    # joins under a different account or projects directory.
+    claude_remote_control_user: lfoss
+    claude_remote_control_workdir: /home/lfoss/projects
+    claude_remote_control_bin: /home/lfoss/.local/bin/claude
+
+  handlers:
+    - name: restart_claude_remote_control
+      ansible.builtin.systemd_service:
+        name: claude-remote-control.service
+        state: restarted
+        daemon_reload: true
+      when: not ansible_check_mode
+
+  tasks:
+    - name: Check the claude binary is installed for {{ claude_remote_control_user }}
+      ansible.builtin.stat:
+        path: "{{ claude_remote_control_bin }}"
+      register: claude_remote_control_binary
+      check_mode: false
+
+    - name: Fail loudly when the claude binary is missing
+      ansible.builtin.assert:
+        that:
+          - claude_remote_control_binary.stat.exists | default(false)
+          - claude_remote_control_binary.stat.executable | default(false)
+        fail_msg: >-
+          {{ claude_remote_control_bin }} is missing or not executable on
+          {{ inventory_hostname }}. Claude Code installs per-user via its own
+          installer, not from this repo — install it as
+          {{ claude_remote_control_user }} first, then re-run this play.
+          Writing the unit anyway would leave systemd restarting a
+          status=203/EXEC failure every 10 seconds, forever.
+
+    - name: Check the unit's working directory exists
+      ansible.builtin.stat:
+        path: "{{ claude_remote_control_workdir }}"
+      register: claude_remote_control_workdir_stat
+      check_mode: false
+
+    - name: Fail loudly when the working directory is missing
+      ansible.builtin.assert:
+        that: claude_remote_control_workdir_stat.stat.isdir | default(false)
+        fail_msg: >-
+          WorkingDirectory {{ claude_remote_control_workdir }} does not exist on
+          {{ inventory_hostname }}; systemd fails the unit at start with
+          status=200/CHDIR and Restart=always retries it forever.
+
+    - name: Install the claude-remote-control unit
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Claude Remote Control
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ claude_remote_control_user }}
+          WorkingDirectory={{ claude_remote_control_workdir }}
+          ExecStart={{ claude_remote_control_bin }} remote-control
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/claude-remote-control.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart_claude_remote_control
+
+    # Skipped under --check for the same reason as the smart/oom equivalents:
+    # in check mode the unit has not actually been written, so a dry run against
+    # a host that does not have it yet fails with "Could not find the requested
+    # service" — exactly when a clean dry run matters most.
+    - name: Enable and start claude-remote-control
+      ansible.builtin.systemd_service:
+        name: claude-remote-control.service
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: not ansible_check_mode
