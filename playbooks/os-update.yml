@@ -88,12 +88,22 @@
     - name: Check whether a reboot is needed
       # Debian/Ubuntu drop this file; Proxmox kernels do not, so also compare the
       # running kernel against the newest one installed under /boot.
+      #
+      # Containers are answered first and separately. An LXC guest shares the
+      # host's kernel, so `uname -r` there reports the HOST's version while
+      # /boot may hold kernel images the container will never boot -- pdm
+      # carries seven. Comparing the two says "reboot needed" forever, and
+      # rebooting the container would not change it. Only its host can.
       ansible.builtin.shell:
         cmd: |
           set -o pipefail
+          virt=$(systemd-detect-virt 2>/dev/null || echo none)
           newest=$(ls -1 /boot/vmlinuz-* 2>/dev/null \
             | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
-          if [ -f /var/run/reboot-required ]; then
+          if [ "$virt" = "lxc" ] || [ "$virt" = "container-other" ] \
+             || [ "$virt" = "systemd-nspawn" ] || [ "$virt" = "docker" ]; then
+            echo "n/a container, kernel belongs to the host (running $(uname -r))"
+          elif [ -f /var/run/reboot-required ]; then
             echo "YES flag-file (running $(uname -r))"
           elif [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ]; then
             echo "YES running $(uname -r), newest installed $newest"
@@ -139,9 +149,13 @@
       ansible.builtin.shell:
         cmd: |
           set -o pipefail
+          virt=$(systemd-detect-virt 2>/dev/null || echo none)
           newest=$(ls -1 /boot/vmlinuz-* 2>/dev/null \
             | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
-          if [ -f /var/run/reboot-required ]; then
+          if [ "$virt" = "lxc" ] || [ "$virt" = "container-other" ] \
+             || [ "$virt" = "systemd-nspawn" ] || [ "$virt" = "docker" ]; then
+            echo "n/a container, kernel belongs to the host (running $(uname -r))"
+          elif [ -f /var/run/reboot-required ]; then
             echo "YES flag-file (running $(uname -r))"
           elif [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ]; then
             echo "YES running $(uname -r), newest installed $newest"
