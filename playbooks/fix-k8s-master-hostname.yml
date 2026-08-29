@@ -119,10 +119,15 @@
       changed_when: false
       when: hostname_set.changed and not ansible_check_mode
 
+    # Must be shell, not command: the command module shlex-splits its argument
+    # and strips the inner double quotes, corrupting the jsonpath filter into
+    # [?(@.type==Hostname)] - which kubectl rejects. Single-quoting the whole
+    # jsonpath in a shell keeps them intact.
     - name: Read back the node's Hostname address
-      ansible.builtin.command: >-
-        {{ rke2_kubectl }} get node {{ target_hostname }}
-        -o jsonpath={.status.addresses[?(@.type=="Hostname")].address}
+      ansible.builtin.shell:
+        cmd: >-
+          {{ rke2_kubectl }} get node {{ target_hostname }}
+          -o jsonpath='{.status.addresses[?(@.type=="Hostname")].address}'
       environment:
         KUBECONFIG: "{{ rke2_kubeconfig }}"
       register: node_hostname_address
