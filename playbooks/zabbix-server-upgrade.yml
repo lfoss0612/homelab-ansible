@@ -1,0 +1,272 @@
+---
+# Upgrade the Zabbix server itself (zabbix-server-mysql + zabbix-frontend-php)
+# from 7.4.13 to 7.4.14, both already on repo.zabbix.com's 7.4/stable channel
+# on zabbix.home.lan (Ubuntu 24.04, MySQL backend, Apache frontend).
+#
+# WHY: found while answering "can the server be upgraded" - it already
+# tracks the same repo as the two agent.version-guarded hosts
+# (zabbix-agent2-version-guard.yml), and 7.4.14 was sitting in its own apt
+# candidate. A patch-level bump within the 7.4 line, not a jump across
+# feature releases - lower risk than a 7.0->7.2->7.4 migration, but still
+# runs a one-way database schema migration on first start of the new
+# server binary, so this backs up the DB first and gates every later step
+# on that backup actually existing and being non-empty.
+#
+# SEQUENCE (matches Zabbix's own documented upgrade procedure): stop
+# zabbix-server -> mysqldump -> upgrade packages -> start zabbix-server
+# (runs the schema upgrade inline) -> poll the API until it reports the new
+# version -> restart Apache so PHP/opcache picks up the new frontend code.
+#
+# CREDENTIAL HANDLING: DBPassword is read from zabbix_server.conf ON THE
+# REMOTE HOST and used to write a --defaults-extra-file for mysqldump,
+# wrapped in block/always so that temp file is removed even if the dump
+# fails partway. The tasks that touch the password value carry
+# no_log: true so it never reaches Ansible's own output.
+#
+# NOT touched by this play: the two zabbix-agent2 holds
+# (zabbix.home.lan, vscode.home.lan). Once this lands, their candidate
+# (7.4.14) equals the new server version rather than exceeding it, so
+# re-running zabbix-agent2-version-guard.yml releases them automatically -
+# run that (and then the actual agent upgrade) as a separate, explicit step
+# afterward, not bundled into this one.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-server-upgrade.yml --check --diff
+#   ansible-playbook playbooks/zabbix-server-upgrade.yml
+
+- name: Upgrade the Zabbix server to 7.4.14
+  hosts: zabbix.home.lan
+  become: true
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    wanted_version: "7.4.14"
+    backup_dir: "/var/backups/zabbix"
+
+  tasks:
+    - name: Confirm the server is currently on the expected pre-upgrade version
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: apiinfo.version
+          params: {}
+          id: 1
+      register: pre_version
+      delegate_to: localhost
+      check_mode: false
+      failed_when: pre_version.json.error is defined
+
+    - name: Skip entirely if already on the wanted version
+      ansible.builtin.meta: end_host
+      when: pre_version.json.result == wanted_version
+
+    - name: Refuse to proceed if the server is already ahead of what we expect
+      ansible.builtin.assert:
+        that:
+          - not (pre_version.json.result is version(wanted_version, '>'))
+        fail_msg: >-
+          Server reports {{ pre_version.json.result }}, already newer than
+          {{ wanted_version }} - this play was written for a specific known
+          jump. Re-check before proceeding.
+
+    - name: Confirm apt is offering exactly the wanted version
+      ansible.builtin.command: apt-cache policy zabbix-server-mysql
+      register: pkg_policy
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse if the wanted version is not actually the candidate
+      ansible.builtin.assert:
+        that:
+          - "{{ pkg_policy.stdout is search('Candidate: 1:' ~ wanted_version ~ '-') }}"
+        fail_msg: >-
+          apt-cache policy does not show 1:{{ wanted_version }}-... as the
+          candidate for zabbix-server-mysql on {{ inventory_hostname }}.
+          Re-check before editing this play's wanted_version.
+        success_msg: "Candidate confirmed: {{ wanted_version }}."
+
+    - name: Ensure the backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Back up the Zabbix database before touching any packages
+      block:
+        - name: Read the DB credentials from zabbix_server.conf
+          ansible.builtin.shell: |
+            set -o pipefail
+            echo "[client]"
+            echo "user=$(grep -E '^\s*DBUser=' /etc/zabbix/zabbix_server.conf | cut -d= -f2-)"
+            echo "password=$(grep -E '^\s*DBPassword=' /etc/zabbix/zabbix_server.conf | cut -d= -f2-)"
+          args:
+            executable: /bin/bash
+          register: db_creds
+          changed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: Write a throwaway mysql defaults file (removed in 'always' below)
+          ansible.builtin.copy:
+            content: "{{ db_creds.stdout }}\n"
+            dest: /root/.zabbix_backup_my.cnf
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Determine the DB name
+          ansible.builtin.command: grep -E '^\s*DBName=' /etc/zabbix/zabbix_server.conf
+          register: db_name_line
+          changed_when: false
+          check_mode: false
+
+        - name: Set the backup filename
+          ansible.builtin.set_fact:
+            db_name: "{{ db_name_line.stdout.split('=')[1] }}"
+            backup_file: "{{ backup_dir }}/{{ db_name_line.stdout.split('=')[1] }}-pre-{{ wanted_version }}-{{ ansible_date_time.iso8601_basic_short }}.sql.gz"
+
+        - name: Dump the database (single-transaction, no downtime needed for this step)
+          ansible.builtin.shell: >-
+            set -o pipefail
+            && mysqldump --defaults-extra-file=/root/.zabbix_backup_my.cnf
+            --single-transaction --routines --triggers {{ db_name }}
+            | gzip > {{ backup_file }}
+          args:
+            executable: /bin/bash
+          changed_when: true
+      always:
+        - name: Remove the throwaway credentials file no matter what happened above
+          ansible.builtin.file:
+            path: /root/.zabbix_backup_my.cnf
+            state: absent
+
+    - name: Confirm the backup actually exists and is not empty
+      ansible.builtin.stat:
+        path: "{{ backup_file }}"
+      register: backup_stat
+
+    - name: Refuse to proceed without a real backup
+      ansible.builtin.assert:
+        that:
+          - backup_stat.stat.exists
+          - backup_stat.stat.size > 1024
+        fail_msg: >-
+          {{ backup_file }} is missing or suspiciously small
+          ({{ backup_stat.stat.size | default('?') }} bytes) - refusing to
+          touch packages without a real backup in hand.
+        success_msg: "Backup confirmed: {{ backup_file }} ({{ backup_stat.stat.size | default('?') }} bytes)."
+
+    - name: Stop zabbix-server before the package upgrade
+      ansible.builtin.systemd_service:
+        name: zabbix-server
+        state: stopped
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Install the exact wanted version of zabbix-server-mysql and the frontend
+      ansible.builtin.apt:
+        name:
+          - "zabbix-server-mysql=1:{{ wanted_version }}*"
+          - "zabbix-frontend-php=1:{{ wanted_version }}*"
+        state: present
+        allow_downgrade: false
+
+    # Mark the log position first - apiinfo.version reflects the FRONTEND
+    # PHP code's version constant, not the database schema state, so it
+    # would report 7.4.14 the instant the package is unpacked regardless of
+    # whether zabbix-server's own migration succeeds. The real proof is
+    # this log and the service staying up, not the API.
+    - name: Note the server log's current size, to only look at what this run adds
+      ansible.builtin.stat:
+        path: /var/log/zabbix/zabbix_server.log
+      register: log_before
+
+    - name: Start zabbix-server (this runs the DB schema upgrade inline)
+      ansible.builtin.systemd_service:
+        name: zabbix-server
+        state: started
+        enabled: true
+
+    # Homelab-scale DB, so this should be quick, but give it real room -
+    # a schema migration that's still running when we check would look
+    # identical to one that silently failed if we didn't wait for it.
+    - name: Give the schema upgrade time to run, then confirm the service is still up
+      ansible.builtin.systemd_service:
+        name: zabbix-server
+      register: server_status
+      until: server_status.status.ActiveState == 'active'
+      retries: 12
+      delay: 10
+
+    - name: Read what this run wrote to the server log
+      ansible.builtin.shell: >-
+        set -o pipefail
+        tail -c +{{ log_before.stat.size + 1 }} /var/log/zabbix/zabbix_server.log
+      args:
+        executable: /bin/bash
+      register: new_log
+      changed_when: false
+      check_mode: false
+
+    - name: Fail loudly if the new log lines mention an error or a failed upgrade
+      ansible.builtin.assert:
+        that:
+          - new_log.stdout is not search('(?i)cannot upgrade database')
+          - new_log.stdout is not search('(?i)database upgrade failed')
+          - new_log.stdout is not search('\[Z3001\]')
+        fail_msg: >-
+          zabbix_server.log shows a database upgrade problem on
+          {{ inventory_hostname }} after starting the new version:
+          {{ new_log.stdout }}
+          The backup is at {{ backup_file }} - restore it and reinstall
+          {{ pre_version.json.result }} rather than guessing at a fix here.
+        success_msg: "No upgrade-failure markers in the new log output."
+
+    - name: Restart Apache so PHP/opcache picks up the new frontend code
+      ansible.builtin.systemd_service:
+        name: apache2
+        state: restarted
+
+    - name: Confirm the API reports the new version (frontend-level check, not proof of DB migration - see above)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: apiinfo.version
+          params: {}
+          id: 1
+      register: post_version
+      delegate_to: localhost
+      check_mode: false
+      until: >-
+        post_version.json is defined
+        and post_version.json.result is defined
+        and post_version.json.result == wanted_version
+      retries: 6
+      delay: 5
+      failed_when: >-
+        post_version.json is not defined
+        or post_version.json.result is not defined
+        or post_version.json.result != wanted_version
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          Zabbix server upgraded {{ pre_version.json.result }} ->
+          {{ post_version.json.result }}. Service stayed active through the
+          schema upgrade, no failure markers in the new log lines. Backup
+          at {{ backup_file }} ({{ backup_stat.stat.size }} bytes).
+          Next: re-run zabbix-agent2-version-guard.yml to release the hold
+          on zabbix.home.lan/vscode.home.lan now that they're no longer
+          ahead of the server, then upgrade those two agents to match.

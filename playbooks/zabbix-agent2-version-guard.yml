@@ -102,11 +102,53 @@
           before this play touches anything here; do not let it silently downgrade.
         success_msg: "{{ inventory_hostname }}: installed {{ installed_version }} is not ahead of the server."
 
-    - name: Release the hold where the candidate no longer exceeds the server
-      ansible.builtin.dpkg_selections:
-        name: zabbix-agent2
-        selection: install
-      when: not (candidate_version is version(zabbix_server_version, '>'))
+    - name: Check whether zabbix-agent2 is currently held
+      ansible.builtin.command: dpkg --get-selections zabbix-agent2
+      register: current_selection
+      changed_when: false
+      check_mode: false
+
+    # Only touches hosts THIS play previously held - never a blanket
+    # "keep everything upgraded" action, which would duplicate what normal
+    # OS patching/unattended-upgrades already does for every other host.
+    - name: Release a previous hold and catch up now that it's safe
+      when:
+        - "'hold' in current_selection.stdout"
+        - not (candidate_version is version(zabbix_server_version, '>'))
+      block:
+        - name: Release the hold
+          ansible.builtin.dpkg_selections:
+            name: zabbix-agent2
+            selection: install
+
+        # ansible.builtin.apt has no allow_change_held_packages equivalent,
+        # and apt-get refuses a -y upgrade of a package dpkg still shows as
+        # held even in the same run the hold was just released in - shell
+        # out directly rather than fight the higher-level module for this
+        # one case.
+        - name: Upgrade to the now-safe candidate
+          ansible.builtin.apt:
+            update_cache: true
+          changed_when: false
+          check_mode: false
+
+        - name: Install the now-safe candidate version
+          ansible.builtin.command: >-
+            apt-get install -y --allow-change-held-packages zabbix-agent2
+          register: catchup_install
+          changed_when: "'is already the newest version' not in catchup_install.stdout"
+
+        - name: Restart the agent to pick up the new version
+          ansible.builtin.systemd_service:
+            name: zabbix-agent2
+            state: restarted
+
+        - name: Report the catch-up
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: was held at {{ installed_version }},
+              released and caught up now that the server is
+              {{ zabbix_server_version }}.
 
     - name: Report hosts with nothing at risk (candidate can't exceed the server anyway)
       ansible.builtin.debug:
