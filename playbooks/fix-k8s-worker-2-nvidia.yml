@@ -1,0 +1,148 @@
+---
+# Restore the GPU on k8s-worker-2 after it booted kernel 7.0.0-30-generic.
+#
+# Usage:
+#   ansible-playbook playbooks/fix-k8s-worker-2-nvidia.yml --check --diff
+#   ansible-playbook playbooks/fix-k8s-worker-2-nvidia.yml
+#
+# Background (2026-08-29): rebooting pve-ai for its kernel update cycled this
+# VM, and it booted 7.0.0-30-generic for the first time -- a kernel that was
+# already installed but had never been booted. nvidia-smi then failed with
+# "couldn't communicate with the NVIDIA driver", no nvidia modules were
+# loaded, and all four gpu-operator pods went Unknown. The node itself stayed
+# Ready, so the cluster was never at risk.
+#
+# Two things were wrong, and only the second one is obvious:
+#
+#   1. linux-headers-7.0.0-30-generic was NOT installed. Without headers dkms
+#      cannot build ANY driver for the running kernel, so nothing rebuilt at
+#      boot regardless of driver version.
+#   2. The installed driver was 580.105.08, which predates kernel 7.0 support.
+#      That is the same version whose build failure against 7.0.0-28 is
+#      documented in playbooks/fix-k8s-worker-2-dpkg.yml.
+#
+# The 580 BRANCH does support this kernel -- Ubuntu ships a prebuilt
+# linux-modules-nvidia-580-open-7.0.0-30-generic. That prebuilt package cannot
+# be used here, though: it depends on nvidia-kernel-common-580 at Ubuntu's
+# archive versioning (580.173.02-0ubuntu0.24.04.1) while this host pins the
+# NVIDIA CUDA repo at priority 600 over the archive's 500 and therefore runs
+# the -1ubuntu1 line. The two version schemes cannot satisfy each other.
+#
+# So: install the headers and move the 580 stack to 580.178.04 from the CUDA
+# repo, letting dkms build. Scoped deliberately to the 580 packages -- a full
+# dist-upgrade here also drags in 610-branch libraries and REMOVES the
+# cuda-drivers metapackage, which is why playbooks/os-update.yml excludes this
+# host by default.
+#
+# This playbook does NOT reboot. If the dkms build fails it stops loudly so
+# the fallback stays open: boot 6.17.0-40-generic, which still has a working
+# nvidia/580.105.08 build.
+
+- name: Restore the NVIDIA driver on k8s-worker-2
+  hosts: "{{ nvidia_fix_hosts | default('k8s-worker-2.home.lan') }}"
+  become: true
+
+  tasks:
+    - name: Record the running kernel
+      ansible.builtin.command: uname -r
+      register: nvidia_fix_kernel
+      changed_when: false
+      check_mode: false
+
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Simulate the scoped install
+      ansible.builtin.command:
+        cmd: >-
+          apt-get -s -o Debug::NoLocking=1 install
+          linux-headers-{{ nvidia_fix_kernel.stdout | trim }}
+          nvidia-dkms-580-open
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: nvidia_fix_sim
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to proceed if anything would be removed
+      # cuda-drivers disappearing is the signature of the 580/610 branch split
+      # leaking in. If that shows up here, the scoping above stopped working.
+      ansible.builtin.assert:
+        that: nvidia_fix_sim.stdout_lines | select('match', '^Remv ') | list | length == 0
+        fail_msg: >-
+          Scoped install would REMOVE:
+          {{ nvidia_fix_sim.stdout_lines | select('match', '^Remv ')
+             | map('regex_replace', '^Remv (\S+).*', '\1') | join(', ') }}.
+          Refusing -- this should install cleanly with zero removals.
+
+    - name: Install kernel headers for the running kernel
+      # Must precede the driver: dkms builds during the driver's postinst, and
+      # with no headers present that build is skipped rather than failed.
+      ansible.builtin.apt:
+        name: "linux-headers-{{ nvidia_fix_kernel.stdout | trim }}"
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Upgrade the NVIDIA 580 stack so dkms can build against kernel 7.0
+      ansible.builtin.apt:
+        name: nvidia-dkms-580-open
+        state: latest
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: nvidia_fix_install
+
+    - name: Read dkms state
+      ansible.builtin.command: dkms status
+      register: nvidia_fix_dkms
+      changed_when: false
+      check_mode: false
+
+    - name: Require a dkms build for the RUNNING kernel
+      # The pre-existing builds for 6.17.0-40-generic and 6.8.0-138-generic do
+      # not help a host booted into 7.0.0-30-generic, so match on the running
+      # kernel specifically rather than on "nvidia appears somewhere".
+      ansible.builtin.assert:
+        that: >-
+          nvidia_fix_dkms.stdout_lines
+          | select('search', nvidia_fix_kernel.stdout | trim)
+          | select('search', 'installed')
+          | list | length > 0
+        fail_msg: >-
+          No dkms build for {{ nvidia_fix_kernel.stdout | trim }} after the
+          upgrade. dkms status: {{ nvidia_fix_dkms.stdout | trim }}.
+          Do NOT reboot chasing this -- fall back to booting
+          6.17.0-40-generic, which still has a working 580.105.08 build.
+        success_msg: "dkms built for {{ nvidia_fix_kernel.stdout | trim }}"
+
+    - name: Load the nvidia module
+      # Plain command on purpose: community.general is not installed on this
+      # control node (`ansible-galaxy collection list` shows only the pinned
+      # set under /opt/ansible/collections), so community.general.modprobe
+      # would fail to resolve at runtime.
+      ansible.builtin.command: modprobe nvidia
+      register: nvidia_fix_modprobe
+      changed_when: nvidia_fix_modprobe.rc == 0
+      failed_when: false
+
+    - name: Query the GPU
+      ansible.builtin.command:
+        cmd: nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+      register: nvidia_fix_smi
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "kernel:  {{ nvidia_fix_kernel.stdout | trim }}"
+          - "dkms:    {{ nvidia_fix_dkms.stdout_lines | select('search', nvidia_fix_kernel.stdout | trim) | join('; ') }}"
+          - "nvidia-smi rc={{ nvidia_fix_smi.rc }}: {{ nvidia_fix_smi.stdout | trim | default('(no output)', true) }}"
+          - >-
+            {{ 'GPU is back.' if nvidia_fix_smi.rc == 0 else
+               'Module built but nvidia-smi still failing -- a reboot into
+                7.0.0-30-generic is the next step, fallback is
+                6.17.0-40-generic.' }}
