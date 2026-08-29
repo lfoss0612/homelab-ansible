@@ -1,0 +1,142 @@
+---
+# Align k8s-master's OS hostname with its Kubernetes node name.
+#
+# WHY: k8s-master is the only node whose /etc/hostname (k8s-master) disagrees
+# with its Kubernetes node name (k8s-master.home.lan). The FQDN node name comes
+# from an explicit "node-name:" in /etc/rancher/rke2/config.yaml; the OS
+# hostname was never changed to match. Both workers happen to agree, because
+# their /etc/hostname is already the FQDN and they carry no node-name override.
+#
+# WHAT IT BREAKS: RKE2's built-in cloud provider writes the OS hostname into the
+# node annotation rke2.io/hostname, and populates status.addresses[Hostname]
+# from that annotation. So on the master:
+#
+#     metadata.name              = k8s-master.home.lan
+#     rke2.io/hostname           = k8s-master          <-- OS hostname
+#     status.addresses[Hostname] = k8s-master
+#
+# The Zabbix "Kubernetes nodes by HTTP" kube.nodes script item stamps every pod
+# with its node's Hostname address, then the per-node dependent items filter
+#
+#     $.Pods[?(@.hostname == "{#NAME}")].containers.requests.cpu.sum()
+#
+# where {#NAME} is metadata.name - the FQDN. On the master the two never match,
+# so both kube.node.requests.cpu[k8s-master.home.lan] and
+# kube.node.requests.memory[k8s-master.home.lan] go unsupported with "cannot
+# apply aggregation function to empty array", and the Kubernetes Cluster
+# dashboard's Nodes page shows no CPU/memory-requested tiles for the master.
+# The workers are unaffected. There is no Zabbix-side fix: the owning LLD rule
+# exposes only {#NAME}, so the filter cannot be re-keyed onto nodeIP.
+#
+# WHY THIS IS SAFE: the node is NOT renamed. "node-name: k8s-master.home.lan" is
+# pinned in config.yaml and takes precedence over the OS hostname, so the node
+# object, its etcd member name and its providerID all keep their current values.
+# The first task asserts that pin is present and refuses to run without it -
+# without the pin, changing the hostname WOULD re-register the node under a new
+# name, orphaning the old one.
+#
+# Persistence across reboot: /etc/cloud/cloud.cfg.d/99-installer.cfg sets
+# preserve_hostname: true, which overrides the "false" in the base cloud.cfg
+# (cloud.cfg.d is merged last). cloud-init will not revert this.
+#
+# DISRUPTION: restarting rke2-server briefly takes down the API server and
+# embedded etcd on the only control-plane node. Running workloads on the
+# workers keep running - their kubelets do not need the API to keep pods up -
+# but for roughly a minute there is no scheduling, no kubectl and no Argo CD.
+#
+# Usage:
+#   ansible-playbook playbooks/fix-k8s-master-hostname.yml --check --diff
+#   ansible-playbook playbooks/fix-k8s-master-hostname.yml
+
+- name: Align k8s-master's OS hostname with its Kubernetes node name
+  hosts: k8s-master.home.lan
+  become: true
+
+  vars:
+    target_hostname: k8s-master.home.lan
+    rke2_kubectl: /var/lib/rancher/rke2/bin/kubectl
+    rke2_kubeconfig: /etc/rancher/rke2/rke2.yaml
+
+  tasks:
+    - name: Read the RKE2 server config
+      ansible.builtin.slurp:
+        src: /etc/rancher/rke2/config.yaml
+      register: rke2_config
+
+    - name: Refuse to run unless node-name is pinned to the FQDN
+      ansible.builtin.assert:
+        that:
+          - (rke2_config.content | b64decode) is search('^\s*node-name:\s*' ~ target_hostname ~ '\s*$', multiline=True)
+        fail_msg: >-
+          /etc/rancher/rke2/config.yaml does not pin "node-name: {{ target_hostname }}".
+          Changing the OS hostname without that pin would re-register this node
+          under a new name and orphan the existing node object. Refusing.
+        success_msg: "node-name is pinned to {{ target_hostname }} - the node will not be renamed."
+
+    - name: Confirm cloud-init will not revert the hostname on reboot
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          test -d /etc/cloud || exit 0
+          grep -rh '^preserve_hostname:' /etc/cloud/cloud.cfg.d/ | tail -1 | grep -q true
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Set the OS hostname to the FQDN
+      ansible.builtin.hostname:
+        name: "{{ target_hostname }}"
+      register: hostname_set
+
+    - name: Ensure /etc/hosts still resolves both the FQDN and the short name
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^{{ ansible_host }}\s'
+        line: "{{ ansible_host }} {{ target_hostname }} {{ target_hostname.split('.')[0] }}"
+        state: present
+
+    - name: Restart rke2-server so the cloud provider rewrites the node addresses
+      ansible.builtin.systemd:
+        name: rke2-server.service
+        state: restarted
+      when: hostname_set.changed
+
+    - name: Wait for the API server to accept connections again
+      ansible.builtin.wait_for:
+        port: 6443
+        host: 127.0.0.1
+        delay: 10
+        timeout: 300
+      when: hostname_set.changed
+
+    - name: Wait for the API server to report ready
+      ansible.builtin.command: "{{ rke2_kubectl }} get --raw /readyz"
+      environment:
+        KUBECONFIG: "{{ rke2_kubeconfig }}"
+      register: readyz
+      until: readyz.rc == 0 and readyz.stdout is search('ok')
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: hostname_set.changed
+
+    - name: Read back the node's Hostname address
+      ansible.builtin.command: >-
+        {{ rke2_kubectl }} get node {{ target_hostname }}
+        -o jsonpath={.status.addresses[?(@.type=="Hostname")].address}
+      environment:
+        KUBECONFIG: "{{ rke2_kubeconfig }}"
+      register: node_hostname_address
+      until: node_hostname_address.stdout | trim == target_hostname
+      retries: 12
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Report the outcome
+      ansible.builtin.debug:
+        msg: >-
+          status.addresses[Hostname] is now "{{ node_hostname_address.stdout | trim }}"
+          (want "{{ target_hostname }}").
+          {{ 'Fixed - the two Zabbix kube.node.requests items should go supported on their next poll.'
+             if node_hostname_address.stdout | trim == target_hostname
+             else 'STILL WRONG - do not re-run blindly; re-check rke2.io/hostname on the node object.' }}
