@@ -104,6 +104,11 @@
       # The pre-existing builds for 6.17.0-40-generic and 6.8.0-138-generic do
       # not help a host booted into 7.0.0-30-generic, so match on the running
       # kernel specifically rather than on "nvidia appears somewhere".
+      #
+      # Skipped under --check: the apt tasks above are no-ops there, so dkms
+      # still reports only the stale builds and this would always fail, which
+      # makes a dry run look like a real breakage.
+      when: not ansible_check_mode
       ansible.builtin.assert:
         that: >-
           nvidia_fix_dkms.stdout_lines
