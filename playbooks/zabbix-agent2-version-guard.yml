@@ -1,0 +1,126 @@
+---
+# Prevents zabbix-agent2 from being upgraded past the Zabbix SERVER's own
+# version on any host that tracks repo.zabbix.com.
+#
+# WHY THIS EXISTS: Zabbix's own compatibility policy is that an agent must
+# never be NEWER than the server (confirmed against
+# zabbix.com/documentation/current/en/manual/appendix/compatibility -
+# "must not be newer than 7.4" for a 7.4 server, generalizes to any version).
+# Debian's own repos never risk this - trixie ships 7.0.22, bookworm-backports
+# ships 7.0.9, both well behind any recent server - so those hosts are left
+# alone entirely; this only touches hosts whose candidate could reach or pass
+# the server.
+#
+# THE GAP FOUND LIVE 2026-08-29, while building the fleet-wide "align agent
+# versions" ask: the server itself (apiinfo.version) is 7.4.13.
+# zabbix.home.lan and vscode.home.lan - the only two hosts on repo.zabbix.com
+# (added by upgrade-to-zabbix-agent2.yml for Ubuntu specifically) - were
+# BOTH already installed at 7.4.13 but showing Candidate: 7.4.14, released
+# 2026-08-25, four days before this was noticed. Nothing had upgraded them
+# yet, but nothing was stopping the next `apt upgrade` (manual or
+# unattended-upgrades) from doing exactly that and silently breaking
+# agent-server compatibility. Confirmed live via `apt-cache policy
+# zabbix-agent2` across the whole fleet before writing this.
+#
+# WHY A HOLD, NOT A VERSION PIN FILE: dpkg_selections' hold state is exactly
+# "don't let this package move via normal apt operations," which is all that
+# is needed here - the desired current version is whatever's already
+# installed, not some computed target. If the server is later upgraded
+# on purpose, re-run this play: it unholds first, so the fresh Candidate
+# (which by then should again be <= the new server version) can be installed,
+# then re-holds at the new version.
+#
+# SCOPE: any host whose zabbix-agent2 candidate version is strictly newer
+# than the server's own version gets held at its current version. Any host
+# whose candidate stays at or below the server version is left completely
+# alone - Debian-family hosts keep receiving their OS's own patch releases
+# automatically, which is correct and desired.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-agent2-version-guard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-agent2-version-guard.yml
+
+- name: Guard zabbix-agent2 against exceeding the Zabbix server's version
+  hosts: all:!api_managed:!k8s
+  become: true
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+
+  tasks:
+    # delegate_to: localhost (no run_once) - each host makes its own quick,
+    # unauthenticated, read-only call rather than trying to share one
+    # host's registered result across the batch, which needs no cross-host
+    # hostvars lookups and has no meaningful cost for an 11-host fleet.
+    - name: Read the Zabbix server's own version (no auth needed for apiinfo.version)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: apiinfo.version
+          params: {}
+          id: 1
+      register: server_version_lookup
+      delegate_to: localhost
+      check_mode: false
+      failed_when: server_version_lookup.json.error is defined
+
+    - name: Set the server version fact
+      ansible.builtin.set_fact:
+        zabbix_server_version: "{{ server_version_lookup.json.result }}"
+
+    - name: Read this host's installed and candidate zabbix-agent2 versions
+      ansible.builtin.command: apt-cache policy zabbix-agent2
+      register: pkg_policy
+      changed_when: false
+      check_mode: false
+      failed_when: pkg_policy.rc != 0 or 'Unable to locate package' in pkg_policy.stdout
+
+    - name: Extract the plain X.Y.Z version numbers
+      ansible.builtin.set_fact:
+        installed_version: >-
+          {{ (pkg_policy.stdout_lines | select('match', '^\s*Installed:') | list | first
+              | regex_search('\d+\.\d+\.\d+')) | default('', true) }}
+        candidate_version: >-
+          {{ (pkg_policy.stdout_lines | select('match', '^\s*Candidate:') | list | first
+              | regex_search('\d+\.\d+\.\d+')) | default('', true) }}
+
+    - name: Skip hosts with no candidate (package not found, or held with no policy block)
+      ansible.builtin.meta: end_host
+      when: installed_version == '' or candidate_version == ''
+
+    - name: Safety check - refuse to silently manage a host already running an agent newer than the server
+      ansible.builtin.assert:
+        that:
+          - not (installed_version is version(zabbix_server_version, '>'))
+        fail_msg: >-
+          {{ inventory_hostname }} already has zabbix-agent2 {{ installed_version }}
+          installed, which is NEWER than the server's {{ zabbix_server_version }}.
+          This should not happen per Zabbix's own compatibility policy - investigate
+          before this play touches anything here; do not let it silently downgrade.
+        success_msg: "{{ inventory_hostname }}: installed {{ installed_version }} is not ahead of the server."
+
+    - name: Report hosts with nothing at risk (candidate can't exceed the server anyway)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: candidate {{ candidate_version }} does not exceed
+          server {{ zabbix_server_version }} - no hold needed, OS repo upgrades stay
+          automatic.
+      when: not (candidate_version is version(zabbix_server_version, '>'))
+
+    - name: Ensure zabbix-agent2 is held where its candidate would exceed the server
+      ansible.builtin.dpkg_selections:
+        name: zabbix-agent2
+        selection: hold
+      when: candidate_version is version(zabbix_server_version, '>')
+
+    - name: Report held hosts
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: held at {{ installed_version }} - candidate
+          {{ candidate_version }} is newer than the server ({{ zabbix_server_version }})
+          and would break agent-server compatibility per Zabbix's own policy.
+          Re-run this play after intentionally upgrading the server to release the hold.
+      when: candidate_version is version(zabbix_server_version, '>')
