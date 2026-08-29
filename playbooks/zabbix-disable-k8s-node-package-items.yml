@@ -1,0 +1,162 @@
+---
+# Disable system.sw.packages.get on the three Kubernetes nodes.
+#
+# WHY IT CANNOT WORK THERE: k8s-master, k8s-worker and k8s-worker-2 have no host
+# Zabbix agent at all - verified live, no zabbix* systemd unit and no
+# /usr/sbin/zabbix* binary on k8s-master. They are monitored by the
+# containerised zabbix-agent DaemonSet in cattle-monitoring-system (3 pods, one
+# per node, alongside zabbix-proxy). system.sw.packages.get shells out to the
+# host package manager, so inside that container it finds no package database
+# and returns:
+#
+#   Failed to read sw value: cannot obtain package information
+#
+# This is not a permissions problem and not a broken agent: dpkg-query exists
+# and runs fine as the zabbix user on the hosts themselves. The same templated
+# item (templateid 42195) collects normally on all eleven hosts that run a real
+# host agent - pve, pve-ai, pve-router, pbs, pdm, cockpit, openclaw, desktop,
+# vscode, zabbix. Only these three, plus omv for an unrelated reason, fail.
+#
+# WHY DISABLE RATHER THAN FIX: host package inventory is not a question a
+# containerised agent can answer. Making it work would mean mounting the host's
+# dpkg database, binary and libraries into the DaemonSet - a homelab-gitops
+# change that trades real complexity for an inventory nicety, on nodes whose
+# packages Ansible can enumerate directly whenever anyone actually needs them.
+# Stop asking the question instead.
+#
+# NOT A DELETE. Disabled is the terminal state, per the standing policy in the
+# vault TODO. item.update is permitted to this token; item.delete is not.
+#
+# NOT COVERED: omv.home.lan fails the same item with a DIFFERENT error -
+# "Unknown metric system.sw.packages.get" - because it runs zabbix_agent2
+# 6.0.14, which predates the key. That one is an agent upgrade
+# (upgrade-to-zabbix-agent2.yml), not a disable, and is deliberately left alone
+# here.
+#
+# SAFETY: only items that are simultaneously enabled, unsupported, and carrying
+# the container-specific error are touched, so if the DaemonSet ever gains a
+# host package database this play stops disabling it rather than fighting the
+# fix. Already-disabled items are left alone, making this idempotent.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-disable-k8s-node-package-items.yml --check --diff
+#   ansible-playbook playbooks/zabbix-disable-k8s-node-package-items.yml
+
+- name: Disable the unanswerable package inventory items on the k8s nodes
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    target_hosts:
+      - k8s-master.home.lan
+      - k8s-worker.home.lan
+      - k8s-worker-2.home.lan
+
+    target_key: "system.sw.packages.get"
+    expected_error: "cannot obtain package information"
+
+  tasks:
+    # Resolve hostids first. item.get has no "hosts" array parameter - passing
+    # one is silently IGNORED, not rejected, and the call then returns the item
+    # for every host on the server. The first version of this play did exactly
+    # that and would have disabled package inventory fleet-wide; the assert
+    # below caught it at 16 items instead of 3. Filter on hostids.
+    - name: Resolve the target hostids
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter: {host: "{{ target_hosts }}"}
+          id: 1
+      register: hosts_lookup
+      check_mode: false
+      failed_when: >-
+        hosts_lookup.json.error is defined
+        or (hosts_lookup.json.result | default([]) | length) != (target_hosts | length)
+
+    - name: Fetch the item on each node
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_", "status", "state", "error"]
+            hostids: "{{ hosts_lookup.json.result | map(attribute='hostid') | list }}"
+            filter: {key_: ["{{ target_key }}"]}
+            selectHosts: ["host"]
+          id: 1
+      register: items
+      check_mode: false
+      failed_when: items.json.error is defined
+
+    - name: Expect exactly one item per node
+      ansible.builtin.assert:
+        that:
+          - (items.json.result | length) == (target_hosts | length)
+        fail_msg: >-
+          Expected {{ target_hosts | length }} "{{ target_key }}" items, found
+          {{ items.json.result | length }}. Refusing rather than guessing.
+
+    - name: Classify them
+      ansible.builtin.set_fact:
+        to_disable: >-
+          {{ items.json.result
+             | selectattr('status', 'eq', '0')
+             | selectattr('state', 'eq', '1')
+             | selectattr('error', 'search', expected_error)
+             | list }}
+        already_off: "{{ items.json.result | selectattr('status', 'eq', '1') | list }}"
+        unexpected: >-
+          {{ items.json.result
+             | selectattr('status', 'eq', '0')
+             | rejectattr('error', 'search', expected_error)
+             | list }}
+
+    - name: Leave anything that no longer matches the container error
+      ansible.builtin.debug:
+        msg: >-
+          NOT TOUCHING {{ unexpected | map(attribute='itemid') | list }} - enabled
+          but not failing with "{{ expected_error }}". If the DaemonSet gained a
+          package database, this item is fixed and should stay enabled.
+      when: unexpected | length > 0
+
+    - name: Disable them
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.update
+          params: {itemid: "{{ item.itemid }}", status: 1}
+          id: 1
+      register: disable_result
+      loop: "{{ to_disable }}"
+      loop_control:
+        label: "{{ [item.hosts | first][0].host | default(item.itemid) }}"
+      failed_when: disable_result.json.error is defined
+      changed_when: disable_result.json.result is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ to_disable | length }} disabled this run,
+          {{ already_off | length }} already disabled,
+          {{ unexpected | length }} left alone.
+          omv.home.lan is deliberately untouched - different error, needs an
+          agent upgrade, not a disable.
