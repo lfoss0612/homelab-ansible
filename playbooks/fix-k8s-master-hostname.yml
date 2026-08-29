@@ -106,7 +106,7 @@
         host: 127.0.0.1
         delay: 10
         timeout: 300
-      when: hostname_set.changed
+      when: hostname_set.changed and not ansible_check_mode
 
     - name: Wait for the API server to report ready
       ansible.builtin.command: "{{ rke2_kubectl }} get --raw /readyz"
@@ -117,7 +117,7 @@
       retries: 30
       delay: 10
       changed_when: false
-      when: hostname_set.changed
+      when: hostname_set.changed and not ansible_check_mode
 
     - name: Read back the node's Hostname address
       ansible.builtin.command: >-
@@ -126,8 +126,9 @@
       environment:
         KUBECONFIG: "{{ rke2_kubeconfig }}"
       register: node_hostname_address
+      check_mode: false
       until: node_hostname_address.stdout | trim == target_hostname
-      retries: 12
+      retries: "{{ 1 if ansible_check_mode else 12 }}"
       delay: 10
       changed_when: false
       failed_when: false
@@ -141,4 +142,6 @@
           (want "{{ target_hostname }}").
           {{ 'Fixed - the two Zabbix kube.node.requests items should go supported on their next poll.'
              if observed == target_hostname
-             else 'Not yet aligned - re-check rke2.io/hostname on the node object before re-running.' }}
+             else ('Expected under --check - this is the current, unfixed value.'
+                   if ansible_check_mode
+                   else 'Not yet aligned - re-check rke2.io/hostname on the node object before re-running.') }}
