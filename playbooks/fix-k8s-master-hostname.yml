@@ -133,10 +133,12 @@
       failed_when: false
 
     - name: Report the outcome
+      vars:
+        observed: "{{ node_hostname_address.stdout | default('') | trim }}"
       ansible.builtin.debug:
         msg: >-
-          status.addresses[Hostname] is now "{{ node_hostname_address.stdout | trim }}"
+          status.addresses[Hostname] is "{{ observed | default('(not read - check mode)', true) }}"
           (want "{{ target_hostname }}").
           {{ 'Fixed - the two Zabbix kube.node.requests items should go supported on their next poll.'
-             if node_hostname_address.stdout | trim == target_hostname
-             else 'STILL WRONG - do not re-run blindly; re-check rke2.io/hostname on the node object.' }}
+             if observed == target_hostname
+             else 'Not yet aligned - re-check rke2.io/hostname on the node object before re-running.' }}
