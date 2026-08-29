@@ -35,9 +35,16 @@
 # without the pin, changing the hostname WOULD re-register the node under a new
 # name, orphaning the old one.
 #
-# Persistence across reboot: /etc/cloud/cloud.cfg.d/99-installer.cfg sets
-# preserve_hostname: true, which overrides the "false" in the base cloud.cfg
-# (cloud.cfg.d is merged last). cloud-init will not revert this.
+# Persistence across reboot: cloud-init is disabled on this host - the Ubuntu
+# live installer dropped /etc/cloud/cloud-init.disabled after first boot, and
+# "cloud-init status" reports "disabled" - so nothing reasserts a hostname at
+# boot. Note that the "preserve_hostname: true" visible in
+# /etc/cloud/cloud.cfg.d/99-installer.cfg does NOT do this: it sits inside the
+# userdata_raw string for the None datasource, not as a top-level key in the
+# merged config, so it would not override the "preserve_hostname: false" in the
+# base cloud.cfg if cloud-init were running. The guard below therefore tests
+# whether cloud-init is actually able to run, not merely whether that string
+# appears somewhere.
 #
 # DISRUPTION: restarting rke2-server briefly takes down the API server and
 # embedded etcd on the only control-plane node. Running workloads on the
@@ -73,14 +80,32 @@
           under a new name and orphan the existing node object. Refusing.
         success_msg: "node-name is pinned to {{ target_hostname }} - the node will not be renamed."
 
-    - name: Confirm cloud-init will not revert the hostname on reboot
+    - name: Determine whether cloud-init could rewrite the hostname at boot
       ansible.builtin.shell:
         cmd: |
-          set -o pipefail
-          test -d /etc/cloud || exit 0
-          grep -rh '^preserve_hostname:' /etc/cloud/cloud.cfg.d/ | tail -1 | grep -q true
+          command -v cloud-init >/dev/null 2>&1 || { echo not-installed; exit 0; }
+          [ -e /etc/cloud/cloud-init.disabled ] && { echo disabled-marker; exit 0; }
+          [ "$(cloud-init status 2>/dev/null | awk -F': ' '/^status:/{print $2}')" = disabled ] \
+            && { echo disabled-status; exit 0; }
+          grep -rhqE '^preserve_hostname:[[:space:]]*true' \
+            /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d/ 2>/dev/null \
+            && { echo preserve-hostname; exit 0; }
+          echo active-would-reset
         executable: /bin/bash
+      register: cloud_init_state
       changed_when: false
+      check_mode: false
+
+    - name: Refuse to run if cloud-init would undo the hostname on next boot
+      ansible.builtin.assert:
+        that:
+          - cloud_init_state.stdout | trim != 'active-would-reset'
+        fail_msg: >-
+          cloud-init is active here and no effective top-level
+          "preserve_hostname: true" was found, so it would reset /etc/hostname on
+          the next boot and silently undo this change. Refusing.
+        success_msg: >-
+          cloud-init cannot revert the hostname ({{ cloud_init_state.stdout | trim }}).
 
     - name: Set the OS hostname to the FQDN
       ansible.builtin.hostname:
