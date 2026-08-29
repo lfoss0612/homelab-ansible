@@ -1,0 +1,156 @@
+---
+# Apply pending OS package upgrades across the fleet.
+#
+# Usage:
+#   ansible-playbook playbooks/os-update.yml --check --diff
+#   ansible-playbook playbooks/os-update.yml
+#   ansible-playbook playbooks/os-update.yml -e os_update_hosts=pbs.home.lan
+#
+# This playbook NEVER reboots. Several hosts here run the VMs the rest of the
+# homelab depends on, so deciding when they go down is a human call. The final
+# play prints the hosts that need one; act on that list by hand.
+#
+# Default target excludes three hosts, each for a different reason:
+#
+#   * api_managed (opnsense) — no SSH/Python transport at all. Because it is
+#     `ansible_connection: local`, an apt task aimed at it does not fail, it
+#     SUCCEEDS against cockpit instead. Same trap CLAUDE.md documents for
+#     every `hosts: all` play.
+#   * pve-router — hosts the OPNsense VM the whole house network runs on, and
+#     is 3 point releases behind (13.3) with 226 pending. Too big a change to
+#     fold into a fleet run; it needs its own window.
+#   * k8s-worker-2 — a dist-upgrade there REMOVES the `cuda-drivers`
+#     metapackage: parts of the stack (libnvidia-cfg1, nvidia-persistenced,
+#     nvidia-settings) move to the 610 branch while nvidia-driver-580-open
+#     stays on 580. This is the same host whose nvidia-dkms build already
+#     wedged dpkg once — see playbooks/fix-k8s-worker-2-dpkg.yml. Resolve the
+#     driver-branch split first, then run this against it explicitly.
+#
+# Override with -e os_update_hosts=... to target any of them deliberately.
+
+- name: Apply pending OS upgrades
+  hosts: >-
+    {{ os_update_hosts | default(
+         'all:!api_managed:!pve-router.home.lan:!k8s-worker-2.home.lan') }}
+  become: true
+  # Batch rather than all-at-once so a bad upgrade can't take the whole fleet
+  # down before anyone notices. cockpit is deliberately NOT in this play.
+  serial: "{{ os_update_serial | default(4) }}"
+
+  tasks:
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+        # OMV is on bookworm and the others on trixie; a suite rename on any
+        # of them should surface as a failure here, not be auto-accepted.
+        cache_valid_time: 0
+
+    - name: Simulate the upgrade to see what it would do
+      ansible.builtin.command:
+        cmd: apt-get -s -o Debug::NoLocking=1 dist-upgrade
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: os_update_sim
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to upgrade when packages would be removed
+      ansible.builtin.assert:
+        that: os_update_sim.stdout_lines | select('match', '^Remv ') | list | length == 0
+        fail_msg: >-
+          dist-upgrade on {{ inventory_hostname }} would REMOVE:
+          {{ os_update_sim.stdout_lines | select('match', '^Remv ')
+             | map('regex_replace', '^Remv (\S+).*', '\1') | join(', ') }}.
+          Refusing. A removal during a routine patch run means a dependency
+          split upstream — investigate before forcing it.
+
+    - name: Record the pending upgrade list
+      ansible.builtin.set_fact:
+        os_update_pending: >-
+          {{ os_update_sim.stdout_lines | select('match', '^Inst ')
+             | map('regex_replace', '^Inst (\S+).*', '\1') | list }}
+
+    - name: Apply the upgrades
+      ansible.builtin.apt:
+        upgrade: dist
+        # Proxmox needs dist over safe: its kernel metapackages pull in a new
+        # proxmox-kernel-* on every ABI bump, which `apt upgrade` will not do.
+        autoremove: false
+        # Keep existing config files on conflict rather than prompting. Without
+        # this a changed conffile hangs the run waiting on stdin that is not there.
+        dpkg_options: force-confdef,force-confold
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: os_update_result
+
+    - name: Check whether a reboot is needed
+      # Debian/Ubuntu drop this file; Proxmox kernels do not, so also compare the
+      # running kernel against the newest one installed under /boot.
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          newest=$(ls -1 /boot/vmlinuz-* 2>/dev/null \
+            | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+          if [ -f /var/run/reboot-required ]; then
+            echo "YES flag-file (running $(uname -r))"
+          elif [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ]; then
+            echo "YES running $(uname -r), newest installed $newest"
+          else
+            echo "no"
+          fi
+        executable: /bin/bash
+      register: os_update_reboot
+      changed_when: false
+      check_mode: false
+
+    - name: Report per-host outcome
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ os_update_pending | length }} package(s) upgraded;
+          reboot {{ os_update_reboot.stdout | trim }}
+
+# cockpit is the Ansible control node — it is running this playbook against
+# itself over SSH. Kept in its own trailing play so that if an upgrade here
+# does disturb sshd or systemd, it happens after every other host is already
+# done rather than aborting the run mid-fleet.
+- name: Apply pending OS upgrades on the control node
+  hosts: >-
+    {{ os_update_control_hosts | default('cockpit.home.lan') }}
+  become: true
+
+  tasks:
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Apply the upgrades
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: false
+        dpkg_options: force-confdef,force-confold
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Check whether a reboot is needed
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          newest=$(ls -1 /boot/vmlinuz-* 2>/dev/null \
+            | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+          if [ -f /var/run/reboot-required ]; then
+            echo "YES flag-file (running $(uname -r))"
+          elif [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ]; then
+            echo "YES running $(uname -r), newest installed $newest"
+          else
+            echo "no"
+          fi
+        executable: /bin/bash
+      register: os_update_reboot_control
+      changed_when: false
+      check_mode: false
+
+    - name: Report per-host outcome
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: reboot {{ os_update_reboot_control.stdout | trim }}"
