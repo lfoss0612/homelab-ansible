@@ -18,8 +18,10 @@
 #      cannot build ANY driver for the running kernel, so nothing rebuilt at
 #      boot regardless of driver version.
 #   2. The installed driver was 580.105.08, which predates kernel 7.0 support.
-#      That is the same version whose build failure against 7.0.0-28 is
-#      documented in playbooks/fix-k8s-worker-2-dpkg.yml.
+#      Its build against 7.0.0-30 fails on removed/changed kernel APIs --
+#      `in_irq` implicit declaration, `vm_flags` now read-only, `vm_fault_t`
+#      type conflict. Same class of failure as the 7.0.0-28 breakage in
+#      playbooks/fix-k8s-worker-2-dpkg.yml.
 #
 # The 580 BRANCH does support this kernel -- Ubuntu ships a prebuilt
 # linux-modules-nvidia-580-open-7.0.0-30-generic. That prebuilt package cannot
@@ -28,15 +30,25 @@
 # NVIDIA CUDA repo at priority 600 over the archive's 500 and therefore runs
 # the -1ubuntu1 line. The two version schemes cannot satisfy each other.
 #
-# So: install the headers and move the 580 stack to 580.178.04 from the CUDA
-# repo, letting dkms build. Scoped deliberately to the 580 packages -- a full
+# So: move the 580 stack to 580.178.04 from the CUDA repo, then install the
+# headers so dkms builds. Scoped deliberately to the 580 packages -- a full
 # dist-upgrade here also drags in 610-branch libraries and REMOVES the
 # cuda-drivers metapackage, which is why playbooks/os-update.yml excludes this
-# host by default.
+# host by default. (The 610 branch is not an option regardless: apt cannot
+# resolve it here at all -- "pkgProblemResolver::Resolve generated breaks".)
+#
+# ORDER MATTERS, and the intuitive order is the wrong one. An earlier version
+# of this playbook installed the headers first, reasoning that dkms builds
+# during the DRIVER's postinst. It also builds during the HEADERS' postinst,
+# via /etc/kernel/header_postinst.d/dkms, using whatever driver is installed
+# at that moment. Installing headers first therefore forced a build with the
+# stale 580.105.08, which failed, which made the headers' postinst exit 1 and
+# left linux-headers-7.0.0-30-generic half-configured with dpkg wedged.
+# Upgrade the driver FIRST, then add the headers.
 #
 # This playbook does NOT reboot. If the dkms build fails it stops loudly so
-# the fallback stays open: boot 6.17.0-40-generic, which still has a working
-# nvidia/580.105.08 build.
+# the fallback stays open: boot 6.17.0-40-generic. linux-headers for that
+# kernel are installed, so the driver upgrade rebuilds its module too.
 
 - name: Restore the NVIDIA driver on k8s-worker-2
   hosts: "{{ nvidia_fix_hosts | default('k8s-worker-2.home.lan') }}"
@@ -58,13 +70,14 @@
       ansible.builtin.command:
         cmd: >-
           apt-get -s -o Debug::NoLocking=1 install
-          linux-headers-{{ nvidia_fix_kernel.stdout | trim }}
           nvidia-dkms-580-open
+          linux-headers-{{ nvidia_fix_kernel.stdout | trim }}
       environment:
         DEBIAN_FRONTEND: noninteractive
       register: nvidia_fix_sim
       changed_when: false
       check_mode: false
+      failed_when: false
 
     - name: Refuse to proceed if anything would be removed
       # cuda-drivers disappearing is the signature of the 580/610 branch split
@@ -77,22 +90,54 @@
              | map('regex_replace', '^Remv (\S+).*', '\1') | join(', ') }}.
           Refusing -- this should install cleanly with zero removals.
 
-    - name: Install kernel headers for the running kernel
-      # Must precede the driver: dkms builds during the driver's postinst, and
-      # with no headers present that build is skipped rather than failed.
+    - name: Check whether the headers package is wedged half-configured
+      ansible.builtin.command:
+        cmd: dpkg-query -W -f=${Status} linux-headers-{{ nvidia_fix_kernel.stdout | trim }}
+      register: nvidia_fix_hdr_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Clear a half-configured headers package before touching the driver
+      # Left behind by the wrong-order failure described in the header. While
+      # it sits half-configured, any apt transaction first retries its
+      # postinst -- rebuilding with the stale driver and failing again, so
+      # the driver upgrade that would FIX the build can never run. Removing
+      # it breaks that deadlock; it gets reinstalled below, after the upgrade.
       ansible.builtin.apt:
         name: "linux-headers-{{ nvidia_fix_kernel.stdout | trim }}"
-        state: present
+        state: absent
+        autoremove: false
       environment:
         DEBIAN_FRONTEND: noninteractive
+      when: "'half-configured' in nvidia_fix_hdr_status.stdout"
 
     - name: Upgrade the NVIDIA 580 stack so dkms can build against kernel 7.0
+      # 580.105.08 -> 580.178.04. With no headers present for the running
+      # kernel this skips that build rather than failing on it, and rebuilds
+      # the modules for 6.17.0-40-generic and 6.8.0-138-generic, whose headers
+      # ARE installed -- which is what keeps the fallback kernel usable.
       ansible.builtin.apt:
         name: nvidia-dkms-580-open
         state: latest
       environment:
         DEBIAN_FRONTEND: noninteractive
       register: nvidia_fix_install
+
+    - name: Install kernel headers for the running kernel
+      # Now safe: the headers' postinst dkms hook builds against 580.178.04.
+      ansible.builtin.apt:
+        name: "linux-headers-{{ nvidia_fix_kernel.stdout | trim }}"
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Verify dpkg is clean
+      ansible.builtin.command: dpkg --audit
+      register: nvidia_fix_audit
+      changed_when: false
+      check_mode: false
+      failed_when: nvidia_fix_audit.stdout | trim != ''
 
     - name: Read dkms state
       ansible.builtin.command: dkms status
@@ -119,7 +164,7 @@
           No dkms build for {{ nvidia_fix_kernel.stdout | trim }} after the
           upgrade. dkms status: {{ nvidia_fix_dkms.stdout | trim }}.
           Do NOT reboot chasing this -- fall back to booting
-          6.17.0-40-generic, which still has a working 580.105.08 build.
+          6.17.0-40-generic, whose module the upgrade above rebuilt.
         success_msg: "dkms built for {{ nvidia_fix_kernel.stdout | trim }}"
 
     - name: Load the nvidia module
