@@ -1,0 +1,237 @@
+---
+# Build the "Zabbix Agent Versions" dashboard - a fleet-wide table of the
+# Zabbix agent version each monitored host is actually running, to catch
+# version drift the same way the OpenClaw fleet dashboard catches version
+# drift for openclaw itself (see zabbix-fleet-dashboard.yml).
+#
+# NOTHING NEW TO COLLECT: every host running a Zabbix agent already reports
+# "Version of Zabbix agent running" (key agent.version) - it ships with the
+# stock "Zabbix agent"/"Zabbix agent active" templates and every one of the
+# 15 monitored hosts already has it. This play only builds the dashboard;
+# it creates no items.
+#
+# DRIFT FOUND LIVE 2026-08-29, before this dashboard existed: 5 distinct
+# versions across 15 hosts - 7.0.22 x8, 7.4.1 x3 (the three k8s nodes),
+# 7.4.13 x2 (zabbix.home.lan itself and vscode.home.lan), 7.0.9 x1 (omv),
+# 7.4.12 x1 (opnsense). Nobody had looked at this cross-host before.
+#
+# HOST GROUP SCOPING: no single existing group covers all 15. "Linux
+# servers" covers 14 - every host except opnsense.home.lan, which is
+# FreeBSD-based and sits in "Firewalls" instead. The tophosts widget takes
+# multiple groupids (OR'd), so both are listed rather than inventing a new
+# "has a Zabbix agent" group for one extra host.
+#
+# NO COLOR THRESHOLDS ON THE VERSION COLUMN: unlike the OpenClaw dashboard's
+# numeric "Last result" column, tophosts thresholds only work on numeric
+# item values. agent.version is a text string ("7.4.13"), so this follows
+# the same precedent already set by that dashboard's own "Installed version"
+# column, which is plain text too - with only 15 rows, an outlier version is
+# easy to eyeball without color-coding, and no useful "correct" version to
+# threshold against was invented.
+#
+# WHY A "Zabbix server" REFERENCE TILE: same reasoning as the OpenClaw
+# dashboard's "Gateway version" tile - one host's version is the one to
+# compare everything else against at a glance, rather than scanning a
+# 15-row table for it. Here that's zabbix.home.lan itself, since it is the
+# one agent version most likely to get bumped first and the one every other
+# agent's protocol compatibility is implicitly judged against.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-agent-version-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-agent-version-dashboard.yml
+
+- name: Build the Zabbix agent version drift dashboard
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "Zabbix Agent Versions"
+    version_item_name: "Version of Zabbix agent running"
+    reference_host: "zabbix.home.lan"
+
+    # Together these cover all 15 hosts that report agent.version.
+    linux_group_name: "Linux servers"
+    firewall_group_name: "Firewalls"
+
+  tasks:
+    - name: Resolve the Linux servers host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ linux_group_name }}"]
+          id: 1
+      register: linux_group_lookup
+      check_mode: false
+      failed_when: >-
+        linux_group_lookup.json.error is defined
+        or (linux_group_lookup.json.result | default([]) | length) != 1
+
+    - name: Resolve the Firewalls host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ firewall_group_name }}"]
+          id: 1
+      register: firewall_group_lookup
+      check_mode: false
+      failed_when: >-
+        firewall_group_lookup.json.error is defined
+        or (firewall_group_lookup.json.result | default([]) | length) != 1
+
+    - name: Resolve the reference host's version item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "name"]
+            host: "{{ reference_host }}"
+            filter:
+              key_: ["agent.version"]
+          id: 1
+      register: ref_item
+      check_mode: false
+      failed_when: >-
+        ref_item.json.error is defined
+        or (ref_item.json.result | default([]) | length) != 1
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Agent versions"
+            widgets:
+              - type: item
+                name: "Zabbix server's own agent version"
+                x: 0
+                y: 0
+                width: 20
+                height: 4
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ref_item.json.result[0].itemid }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "{{ reference_host }}"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+
+              - type: tophosts
+                name: "Agent version by host"
+                x: 20
+                y: 0
+                width: 52
+                height: 17
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ linux_group_lookup.json.result[0].groupid }}"}
+                  - {type: 2, name: "groupids.1", value: "{{ firewall_group_lookup.json.result[0].groupid }}"}
+                  - {type: 1, name: "columns.0.name", value: "Host"}
+                  - {type: 0, name: "columns.0.data", value: "2"}
+                  - {type: 1, name: "columns.1.name", value: "Agent version"}
+                  - {type: 0, name: "columns.1.data", value: "1"}
+                  - {type: 1, name: "columns.1.item", value: "{{ version_item_name }}"}
+                  - {type: 0, name: "column", value: "1"}
+                  # Default host limit is 10, which would silently truncate
+                  # this 15-host fleet - see zabbix-fleet-dashboard.yml's
+                  # identical note.
+                  - {type: 0, name: "count", value: "50"}
+                  - {type: 1, name: "reference", value: "AVERT"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            # dashboard.create defaults to private:1 with zero shares -
+            # every dashboard built by this fleet of playbooks hit this once
+            # already (see TODO.md's "invisible to the user" writeup on
+            # dashboards 402/403/404), which made the dashboard invisible to
+            # everyone but the automation token. Explicit here so a
+            # from-scratch run doesn't repeat it.
+            private: 0
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}

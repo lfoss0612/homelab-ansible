@@ -840,6 +840,11 @@
             name: "{{ dashboard_name }}"
             display_period: 30
             auto_start: 1
+            # dashboard.create defaults to private:1 with zero shares, which
+            # made this dashboard invisible to everyone but the automation
+            # token until fixed live 2026-08-29 (see TODO.md) - explicit here
+            # so a from-scratch run doesn't regress it.
+            private: 0
             pages: "{{ dashboard_pages }}"
           id: 1
       register: dash_create
