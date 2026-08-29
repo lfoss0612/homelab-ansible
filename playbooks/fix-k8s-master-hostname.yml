@@ -132,7 +132,7 @@
         KUBECONFIG: "{{ rke2_kubeconfig }}"
       register: node_hostname_address
       check_mode: false
-      until: node_hostname_address.stdout | trim == target_hostname
+      until: ansible_check_mode or (node_hostname_address.stdout | trim == target_hostname)
       retries: "{{ 1 if ansible_check_mode else 12 }}"
       delay: 10
       changed_when: false
