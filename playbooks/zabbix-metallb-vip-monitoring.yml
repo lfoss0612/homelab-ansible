@@ -1,0 +1,286 @@
+---
+# Real reachability alerting for the MetalLB LoadBalancer VIPs.
+#
+# WHY NOT A DISCOVERY ACTION, which is what the vault TODO proposed:
+#
+#  1. Discovery events can never become Problems. The API says so directly -
+#     problem.get rejects source 1 with 'value must be one of 0, 3, 4' (trigger,
+#     internal, service). A discovery action can at best send a notification;
+#     it cannot produce a Problem, a severity, or an acknowledgement.
+#  2. The discovery pipeline here creates hosts that monitor nothing. The 96
+#     hosts "Auto-add Lan Devices" has made on 10.0.2.x carry zero templates and
+#     zero items - its Generic by SNMP link fails, which zabbix_server.log is
+#     full of. Pointing that action at the MetalLB rule would have produced 12
+#     more empty shells.
+#  3. action.create is refused to the automation token anyway (host.create,
+#     item.create and trigger.create are all permitted), so that route could not
+#     be a playbook at all.
+#
+# Also, drule 7 polls hourly, so discovery-based detection is up to an hour
+# late. These items run at 60s.
+#
+# !! NOTHING HERE CAN BE DELETED BY AUTOMATION !!  host.delete, item.delete and
+# trigger.delete are ALL refused to this token (probed live). A wrong-but-valid
+# object created by this play can only be removed through the UI. Hence
+# vip_limit below: create one VIP first, confirm it collects and the trigger
+# reads correctly, then run for the rest.
+#
+#   ansible-playbook playbooks/zabbix-metallb-vip-monitoring.yml \
+#     -e '{"vip_limit": ["10.2.6.1"]}'      # canary
+#   ansible-playbook playbooks/zabbix-metallb-vip-monitoring.yml
+#
+# THE LIST IS HARDCODED ON PURPOSE, so what is monitored is reviewable in git
+# rather than silently following the cluster. A drift check delegated to
+# k8s-master compares it against the live LoadBalancer services and FAILS on a
+# mismatch - that failure is the signal to update this file, not a bug.
+#
+# 10.2.6.0 IS DELIBERATELY EXCLUDED. It is the network address of the /24 and
+# does not answer ICMP - verified from the Zabbix server with both ping and
+# fping, which is exactly why 12 VIPs have always discovered as 11. It is
+# currently assigned to comfyui/comfyui, which is worth looking at on its own
+# merits: many clients refuse to talk to a .0 host address. Monitoring it by
+# ICMP is not possible, so it is listed here as excluded rather than silently
+# missing.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-metallb-vip-monitoring.yml --check --diff
+
+- name: Monitor the MetalLB LoadBalancer VIPs by ICMP
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    vip_host: "metallb-vips"
+    vip_host_name: "MetalLB VIPs"
+    vip_group_id: "19"          # Applications - where the k8s component hosts live
+    k8s_control_node: "k8s-master.home.lan"
+
+    # Restrict a run to these IPs. Empty means all. Exists because nothing here
+    # can be deleted once created - see the header.
+    vip_limit: []
+
+    # Cannot be ICMP-monitored; see header.
+    vip_excluded:
+      - {ip: "10.2.6.0", svc: "comfyui/comfyui"}
+
+    metallb_vips:
+      - {ip: "10.2.6.1",   svc: "litellm/litellm"}
+      - {ip: "10.2.6.2",   svc: "open-webui/open-webui"}
+      - {ip: "10.2.6.3",   svc: "yugabytedb/pgadmin-pgadmin4"}
+      - {ip: "10.2.6.4",   svc: "yugabytedb/yb-master-ui"}
+      - {ip: "10.2.6.5",   svc: "yugabytedb/yugabyted-ui-service"}
+      - {ip: "10.2.6.6",   svc: "yugabytedb/yb-tserver-service"}
+      - {ip: "10.2.6.10",  svc: "cattle-monitoring-system/rancher-monitoring-grafana"}
+      - {ip: "10.2.6.100", svc: "postgrest/postgrest"}
+      - {ip: "10.2.6.102", svc: "argocd/argocd-server"}
+      - {ip: "10.2.6.103", svc: "open-webui/ollama"}
+      - {ip: "10.2.6.105", svc: "langflow/langflow-service"}
+
+  tasks:
+    # ------------------------------------------------------------ drift check
+    - name: Read the live LoadBalancer VIPs from the cluster
+      ansible.builtin.shell:
+        cmd: >-
+          /var/lib/rancher/rke2/bin/kubectl get svc -A
+          -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.status.loadBalancer.ingress[0].ip}{" "}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}'
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      delegate_to: "{{ k8s_control_node }}"
+      become: true
+      register: live_vips
+      changed_when: false
+      check_mode: false
+
+    - name: Compare the hardcoded list against the cluster
+      vars:
+        live: "{{ live_vips.stdout_lines | map('trim') | reject('eq', '') | sort | list }}"
+        declared: >-
+          {{ (metallb_vips + vip_excluded)
+             | map(attribute='ip') | zip((metallb_vips + vip_excluded) | map(attribute='svc'))
+             | map('join', ' ') | sort | list }}
+      ansible.builtin.assert:
+        that:
+          - live == declared
+        fail_msg: |-
+          The MetalLB VIPs in this playbook no longer match the cluster.
+          Update metallb_vips (or vip_excluded) and re-run - do not bypass this.
+            only in cluster: {{ live | difference(declared) }}
+            only in file:    {{ declared | difference(live) }}
+        success_msg: >-
+          {{ declared | length }} VIPs declared and all match the live cluster
+          ({{ metallb_vips | length }} monitored, {{ vip_excluded | length }} excluded).
+
+    - name: Select the VIPs in scope for this run
+      ansible.builtin.set_fact:
+        vips_in_scope: >-
+          {{ metallb_vips if (vip_limit | length) == 0
+             else (metallb_vips | selectattr('ip', 'in', vip_limit) | list) }}
+
+    - name: Refuse an empty run
+      ansible.builtin.assert:
+        that:
+          - (vips_in_scope | length) > 0
+        fail_msg: "vip_limit {{ vip_limit }} matched none of the declared VIPs."
+
+    # ------------------------------------------------------------------- host
+    - name: Look for the VIP host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter: {host: ["{{ vip_host }}"]}
+            selectItems: ["itemid", "key_"]
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: host_lookup.json.error is defined
+
+    - name: Create the VIP host when missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.create
+          params:
+            host: "{{ vip_host }}"
+            name: "{{ vip_host_name }}"
+            groups: [{groupid: "{{ vip_group_id }}"}]
+            description: >-
+              MetalLB LoadBalancer VIP reachability. Declared by
+              playbooks/zabbix-metallb-vip-monitoring.yml in homelab-ansible -
+              do not add items here by hand. Deliberately not created by
+              discovery: discovery events cannot become Problems.
+          id: 1
+      register: host_create
+      when: (host_lookup.json.result | length) == 0
+      failed_when: host_create.json.error is defined
+      changed_when: host_create.json.result is defined
+
+    - name: Re-resolve the host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter: {host: ["{{ vip_host }}"]}
+            selectItems: ["itemid", "key_"]
+          id: 1
+      register: host_final
+      check_mode: false
+      failed_when: host_final.json.error is defined
+
+    - name: Note the existing item keys
+      ansible.builtin.set_fact:
+        existing_keys: >-
+          {{ (host_final.json.result | first).items | default([]) | map(attribute='key_') | list
+             if (host_final.json.result | length) > 0 else [] }}
+        vip_hostid: >-
+          {{ (host_final.json.result | first).hostid
+             if (host_final.json.result | length) > 0 else '' }}
+
+    # ------------------------------------------------------------------ items
+    - name: Create the ICMP items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ vip_hostid }}"
+            name: "{{ item.svc }} ({{ item.ip }}): ICMP ping"
+            key_: "icmpping[{{ item.ip }}]"
+            type: 3
+            value_type: 3
+            delay: "60s"
+            history: "7d"
+            trends: "90d"
+            description: "Reachability of the MetalLB VIP for {{ item.svc }}."
+            tags:
+              - {tag: "component", value: "metallb"}
+              - {tag: "service", value: "{{ item.svc }}"}
+          id: 1
+      register: item_create
+      loop: "{{ vips_in_scope }}"
+      loop_control:
+        label: "icmpping[{{ item.ip }}] - {{ item.svc }}"
+      when: ("icmpping[" ~ item.ip ~ "]") not in existing_keys
+      failed_when: item_create.json.error is defined
+      changed_when: item_create.json.result is defined
+
+    # --------------------------------------------------------------- triggers
+    - name: List existing triggers on the VIP host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description"]
+            host: "{{ vip_host }}"
+          id: 1
+      register: trig_existing
+      check_mode: false
+      failed_when: trig_existing.json.error is defined
+
+    - name: Create the unreachability triggers
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "{{ item.svc }} ({{ item.ip }}): VIP unreachable by ICMP"
+            expression: "max(/{{ vip_host }}/icmpping[{{ item.ip }}],#3)=0"
+            priority: 3
+            manual_close: 0
+            tags:
+              - {tag: "component", value: "metallb"}
+              - {tag: "service", value: "{{ item.svc }}"}
+          id: 1
+      register: trig_create
+      loop: "{{ vips_in_scope }}"
+      loop_control:
+        label: "{{ item.svc }} ({{ item.ip }})"
+      when: >-
+        (trig_existing.json.result
+         | selectattr('description', 'eq', item.svc ~ ' (' ~ item.ip ~ '): VIP unreachable by ICMP')
+         | list | length) == 0
+      failed_when: trig_create.json.error is defined
+      changed_when: trig_create.json.result is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          host {{ 'CREATED' if (host_lookup.json.result | length) == 0 else 'present' }};
+          in scope this run: {{ vips_in_scope | map(attribute='ip') | list }};
+          items created {{ item_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }},
+          triggers created {{ trig_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}.
+          Excluded from monitoring entirely: {{ vip_excluded | map(attribute='ip') | list }}.
