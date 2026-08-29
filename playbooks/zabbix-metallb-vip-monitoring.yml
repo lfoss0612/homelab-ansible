@@ -190,8 +190,11 @@
 
     - name: Note the existing item keys
       ansible.builtin.set_fact:
+        # ['items'], NOT .items - dotted access resolves to the dict's built-in
+        # items() method, and map() then fails with "'method' object is not
+        # iterable". Zabbix's selectItems result key is genuinely named "items".
         existing_keys: >-
-          {{ (host_final.json.result | first).items | default([]) | map(attribute='key_') | list
+          {{ (host_final.json.result | first)['items'] | default([]) | map(attribute='key_') | list
              if (host_final.json.result | length) > 0 else [] }}
         vip_hostid: >-
           {{ (host_final.json.result | first).hostid
