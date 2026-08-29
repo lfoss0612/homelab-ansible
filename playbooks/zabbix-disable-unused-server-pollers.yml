@@ -1,0 +1,159 @@
+---
+# Disable the 11 permanently-unsupported Zabbix server internal items.
+#
+# zabbix.home.lan carries 11 items from the "Zabbix server health" template that
+# report on optional server subsystems this deployment does not run. Each has
+# sat at state 1 (unsupported) with a structural error, not a transient one:
+#
+#   No "ipmi manager" / "ipmi poller" processes started.
+#   No "java poller" processes started.
+#   No "snmp trapper" processes started.
+#   No "vmware collector" processes started.   (2 items)
+#   No "report manager" / "report writer" processes started.
+#   No "connector manager" / "connector worker" processes started.
+#   connector is not initialized: please check "StartConnectors" ...
+#
+# VERIFIED BEFORE WRITING THIS, not assumed from the error text: every relevant
+# setting in /etc/zabbix/zabbix_server.conf is commented out and therefore at
+# its default of 0 - StartIPMIPollers, StartJavaPollers, StartSNMPTrapper,
+# StartVMwareCollectors, StartReportWriters, StartConnectors - and a live ps
+# across those process names counts zero. These items cannot collect anything
+# in the current configuration.
+#
+# WHY BOTHER: they are 11 of the 28 items that are unsupported AND enabled,
+# which is the metric worth alerting on (see the vault TODO - the raw
+# {state: 1} count is dominated by auto-disabled LLD leftovers and is useless).
+# Clearing structural noise out of that number is what makes the remainder
+# meaningful.
+#
+# NOT A DELETE. Disabled is the terminal state for anything found dead here, per
+# the standing policy in the vault TODO. Nothing is removed; every item is one
+# click from coming back.
+#
+# IF YOU LATER ENABLE ONE OF THOSE SUBSYSTEMS - StartVMwareCollectors, say -
+# the matching item does NOT resume on its own. Re-enable it by hand, or drop
+# its key from disable_keys below and re-run, which will leave it alone.
+#
+# SAFETY: only items that are BOTH currently unsupported AND carrying one of the
+# expected structural errors are touched. An item that has started working is
+# skipped, so a re-run after enabling a subsystem cannot switch off live
+# monitoring. Items already disabled are left alone, making this idempotent.
+#
+# These are template-inherited items disabled at host level, which is where the
+# override belongs; a future re-link of "Zabbix server health" could in
+# principle reassert the template's status, in which case re-run this play.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-disable-unused-server-pollers.yml --check --diff
+#   ansible-playbook playbooks/zabbix-disable-unused-server-pollers.yml
+
+- name: Disable the unused Zabbix server poller items
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    zabbix_host: "zabbix.home.lan"
+
+    disable_keys:
+      - "zabbix[connector_queue]"
+      - "zabbix[process,connector manager,avg,busy]"
+      - "zabbix[process,connector worker,avg,busy]"
+      - "zabbix[process,ipmi manager,avg,busy]"
+      - "zabbix[process,ipmi poller,avg,busy]"
+      - "zabbix[process,java poller,avg,busy]"
+      - "zabbix[process,report manager,avg,busy]"
+      - "zabbix[process,report writer,avg,busy]"
+      - "zabbix[process,snmp trapper,avg,busy]"
+      - "zabbix[process,vmware collector,avg,busy]"
+      - "zabbix[vmware,buffer,pused]"
+
+    # An item is only disabled if its error matches one of these. Anything else
+    # means the situation changed and a human should look.
+    expected_error_patterns:
+      - "processes started"
+      - "connector is not initialized"
+
+  tasks:
+    - name: Fetch the candidate items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_", "name", "status", "state", "error"]
+            host: "{{ zabbix_host }}"
+            filter: {key_: "{{ disable_keys }}"}
+          id: 1
+      register: items
+      check_mode: false
+      failed_when: items.json.error is defined
+
+    - name: Every key must resolve to exactly one item
+      ansible.builtin.assert:
+        that:
+          - (items.json.result | length) == (disable_keys | length)
+        fail_msg: >-
+          Expected {{ disable_keys | length }} items on {{ zabbix_host }}, found
+          {{ items.json.result | length }}. Keys present:
+          {{ items.json.result | map(attribute='key_') | list }}.
+          Refusing rather than guessing which ones moved.
+
+    - name: Select the ones that are enabled, unsupported, and structurally dead
+      ansible.builtin.set_fact:
+        to_disable: >-
+          {{ items.json.result
+             | selectattr('status', 'eq', '0')
+             | selectattr('state', 'eq', '1')
+             | selectattr('error', 'search', expected_error_patterns | join('|'))
+             | list }}
+        already_off: >-
+          {{ items.json.result | selectattr('status', 'eq', '1') | list }}
+        unexpected: >-
+          {{ items.json.result
+             | selectattr('status', 'eq', '0')
+             | rejectattr('error', 'search', expected_error_patterns | join('|'))
+             | list }}
+
+    - name: Warn about anything enabled that does not match the expected errors
+      ansible.builtin.debug:
+        msg: >-
+          NOT TOUCHING {{ unexpected | map(attribute='key_') | list }} - these are
+          enabled but their state/error does not match a dead subsystem. Look
+          before acting.
+      when: unexpected | length > 0
+
+    - name: Disable them
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.update
+          params:
+            itemid: "{{ item.itemid }}"
+            status: 1
+          id: 1
+      register: disable_result
+      loop: "{{ to_disable }}"
+      loop_control:
+        label: "{{ item.key_ }}"
+      failed_when: disable_result.json.error is defined
+      changed_when: disable_result.json.result is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ to_disable | length }} disabled this run,
+          {{ already_off | length }} already disabled,
+          {{ unexpected | length }} left alone as unexpected.
+          Disabled: {{ to_disable | map(attribute='key_') | list }}
