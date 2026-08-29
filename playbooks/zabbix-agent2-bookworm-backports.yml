@@ -1,0 +1,112 @@
+---
+# Bring Debian 12 hosts' zabbix-agent2 up to the 7.0 line from backports.
+#
+# WHY: system.sw.packages.get is unsupported on omv.home.lan with "Unknown
+# metric system.sw.packages.get" - the key does not exist in the agent it runs.
+# omv is the only Debian 12 (bookworm) host left in the fleet; everything else
+# is on Debian 13 (trixie), whose own repo ships zabbix-agent2 7.0.22, where the
+# same templated item collects fine. So this is purely a version gap:
+#
+#   omv      Debian 12 bookworm   zabbix_agent2 6.0.14   item unsupported
+#   pve      Debian 13 trixie     zabbix_agent2 7.0.22   item OK
+#   pbs      Debian 13 trixie     zabbix_agent2 7.0.22   item OK
+#   cockpit  Debian 13 trixie     zabbix_agent2 7.0.22   item OK
+#
+# WHY BACKPORTS AND NOT repo.zabbix.com: bookworm-backports already carries
+# 1:7.0.9+dfsg-1~bpo12+1 and is ALREADY ENABLED on omv - it shows in
+# `apt-cache policy zabbix-agent2` at priority 100. Adding a third-party apt
+# source to a NAS appliance to get a package Debian already offers would be a
+# larger and less reversible change for no benefit. Note this differs from
+# upgrade-to-zabbix-agent2.yml, which adds repo.zabbix.com on Ubuntu only.
+#
+# Simulated before writing: `apt-get -s install -t bookworm-backports
+# zabbix-agent2` upgrades exactly one package, pulls no new dependencies and
+# removes nothing.
+#
+# SCOPE: bookworm hosts only, and never the k8s nodes or the API-managed
+# appliance. The k8s exclusion is not cosmetic - those three are monitored by
+# the in-cluster zabbix-agent DaemonSet using hostNetwork on the same
+# node IP:10050, and installing a host agent there recreates the port conflict
+# that remove-agent-from-k8s-nodes.yml exists to fix. They are Ubuntu anyway, so
+# the bookworm guard would also skip them; the host pattern is belt and braces.
+#
+# The agent restart is a brief monitoring gap on that host, nothing more.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-agent2-bookworm-backports.yml --check --diff
+#   ansible-playbook playbooks/zabbix-agent2-bookworm-backports.yml
+
+- name: Upgrade zabbix-agent2 from bookworm-backports
+  hosts: all:!api_managed:!k8s
+  become: true
+
+  vars:
+    wanted_major: "7"
+
+  tasks:
+    - name: Skip anything that is not Debian 12
+      ansible.builtin.meta: end_host
+      when: >-
+        ansible_distribution != 'Debian'
+        or ansible_distribution_release != 'bookworm'
+
+    - name: Confirm bookworm-backports is actually configured
+      ansible.builtin.command: apt-cache policy zabbix-agent2
+      register: pkg_policy
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse if backports is not offering a {{ wanted_major }}.x agent
+      ansible.builtin.assert:
+        that:
+          - pkg_policy.stdout is search('bookworm-backports')
+          - pkg_policy.stdout is search('1:' ~ wanted_major ~ '\.')
+        fail_msg: >-
+          bookworm-backports is not offering a {{ wanted_major }}.x zabbix-agent2
+          on {{ inventory_hostname }}. Enable it (or reconsider this play) rather
+          than adding a third-party repo by hand.
+        success_msg: "bookworm-backports offers a {{ wanted_major }}.x agent."
+
+    - name: Install zabbix-agent2 from backports
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: latest
+        default_release: bookworm-backports
+        update_cache: true
+      notify: restart_zabbix_agent2
+
+    - name: Make sure the agent is running and enabled
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: started
+        enabled: true
+
+    - name: Read the installed version back
+      ansible.builtin.command: zabbix_agent2 -V
+      register: agent_version
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm the agent is now on the wanted major
+      ansible.builtin.assert:
+        that:
+          - agent_version.stdout_lines[0] is search('\) ' ~ wanted_major ~ '\.')
+        fail_msg: >-
+          Still on "{{ agent_version.stdout_lines[0] | default('unknown') }}" after
+          the upgrade on {{ inventory_hostname }}.
+        success_msg: "{{ agent_version.stdout_lines[0] }}"
+      when: not ansible_check_mode
+
+    - name: Note what to check next
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ agent_version.stdout_lines[0] | default('(check mode)') }}.
+          system.sw.packages.get should leave the unsupported state on its next
+          poll - it is a 1h item, so allow for that before judging.
+
+  handlers:
+    - name: restart_zabbix_agent2
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: restarted
+        enabled: true
