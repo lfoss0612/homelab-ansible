@@ -1,6 +1,6 @@
 ---
-# Build the "Kubernetes Pods" Zabbix dashboard, plus the calculated items it
-# needs.
+# Build the "Kubernetes Pods" Zabbix dashboard (dashboard id 403), plus the
+# calculated items its Pods/Nodes/Storage pages need.
 #
 # There was no pod dashboard anywhere. Of the four dashboards on this server,
 # none is Kubernetes-related; the k8s templates DO ship four ("API server
@@ -16,7 +16,7 @@
 # CALCULATED ITEMS: the template exposes cluster-level counts for nodes,
 # deployments, jobs, cronjobs and namespaces, but NOT for pods - there is no
 # kube.pod.count. Pod totals therefore have to be aggregated from the per-pod
-# items, which is what the six calculated items below do, using a wildcard key
+# items, which is what the six pod_calc_items below do, using a wildcard key
 # in a foreach aggregation:
 #
 #     sum(last_foreach(/k8s-master.home.lan/kube.pod.phase.running[*]))
@@ -30,13 +30,41 @@
 # TODO asking for this dashboard predates that fix and could not have been
 # built before it.
 #
+# THE DRIFT THIS FILE CLOSES, found 2026-08-29: `git log` on this file showed
+# exactly one commit, building only the Pods page - but the LIVE dashboard
+# already had Nodes, Storage and Network pages, and the live Kubelet hosts
+# already carried per-container memory item prototypes and CPU items, none of
+# it ever committed. Someone (a past session) built all of that directly
+# against the API without writing it back into this repo, which is exactly
+# the anti-pattern this repo's own CLAUDE.md warns against ("anything found by
+# debugging on a host gets fixed by a playbook in this repo, never by hand on
+# the host"). This revision reproduces that live state as idempotent,
+# re-runnable tasks - re-running it against an already-correct server should
+# report zero changes, which is itself the proof the capture was accurate.
+# The per-container memory item prototypes are NOT recreated here: they are
+# vendor/template content (non-zero templateid on all six, confirmed live via
+# itemprototype.get), free with the "Kubernetes Kubelet by HTTP" template link
+# plus the nodes/metrics RBAC grant - nothing to commit beyond noting it.
+#
+# OWNERSHIP ACROSS PLAYBOOKS - this file composes the dashboard, but several
+# of the items it references are created by other, more narrowly-scoped
+# playbooks. Run them first on a from-scratch server:
+#   zabbix-pod-crashloopbackoff.yml       kube.pods.crashlooping + per-pod items
+#   zabbix-pod-namespace-breakdown.yml    the 38 per-namespace Namespaces-page items
+#   zabbix-kubelet-cpu-items.yml          per-node CPU usage totals
+#   zabbix-metallb-vip-monitoring.yml     the 12 icmpping VIP items (Network page)
+# This file only creates the Nodes-page and Storage-page aggregate items
+# (node_calc_items, storage_calc_items below) - everything else it references
+# is asserted to already exist, the same way the existing pod_calc_items
+# assert already worked.
+#
 # NOTE ON CLEANUP: item.delete is refused to the automation token, so a
 # mistyped calculated item cannot be removed by re-running this play - it can
 # only be updated in place or deleted through the UI. Keys are therefore
 # treated as stable identifiers: change a key here only deliberately, since the
 # old one will linger.
 #
-# Usage:
+# Usage (run the four dependency playbooks above first on a from-scratch server):
 #   ansible-playbook playbooks/zabbix-kubernetes-dashboard.yml --check --diff
 #   ansible-playbook playbooks/zabbix-kubernetes-dashboard.yml
 
@@ -50,6 +78,54 @@
 
     k8s_host: "k8s-master.home.lan"
     dashboard_name: "Kubernetes Pods"
+
+    kubelet_nodes:
+      - "k8s-master.home.lan"
+      - "k8s-worker.home.lan"
+      - "k8s-worker-2.home.lan"
+
+    # Live 2026-08-29 - keep in sync with zabbix-pod-namespace-breakdown.yml's
+    # `namespaces` var. Not re-derived here to avoid a second live kubectl
+    # dependency in a play whose job is composing a dashboard, not verifying
+    # cluster state - that playbook already asserts this list against the
+    # cluster before creating the items this one only reads.
+    namespaces:
+      - argocd
+      - cattle-capi-system
+      - cattle-fleet-local-system
+      - cattle-fleet-system
+      - cattle-monitoring-system
+      - cattle-system
+      - cattle-turtles-system
+      - cert-manager
+      - fleet-default
+      - fleet-local
+      - gpu-operator
+      - kube-system
+      - langflow
+      - litellm
+      - longhorn-system
+      - metallb-system
+      - open-webui
+      - postgrest
+      - yugabytedb
+
+    # Matches zabbix-metallb-vip-monitoring.yml's metallb_vips exactly - that
+    # playbook owns creating these items; this one only reads them for the
+    # Network page.
+    metallb_vips:
+      - {ip: "10.2.6.0",   svc: "comfyui/comfyui"}
+      - {ip: "10.2.6.1",   svc: "litellm/litellm"}
+      - {ip: "10.2.6.2",   svc: "open-webui/open-webui"}
+      - {ip: "10.2.6.3",   svc: "yugabytedb/pgadmin-pgadmin4"}
+      - {ip: "10.2.6.4",   svc: "yugabytedb/yb-master-ui"}
+      - {ip: "10.2.6.5",   svc: "yugabytedb/yugabyted-ui-service"}
+      - {ip: "10.2.6.6",   svc: "yugabytedb/yb-tserver-service"}
+      - {ip: "10.2.6.10",  svc: "cattle-monitoring-system/rancher-monitoring-grafana"}
+      - {ip: "10.2.6.100", svc: "postgrest/postgrest"}
+      - {ip: "10.2.6.102", svc: "argocd/argocd-server"}
+      - {ip: "10.2.6.103", svc: "open-webui/ollama"}
+      - {ip: "10.2.6.105", svc: "langflow/langflow-service"}
 
     # key, name, and the calculated expression. Aggregated from the per-pod
     # items because the template has no pod-count equivalent.
@@ -73,6 +149,50 @@
         name: "Pods: container restarts, total"
         expr: "sum(last_foreach(/k8s-master.home.lan/kube.pod.containers_restarts[*]))"
 
+    # Owned by this play. One health/cpu%/mem%/memory-total set per node,
+    # captured verbatim from the live server 2026-08-29.
+    node_calc_item_defs:
+      health:
+        key: "kube.node.health[{node}]"
+        name: "Node [{node}] pressure or not-ready"
+        expr: >-
+          (last(/{k8s_host}/kube.node.conditions.ready[{node}])=0) or
+          (last(/{k8s_host}/kube.node.conditions.diskpressure[{node}])=1) or
+          (last(/{k8s_host}/kube.node.conditions.memorypressure[{node}])=1) or
+          (last(/{k8s_host}/kube.node.conditions.pidpressure[{node}])=1)
+      cpu_pct:
+        key: "kube.node.cpu.request_pct[{node}]"
+        name: "Node [{node}]: CPU requested, %"
+        expr: >-
+          last(/{k8s_host}/kube.node.requests.cpu[{node}]) /
+          last(/{k8s_host}/kube.node.allocatable.cpu[{node}]) * 100
+      mem_pct:
+        key: "kube.node.memory.request_pct[{node}]"
+        name: "Node [{node}]: memory requested, %"
+        expr: >-
+          last(/{k8s_host}/kube.node.requests.memory[{node}]) /
+          last(/{k8s_host}/kube.node.allocatable.memory[{node}]) * 100
+      mem_total:
+        key: "kube.kubelet.container.memory.working_set.total[{node}]"
+        name: "Node [{node}]: containers memory working set, total"
+        expr: "sum(last_foreach(/Kubelet {node}/kube.kubelet.container.memory.working_set[*,*,*]))"
+
+    # Owned by this play. Cluster-wide, not per-node - the underlying
+    # kube.pv.*/kube.pvc.* items are vendor LLD from the linked template.
+    storage_calc_items:
+      - key: "kube.pv.capacity.bytes.total"
+        name: "PV capacity, total"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pv.capacity.bytes[*]))"
+      - key: "kube.pvc.count.bound"
+        name: "PVC: bound, total"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pvc.status_phase.bound.sum[*]))"
+      - key: "kube.pvc.count.pending"
+        name: "PVC: pending, total"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pvc.status_phase.pending.sum[*]))"
+      - key: "kube.pvc.count.lost"
+        name: "PVC: lost, total"
+        expr: "sum(last_foreach(/k8s-master.home.lan/kube.pvc.status_phase.lost.sum[*]))"
+
   tasks:
     - name: Resolve the Kubernetes host
       ansible.builtin.uri:
@@ -95,6 +215,49 @@
       failed_when: >-
         host_lookup.json.error is defined
         or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Build the flat list of node calculated items to ensure exist
+      ansible.builtin.set_fact:
+        node_calc_item_list: >-
+          {{ node_calc_item_list | default([]) + [{
+            'key': node_calc_item_defs[metric].key.format(node=node),
+            'name': node_calc_item_defs[metric].name.format(node=node),
+            'expr': node_calc_item_defs[metric].expr.format(node=node, k8s_host=k8s_host),
+          }] }}
+      loop: "{{ kubelet_nodes | product(['health', 'cpu_pct', 'mem_pct', 'mem_total']) | list }}"
+      loop_control:
+        loop_var: pair
+        label: "{{ pair[0] }} / {{ pair[1] }}"
+      vars:
+        node: "{{ pair[0] }}"
+        metric: "{{ pair[1] }}"
+
+    # Plain "~" concatenation, not regex_replace: regex_replace's backreference
+    # (\1) only survives if the YAML field holding it is double-quoted, since
+    # YAML's double-quote escaping is what turns the literal two characters
+    # "\\1" into the single backslash regex_replace actually needs - inside a
+    # ">-" folded block (used throughout this file for readability) no such
+    # unescaping happens, so the backreference reaches Jinja unresolved and
+    # regex_replace silently inserts the literal text "\\1" instead of the
+    # namespace/node/IP. Confirmed live 2026-08-29: the "Assert every
+    # referenced item resolved" task below failed with 19 identical
+    # "kube.namespace.pods.total[\\1]" entries instead of 19 distinct
+    # namespace-keyed ones.
+    - name: Build the per-namespace item keys
+      ansible.builtin.set_fact:
+        namespace_total_keys: "{{ (namespace_total_keys | default([])) + ['kube.namespace.pods.total[' ~ item ~ ']'] }}"
+        namespace_problem_keys: "{{ (namespace_problem_keys | default([])) + ['kube.namespace.pods.problems[' ~ item ~ ']'] }}"
+      loop: "{{ namespaces }}"
+
+    - name: Build the per-node CPU total keys
+      ansible.builtin.set_fact:
+        cpu_total_keys: "{{ (cpu_total_keys | default([])) + ['kube.kubelet.container.cpu.usage.total[' ~ item ~ ']'] }}"
+      loop: "{{ kubelet_nodes }}"
+
+    - name: Build the per-VIP icmpping keys
+      ansible.builtin.set_fact:
+        icmpping_keys: "{{ (icmpping_keys | default([])) + ['icmpping[' ~ item.ip ~ ']'] }}"
+      loop: "{{ metallb_vips }}"
 
     - name: Create the pod aggregate calculated items
       ansible.builtin.uri:
@@ -126,7 +289,62 @@
       failed_when: calc_create.json.error is defined
       changed_when: calc_create.json.result is defined
 
-    - name: Re-read the item ids
+    - name: Create the node calculated items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "{{ item.name }}"
+            key_: "{{ item.key }}"
+            type: 15
+            value_type: >-
+              {{ 3 if ('working_set.total' in item.key or '.health[' in item.key) else 0 }}
+            delay: "1m"
+            params: "{{ item.expr }}"
+          id: 1
+      register: node_calc_create
+      loop: "{{ node_calc_item_list }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.key not in (host_lookup.json.result[0]['items'] | map(attribute='key_') | list)
+      failed_when: node_calc_create.json.error is defined
+      changed_when: node_calc_create.json.result is defined
+
+    - name: Create the storage calculated items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "{{ item.name }}"
+            key_: "{{ item.key }}"
+            type: 15
+            value_type: 3
+            delay: "1m"
+            params: "{{ item.expr }}"
+          id: 1
+      register: storage_calc_create
+      loop: "{{ storage_calc_items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.key not in (host_lookup.json.result[0]['items'] | map(attribute='key_') | list)
+      failed_when: storage_calc_create.json.error is defined
+      changed_when: storage_calc_create.json.result is defined
+
+    - name: Re-read every item this dashboard references
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
@@ -140,9 +358,17 @@
             output: ["itemid", "key_"]
             hostids: ["{{ host_lookup.json.result[0].hostid }}"]
             filter:
-              key_: "{{ pod_calc_items | map(attribute='key') | list
-                         + ['kube.node.count', 'kube.deployment.count',
-                            'kube.job.count', 'kube.cronjob.count'] }}"
+              key_: >-
+                {{ pod_calc_items | map(attribute='key') | list
+                   + ['kube.node.count', 'kube.deployment.count', 'kube.job.count', 'kube.cronjob.count']
+                   + node_calc_item_list | map(attribute='key') | list
+                   + storage_calc_items | map(attribute='key') | list
+                   + ['kube.pv.status_phase.available.sum[]', 'kube.pv.status_phase.bound.sum[]',
+                      'kube.pv.status_phase.failed.sum[]', 'kube.pv.status_phase.pending.sum[]',
+                      'kube.pv.status_phase.released.sum[]']
+                   + ['kube.pods.crashlooping']
+                   + namespace_total_keys + namespace_problem_keys
+                   + cpu_total_keys + icmpping_keys }}
           id: 1
       register: item_ids
       check_mode: false
@@ -155,25 +381,70 @@
                   | zip(item_ids.json.result | map(attribute='itemid'))) }}
 
     # In --check the item.create tasks skip, so any calculated item that does
-    # not exist yet cannot be referenced by the widgets below. That is inherent
-    # to create-then-reference, not a fault: run the play for real once (item
-    # creation is additive and safe), after which --check works normally.
+    # not exist yet cannot be referenced by the widgets below. That is
+    # inherent to create-then-reference, not a fault. Items owned by the
+    # dependency playbooks listed in the header (crashloop, namespace, CPU,
+    # icmpping) must already exist - this play does not create them.
     - name: Assert every referenced item resolved
       ansible.builtin.assert:
         that:
           - missing_keys | length == 0
         fail_msg: >-
           These items do not exist yet: {{ missing_keys }}.
-          {{ "Expected under --check on a first run - the create tasks skip, so run without --check once."
-             if ansible_check_mode else
-             "Unexpected outside check mode; item creation must have failed." }}
+          If they're pod_calc_items/node_calc_items/storage_calc_items, this is
+          expected under --check on a first run - the create tasks skip, so run
+          without --check once. If they're a crashlooping/namespace/CPU/icmpping
+          key, run the owning playbook from this file's header comment first.
         success_msg: "All {{ ids | length }} referenced items resolved."
       vars:
-        missing_keys: >-
-          {{ (pod_calc_items | map(attribute='key') | list
-              + ['kube.node.count', 'kube.deployment.count',
-                 'kube.job.count', 'kube.cronjob.count'])
-             | reject('in', ids.keys() | list) | list }}
+        all_expected_keys: >-
+          {{ pod_calc_items | map(attribute='key') | list
+             + ['kube.node.count', 'kube.deployment.count', 'kube.job.count', 'kube.cronjob.count']
+             + node_calc_item_list | map(attribute='key') | list
+             + storage_calc_items | map(attribute='key') | list
+             + ['kube.pv.status_phase.available.sum[]', 'kube.pv.status_phase.bound.sum[]',
+                'kube.pv.status_phase.failed.sum[]', 'kube.pv.status_phase.pending.sum[]',
+                'kube.pv.status_phase.released.sum[]']
+             + ['kube.pods.crashlooping']
+             + namespace_total_keys + namespace_problem_keys
+             + cpu_total_keys + icmpping_keys }}
+        missing_keys: "{{ all_expected_keys | reject('in', ids.keys() | list) | list }}"
+
+    - name: Build the Namespaces page widgets
+      ansible.builtin.set_fact:
+        namespace_widgets: >-
+          {{ (namespace_widgets | default([])) + [
+            {
+              'type': 'item', 'name': ns ~ ': pods',
+              'x': (idx % 6) * 12, 'y': (idx // 6) * 3, 'width': 6, 'height': 3,
+              'fields': [
+                {'type': 4, 'name': 'itemid.0', 'value': ids['kube.namespace.pods.total[' ~ ns ~ ']']},
+                {'type': 0, 'name': 'show.0', 'value': '2'},
+                {'type': 0, 'name': 'value_size', 'value': '30'},
+                {'type': 0, 'name': 'decimal_size', 'value': '30'},
+                {'type': 0, 'name': 'units_show', 'value': '0'}
+              ]
+            },
+            {
+              'type': 'item', 'name': ns ~ ': problems',
+              'x': (idx % 6) * 12 + 6, 'y': (idx // 6) * 3, 'width': 6, 'height': 3,
+              'fields': [
+                {'type': 4, 'name': 'itemid.0', 'value': ids['kube.namespace.pods.problems[' ~ ns ~ ']']},
+                {'type': 0, 'name': 'show.0', 'value': '2'},
+                {'type': 0, 'name': 'value_size', 'value': '30'},
+                {'type': 0, 'name': 'decimal_size', 'value': '30'},
+                {'type': 0, 'name': 'units_show', 'value': '0'},
+                {'type': 1, 'name': 'thresholds.0.color', 'value': '4CAF50'},
+                {'type': 1, 'name': 'thresholds.0.threshold', 'value': '0'},
+                {'type': 1, 'name': 'thresholds.1.color', 'value': 'F44336'},
+                {'type': 1, 'name': 'thresholds.1.threshold', 'value': '1'}
+              ]
+            }
+          ] }}
+      loop: "{{ namespaces }}"
+      loop_control:
+        loop_var: ns
+        index_var: idx
 
     - name: Look for an existing dashboard
       ansible.builtin.uri:
@@ -202,46 +473,46 @@
         dashboard_pages:
           - name: "Pods"
             widgets:
-              # --- Row 1: the five numbers worth seeing first -------------
+              # --- Row 1: the six numbers worth seeing first ---------------
               - type: item
                 name: "Total pods"
                 x: 0
                 y: 0
-                width: 14
+                width: 12
                 height: 3
                 fields:
                   - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.total'] }}"}
                   - {type: 0, name: "show.0", value: "2"}
-                  - {type: 0, name: "value_size", value: "50"}
-                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "units_show", value: "0"}
 
               - type: item
                 name: "Running"
-                x: 14
+                x: 12
                 y: 0
-                width: 15
+                width: 12
                 height: 3
                 fields:
                   - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.running'] }}"}
                   - {type: 0, name: "show.0", value: "2"}
-                  - {type: 0, name: "value_size", value: "50"}
-                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "units_show", value: "0"}
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
                   - {type: 1, name: "thresholds.0.threshold", value: "0"}
 
               - type: item
                 name: "Pending"
-                x: 29
+                x: 24
                 y: 0
-                width: 14
+                width: 12
                 height: 3
                 fields:
                   - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.pending'] }}"}
                   - {type: 0, name: "show.0", value: "2"}
-                  - {type: 0, name: "value_size", value: "50"}
-                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "units_show", value: "0"}
                   # Green at zero, amber the moment anything is stuck pending.
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
@@ -251,15 +522,15 @@
 
               - type: item
                 name: "Failed"
-                x: 43
+                x: 36
                 y: 0
-                width: 14
+                width: 12
                 height: 3
                 fields:
                   - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.failed'] }}"}
                   - {type: 0, name: "show.0", value: "2"}
-                  - {type: 0, name: "value_size", value: "50"}
-                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "units_show", value: "0"}
                   - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
                   - {type: 1, name: "thresholds.0.threshold", value: "0"}
@@ -268,16 +539,33 @@
 
               - type: item
                 name: "Container restarts"
-                x: 57
+                x: 48
                 y: 0
-                width: 15
+                width: 12
                 height: 3
                 fields:
                   - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.restarts'] }}"}
                   - {type: 0, name: "show.0", value: "2"}
-                  - {type: 0, name: "value_size", value: "50"}
-                  - {type: 0, name: "decimal_size", value: "50"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "units_show", value: "0"}
+
+              - type: item
+                name: "Crash looping (CrashLoopBackOff)"
+                x: 60
+                y: 0
+                width: 12
+                height: 3
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ids['kube.pods.crashlooping'] }}"}
+                  - {type: 0, name: "show.0", value: "2"}
+                  - {type: 0, name: "value_size", value: "45"}
+                  - {type: 0, name: "decimal_size", value: "45"}
+                  - {type: 0, name: "units_show", value: "0"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "1"}
 
               # --- Row 2: what is actually wrong, and the trend -----------
               - type: problems
@@ -364,6 +652,179 @@
                   - {type: 0, name: "value_size", value: "45"}
                   - {type: 0, name: "decimal_size", value: "45"}
                   - {type: 0, name: "units_show", value: "0"}
+
+    - name: Build the Nodes page tiles
+      ansible.builtin.set_fact:
+        node_tiles: >-
+          {{ (node_tiles | default([])) + [{
+            'type': 'item',
+            'name': node ~ row.suffix,
+            'x': idx * 24, 'y': row.y, 'width': 24, 'height': 3,
+            'fields': (
+              [
+                {'type': 4, 'name': 'itemid.0', 'value': ids[row.metric ~ node ~ ']']},
+                {'type': 0, 'name': 'show.0', 'value': '2'},
+                {'type': 0, 'name': 'value_size', 'value': '35'},
+                {'type': 0, 'name': 'decimal_size', 'value': '35'},
+                {'type': 0, 'name': 'units_show', 'value': '0'}
+              ]
+              + (
+                [
+                  {'type': 1, 'name': 'thresholds.0.color', 'value': '4CAF50'},
+                  {'type': 1, 'name': 'thresholds.0.threshold', 'value': '0'},
+                  {'type': 1, 'name': 'thresholds.1.color', 'value': 'F44336'},
+                  {'type': 1, 'name': 'thresholds.1.threshold', 'value': '1'}
+                ] if row.metric == 'kube.node.health[' else []
+              )
+            )
+          }] }}
+      loop: "{{ kubelet_nodes | product([
+              {'metric': 'kube.node.cpu.request_pct[', 'suffix': ': CPU requested %', 'y': 0},
+              {'metric': 'kube.node.memory.request_pct[', 'suffix': ': memory requested %', 'y': 3},
+              {'metric': 'kube.node.health[', 'suffix': ': pressure/not-ready', 'y': 6},
+              {'metric': 'kube.kubelet.container.memory.working_set.total[', 'suffix': ': containers memory (working set)', 'y': 9},
+              {'metric': 'kube.kubelet.container.cpu.usage.total[', 'suffix': ': containers CPU usage', 'y': 12}
+            ]) | list }}"
+      loop_control:
+        loop_var: pair
+        index_var: pair_idx
+        label: "{{ pair[0] }} {{ pair[1].suffix }}"
+      vars:
+        node: "{{ pair[0] }}"
+        row: "{{ pair[1] }}"
+        idx: "{{ kubelet_nodes.index(pair[0]) }}"
+
+    - name: Compose the Nodes, Storage and Namespaces pages
+      ansible.builtin.set_fact:
+        dashboard_pages: "{{ dashboard_pages + [nodes_page, storage_page, namespaces_page, network_page] }}"
+      vars:
+        nodes_page:
+          name: "Nodes"
+          widgets: >-
+            {{ node_tiles + [
+              {
+                'type': 'svggraph', 'name': 'CPU requested % by node', 'x': 0, 'y': 15, 'width': 36, 'height': 6,
+                'fields': [
+                  {'type': 1, 'name': 'ds.0.hosts.0', 'value': k8s_host}, {'type': 1, 'name': 'ds.0.items.0', 'value': 'Node [' ~ kubelet_nodes[0] ~ ']: CPU requested, %'}, {'type': 1, 'name': 'ds.0.color', 'value': '2196F3'},
+                  {'type': 1, 'name': 'ds.1.hosts.0', 'value': k8s_host}, {'type': 1, 'name': 'ds.1.items.0', 'value': 'Node [' ~ kubelet_nodes[1] ~ ']: CPU requested, %'}, {'type': 1, 'name': 'ds.1.color', 'value': '4CAF50'},
+                  {'type': 1, 'name': 'ds.2.hosts.0', 'value': k8s_host}, {'type': 1, 'name': 'ds.2.items.0', 'value': 'Node [' ~ kubelet_nodes[2] ~ ']: CPU requested, %'}, {'type': 1, 'name': 'ds.2.color', 'value': 'FF9800'},
+                  {'type': 1, 'name': 'lefty_min', 'value': '0'}
+                ]
+              },
+              {
+                'type': 'svggraph', 'name': 'Memory requested % by node', 'x': 36, 'y': 15, 'width': 36, 'height': 6,
+                'fields': [
+                  {'type': 1, 'name': 'ds.0.hosts.0', 'value': k8s_host}, {'type': 1, 'name': 'ds.0.items.0', 'value': 'Node [' ~ kubelet_nodes[0] ~ ']: memory requested, %'}, {'type': 1, 'name': 'ds.0.color', 'value': '2196F3'},
+                  {'type': 1, 'name': 'ds.1.hosts.0', 'value': k8s_host}, {'type': 1, 'name': 'ds.1.items.0', 'value': 'Node [' ~ kubelet_nodes[1] ~ ']: memory requested, %'}, {'type': 1, 'name': 'ds.1.color', 'value': '4CAF50'},
+                  {'type': 1, 'name': 'ds.2.hosts.0', 'value': k8s_host}, {'type': 1, 'name': 'ds.2.items.0', 'value': 'Node [' ~ kubelet_nodes[2] ~ ']: memory requested, %'}, {'type': 1, 'name': 'ds.2.color', 'value': 'FF9800'},
+                  {'type': 1, 'name': 'lefty_min', 'value': '0'}
+                ]
+              }
+            ] }}
+
+        storage_page:
+          name: "Storage"
+          widgets:
+            - {type: item, name: "PVs bound", x: 0, y: 0, width: 14, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pv.status_phase.bound.sum[]'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "decimal_size", value: "45"}, {type: 0, name: "units_show", value: "0"},
+                {type: 1, name: "thresholds.0.color", value: "4CAF50"}, {type: 1, name: "thresholds.0.threshold", value: "0"}
+              ]}
+            - {type: item, name: "PVs available", x: 14, y: 0, width: 15, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pv.status_phase.available.sum[]'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "decimal_size", value: "45"}, {type: 0, name: "units_show", value: "0"}
+              ]}
+            - {type: item, name: "PVs pending", x: 29, y: 0, width: 14, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pv.status_phase.pending.sum[]'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "decimal_size", value: "45"}, {type: 0, name: "units_show", value: "0"},
+                {type: 1, name: "thresholds.0.color", value: "4CAF50"}, {type: 1, name: "thresholds.0.threshold", value: "0"},
+                {type: 1, name: "thresholds.1.color", value: "FF9800"}, {type: 1, name: "thresholds.1.threshold", value: "1"}
+              ]}
+            - {type: item, name: "PVs failed", x: 43, y: 0, width: 14, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pv.status_phase.failed.sum[]'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "decimal_size", value: "45"}, {type: 0, name: "units_show", value: "0"},
+                {type: 1, name: "thresholds.0.color", value: "4CAF50"}, {type: 1, name: "thresholds.0.threshold", value: "0"},
+                {type: 1, name: "thresholds.1.color", value: "F44336"}, {type: 1, name: "thresholds.1.threshold", value: "1"}
+              ]}
+            - {type: item, name: "PVs released", x: 57, y: 0, width: 15, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pv.status_phase.released.sum[]'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "decimal_size", value: "45"}, {type: 0, name: "units_show", value: "0"}
+              ]}
+            - {type: item, name: "PVCs bound", x: 0, y: 3, width: 24, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pvc.count.bound'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "value_size", value: "40"}, {type: 0, name: "decimal_size", value: "40"}, {type: 0, name: "units_show", value: "0"},
+                {type: 1, name: "thresholds.0.color", value: "4CAF50"}, {type: 1, name: "thresholds.0.threshold", value: "0"}
+              ]}
+            - {type: item, name: "PVCs pending", x: 24, y: 3, width: 24, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pvc.count.pending'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "value_size", value: "40"}, {type: 0, name: "decimal_size", value: "40"}, {type: 0, name: "units_show", value: "0"},
+                {type: 1, name: "thresholds.0.color", value: "4CAF50"}, {type: 1, name: "thresholds.0.threshold", value: "0"},
+                {type: 1, name: "thresholds.1.color", value: "FF9800"}, {type: 1, name: "thresholds.1.threshold", value: "1"}
+              ]}
+            - {type: item, name: "PVCs lost", x: 48, y: 3, width: 24, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pvc.count.lost'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "value_size", value: "40"}, {type: 0, name: "decimal_size", value: "40"}, {type: 0, name: "units_show", value: "0"},
+                {type: 1, name: "thresholds.0.color", value: "4CAF50"}, {type: 1, name: "thresholds.0.threshold", value: "0"},
+                {type: 1, name: "thresholds.1.color", value: "F44336"}, {type: 1, name: "thresholds.1.threshold", value: "1"}
+              ]}
+            - {type: item, name: "PV capacity, total", x: 0, y: 6, width: 24, height: 3, fields: [
+                {type: 4, name: "itemid.0", value: "{{ ids['kube.pv.capacity.bytes.total'] }}"},
+                {type: 0, name: "show.0", value: "2"}, {type: 0, name: "value_size", value: "40"}, {type: 0, name: "decimal_size", value: "40"}
+              ]}
+            - type: svggraph
+              name: "PV capacity, total, over time"
+              x: 24
+              y: 6
+              width: 48
+              height: 6
+              fields:
+                - {type: 1, name: "ds.0.hosts.0", value: "{{ k8s_host }}"}
+                - {type: 1, name: "ds.0.items.0", value: "PV capacity, total"}
+                - {type: 1, name: "ds.0.color", value: "2196F3"}
+                - {type: 1, name: "lefty_min", value: "0"}
+
+        namespaces_page:
+          name: "Namespaces"
+          widgets: "{{ namespace_widgets }}"
+
+        network_page:
+          name: "Network"
+          # Only the discovery widget - "Attach the VIP tiles" below appends
+          # the per-VIP item tiles once vip_tiles is built, since it needs
+          # `ids` (namespace items, node items, etc.) resolved first anyway.
+          widgets:
+            - {type: discovery, name: "MetalLB VIPs (10.2.6.0-254)", x: 0, y: 0, width: 72, height: 4, fields: []}
+
+    - name: Build the Network page VIP tiles
+      ansible.builtin.set_fact:
+        vip_tiles: >-
+          {{ (vip_tiles | default([])) + [{
+            'type': 'item',
+            'name': v.svc ~ ' (' ~ v.ip ~ ')',
+            'x': (idx % 6) * 12, 'y': 4 + ((idx // 6) * 3), 'width': 12, 'height': 3,
+            'fields': [
+              {'type': 4, 'name': 'itemid.0', 'value': ids['icmpping[' ~ v.ip ~ ']']},
+              {'type': 0, 'name': 'show.0', 'value': '2'},
+              {'type': 0, 'name': 'value_size', 'value': '30'},
+              {'type': 0, 'name': 'decimal_size', 'value': '30'},
+              {'type': 0, 'name': 'units_show', 'value': '0'},
+              {'type': 1, 'name': 'thresholds.0.color', 'value': 'F44336'},
+              {'type': 1, 'name': 'thresholds.0.threshold', 'value': '0'},
+              {'type': 1, 'name': 'thresholds.1.color', 'value': '4CAF50'},
+              {'type': 1, 'name': 'thresholds.1.threshold', 'value': '1'}
+            ]
+          }] }}
+      loop: "{{ metallb_vips }}"
+      loop_control:
+        loop_var: v
+        index_var: idx
+
+    - name: Attach the VIP tiles to the Network page
+      ansible.builtin.set_fact:
+        dashboard_pages: >-
+          {{ dashboard_pages[:-1] + [dashboard_pages[-1] | combine({
+            'widgets': [dashboard_pages[-1].widgets[0]] + vip_tiles
+          })] }}
 
     - name: Create the dashboard
       ansible.builtin.uri:

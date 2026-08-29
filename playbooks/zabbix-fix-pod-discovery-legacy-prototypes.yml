@@ -1,0 +1,102 @@
+---
+# Stops kube.pod.discovery (itemid 73251 on k8s-master.home.lan) from erroring
+# on every LLD cycle.
+#
+# WHAT WAS WRONG: the rule carries two generations of item prototypes. The
+# live, working generation keys on {#NAMESPACE}/{#NAME} (e.g.
+# kube.pod.phase.running[{#NAMESPACE}/{#NAME}]) - see
+# zabbix-kubernetes-dashboard.yml. A dead first generation
+# (73257, 73281-73287) keys on {#NAMESPACE}/{#POD} and {#NODE}, both of which
+# zabbix-remove-orphan-pod-prototypes.yml deliberately removed from the rule's
+# LLD macro paths weeks ago - {#POD} was a temporary shim for a different bug,
+# {#NODE} was never re-added. Those 8 prototypes were disabled (status=1) at
+# the time, which stops the ITEMS they'd create from collecting data, but does
+# NOT stop LLD from trying to create them: their "discover" flag was still 0
+# (yes, discover). With no {#POD}/{#NODE} macro to substitute, every discovered
+# pod produces the exact same literal, unresolved key
+# (e.g. "kube.pod.get[longhorn-system/{#POD}]") for every pod in that
+# namespace, so every cycle after the first collides on "item already exists"
+# for the same handful of literal keys, over and over. Confirmed live
+# 2026-08-29 via discoveryrule.get: the rule's error field was full of exactly
+# this, for every namespace with more than one pod.
+#
+# THE FIX: set discover=1 (No) on all 8. They stay disabled either way - this
+# only stops LLD from re-attempting their (impossible) creation, which clears
+# the rule's error field on the next cycle. item.delete/itemprototype.delete
+# are refused to the automation token, so "stop discovering" is the terminal
+# state here, same policy as the orphaned Kubernetes prototypes in
+# zabbix-remove-orphan-pod-prototypes.yml.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-fix-pod-discovery-legacy-prototypes.yml --check --diff
+#   ansible-playbook playbooks/zabbix-fix-pod-discovery-legacy-prototypes.yml
+
+- name: "Stop LLD from re-attempting the dead {% raw %}{#POD}/{#NODE}{% endraw %} pod prototypes"
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    legacy_prototype_ids:
+      - "73257"   # Node [{#NODE}] Namespace [{#NAMESPACE}] Pod [{#POD}]: Get data
+      - "73281"   # ... Conditions: Containers ready
+      - "73282"   # ... Conditions: Initialized
+      - "73283"   # ... Conditions: Ready
+      - "73284"   # ... Conditions: Scheduled
+      - "73285"   # ... Containers: Restarts
+      - "73286"   # ... Status: Phase
+      - "73287"   # ... Uptime
+
+  tasks:
+    - name: Read the current discover flag on each legacy prototype
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.get
+          params:
+            itemids: "{{ legacy_prototype_ids }}"
+            output: ["itemid", "status", "discover"]
+          id: 1
+      register: proto_lookup
+      check_mode: false
+      failed_when: >-
+        proto_lookup.json.error is defined
+        or (proto_lookup.json.result | default([]) | length) != (legacy_prototype_ids | length)
+
+    - name: Set discover=No on any that still have it set to Yes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.update
+          params:
+            itemid: "{{ item.itemid }}"
+            discover: 1
+          id: 1
+      register: proto_fix
+      loop: "{{ proto_lookup.json.result }}"
+      loop_control:
+        label: "{{ item.itemid }}"
+      when: item.discover == '0'
+      failed_when: proto_fix.json.error is defined
+      changed_when: proto_fix.json.result is defined
+
+    - name: Confirm the discovery rule's error clears on the next cycle
+      ansible.builtin.debug:
+        msg: >-
+          {{ proto_fix.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          of {{ legacy_prototype_ids | length }} prototypes updated.
+          The rule's own error field (discoveryrule.get on itemid 73251) only
+          clears after its next LLD cycle runs clean - it is not instant.

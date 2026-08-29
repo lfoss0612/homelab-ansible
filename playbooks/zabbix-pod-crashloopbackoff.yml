@@ -1,0 +1,253 @@
+---
+# Adds real CrashLoopBackOff detection to kube.pod.discovery, alongside the
+# existing restart-count heuristic.
+#
+# WHAT WAS MISSING: the only existing "crash looping" signal
+# (kube.pod.containers_restarts, vendor trigger 34643,
+# "({53662}-{53663})>1") is a restart-count DELTA over time - a proxy. It
+# fires for any pod restarting quickly for any reason, not specifically for
+# one sitting in CrashLoopBackOff right now.
+#
+# WHY THIS WAS CHEAP TO ADD: kube.pod.discovery's master item (kube.state.metrics,
+# itemid 75884) is a JavaScript item that scrapes kube-state-metrics' entire
+# /metrics endpoint and returns the raw text whole - every existing generation-2
+# pod item (kube.pod.phase.*, kube.pod.ready, etc., see
+# zabbix-kubernetes-dashboard.yml) is just a Prometheus-pattern filter over
+# that one shared scrape. kube_pod_container_status_waiting_reason is a
+# standard kube-state-metrics metric already arriving in every poll; this adds
+# one more item prototype in the same style as the 17 that already exist, not
+# new K8s API/RBAC work.
+#
+# THE ONE GOTCHA, found live 2026-08-29: kube_pod_container_status_waiting_reason
+# is a SPARSE metric - kube-state-metrics only emits a row for a given
+# (pod, reason) pair while that reason is actually active, unlike
+# kube_pod_status_phase (which always emits one row per possible phase, 0 or
+# 1). With error_handler=1 ("discard value" - copied from the sibling
+# kube.pod.containers_waiting item, where it's correct), a healthy pod that
+# has never once hit CrashLoopBackOff never gets a match, so the item never
+# receives a SINGLE value - lastclock stays 0 forever, and any
+# sum(last_foreach(...)) built on it fails with "no input data for function"
+# even after multiple poll cycles, which is unrelated to LLD's own discovery
+# cadence.
+# FIX: error_handler=2 ("set value to 0") instead. A healthy pod now reads a
+# real 0 forever, and flips to 1 exactly when kube-state-metrics starts
+# emitting that reason for it. Confirmed live: after switching, all 121
+# then-discovered pods picked up a real value within one master poll cycle.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-pod-crashloopbackoff.yml --check --diff
+#   ansible-playbook playbooks/zabbix-pod-crashloopbackoff.yml
+
+- name: Add real CrashLoopBackOff detection to the pod discovery rule
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    k8s_host: "k8s-master.home.lan"
+    pod_discovery_ruleid: "73251"       # kube.pod.discovery
+    pod_master_itemid: "75884"          # kube.state.metrics
+    # {% raw %} is required below - Zabbix LLD macros are written {#NAME}, and
+    # Ansible/Jinja treats a bare "{#" as the start of a comment tag. See
+    # smart-monitor-zabbix-setup.yml for the same gotcha solved the same way.
+    crashloop_key: "{% raw %}kube.pod.container.crashloopbackoff[{#NAMESPACE}/{#NAME}]{% endraw %}"
+    crashloop_agg_key: "kube.pods.crashlooping"
+    trigger_description: >-
+      {% raw %}Kubernetes cluster state: Namespace [{#NAMESPACE}] Pod [{#NAME}]: Pod is in CrashLoopBackOff{% endraw %}
+
+  tasks:
+    - name: Resolve the Kubernetes host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: ["{{ k8s_host }}"]
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Look for the CrashLoopBackOff item prototype
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.get
+          params:
+            discoveryids: ["{{ pod_discovery_ruleid }}"]
+            output: ["itemid", "key_"]
+            filter:
+              key_: ["{{ crashloop_key }}"]
+          id: 1
+      register: proto_lookup
+      check_mode: false
+      failed_when: proto_lookup.json.error is defined
+
+    - name: Create the CrashLoopBackOff item prototype
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            ruleid: "{{ pod_discovery_ruleid }}"
+            master_itemid: "{{ pod_master_itemid }}"
+            name: >-
+              {% raw %}Namespace [{#NAMESPACE}] Pod [{#NAME}]: Crash looping (CrashLoopBackOff){% endraw %}
+            key_: "{{ crashloop_key }}"
+            type: 18
+            value_type: 0
+            delay: "0"
+            history: "31d"
+            trends: "365d"
+            tags:
+              - {tag: "component", value: "pod"}
+              - tag: "namespace"
+                value: "{% raw %}{#NAMESPACE}{% endraw %}"
+              - tag: "pod"
+                value: "{% raw %}{#NAME}{% endraw %}"
+              - {tag: "status", value: "crashloopbackoff"}
+            preprocessing:
+              - type: 22   # Prometheus pattern
+                params: >-
+                  {% raw %}kube_pod_container_status_waiting_reason{namespace="{#NAMESPACE}", pod="{#NAME}", reason="CrashLoopBackOff"}
+                  value{% endraw %}
+
+                error_handler: 2       # set value to <params below> on no match - see header
+                error_handler_params: "0"
+          id: 1
+      register: proto_create
+      when: proto_lookup.json.result | length == 0
+      failed_when: proto_create.json.error is defined
+      changed_when: proto_create.json.result is defined
+
+    - name: Look for the CrashLoopBackOff trigger prototype
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.get
+          params:
+            discoveryids: ["{{ pod_discovery_ruleid }}"]
+            output: ["triggerid", "description"]
+            filter:
+              description: ["{{ trigger_description }}"]
+          id: 1
+      register: trig_lookup
+      check_mode: false
+      failed_when: trig_lookup.json.error is defined
+
+    - name: Create the CrashLoopBackOff trigger prototype
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.create
+          params:
+            description: "{{ trigger_description }}"
+            expression: "last(/{{ k8s_host }}/{{ crashloop_key }})=1"
+            priority: 2
+            manual_close: 0
+            comments: >-
+              kube-state-metrics reports this pod's container(s) with waiting
+              reason CrashLoopBackOff directly
+              (kube_pod_container_status_waiting_reason), rather than
+              inferring it from a restart-count delta the way the existing
+              "Pod is crash looping" trigger does.
+            tags:
+              - {tag: "scope", value: "availability"}
+              - {tag: "component", value: "pod"}
+              - {tag: "status", value: "crashloopbackoff"}
+          id: 1
+      register: trig_create
+      when: trig_lookup.json.result | length == 0
+      failed_when: trig_create.json.error is defined
+      changed_when: trig_create.json.result is defined
+
+    - name: Look for the cluster-wide crash-looping aggregate item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            output: ["itemid", "key_"]
+            filter:
+              key_: ["{{ crashloop_agg_key }}"]
+          id: 1
+      register: agg_lookup
+      check_mode: false
+      failed_when: agg_lookup.json.error is defined
+
+    - name: Create the cluster-wide crash-looping aggregate item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "Pods: crash looping (CrashLoopBackOff)"
+            key_: "{{ crashloop_agg_key }}"
+            type: 15
+            value_type: 3
+            delay: "1m"
+            params: "sum(last_foreach(/{{ k8s_host }}/kube.pod.container.crashloopbackoff[*]))"
+            description: >-
+              Aggregated from the per-pod kube.pod.container.crashloopbackoff
+              items - count of pods currently reporting waiting reason
+              CrashLoopBackOff via kube-state-metrics.
+          id: 1
+      register: agg_create
+      when: agg_lookup.json.result | length == 0
+      failed_when: agg_create.json.error is defined
+      changed_when: agg_create.json.result is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          Item prototype {{ 'created' if (proto_create is defined and proto_create.changed | default(false)) else 'already present' }},
+          trigger prototype {{ 'created' if (trig_create is defined and trig_create.changed | default(false)) else 'already present' }},
+          aggregate item {{ 'created' if (agg_create is defined and agg_create.changed | default(false)) else 'already present' }}.
+          On a first run, per-pod items appear on the next kube.state.metrics poll
+          (~1 minute) - re-run zabbix-kubernetes-dashboard.yml afterwards if the
+          dashboard tile was created in the same session and shows no data yet.

@@ -1,0 +1,195 @@
+---
+# Per-namespace pod counts, so the dashboard can show a namespace breakdown
+# instead of only cluster-wide totals.
+#
+# WHY TAG-FILTERED foreach() RATHER THAN A SEPARATE ITEM PER (namespace, pod):
+# every generation-2 pod item already carries a "namespace" tag (see
+# zabbix-kubernetes-dashboard.yml's header on the {#NAMESPACE} LLD macro), so
+# Zabbix's own tag filter on last_foreach() can scope an aggregate to one
+# namespace without any new per-pod plumbing:
+#
+#     sum(last_foreach(/k8s-master.home.lan/kube.pod.phase.pending[*]?[tag="namespace:kube-system"]))
+#
+# Validated live against the real server before this play was written (kube-system
+# read 19 running pods via this exact filter form).
+#
+# WHY TWO ITEMS PER NAMESPACE, NOT A NATIVE TABLE WIDGET: Zabbix has no widget
+# that renders "one row per tag value on a single host." tophosts renders one
+# row per Zabbix HOST, and all pods here are LLD items on the single
+# k8s-master.home.lan host - there's no per-namespace host to key rows off of.
+# The dashboard therefore renders these as a compact tile grid (one "total"
+# and one "problems" tile per namespace) rather than a real table - see
+# zabbix-kubernetes-dashboard.yml's Namespaces page.
+#
+# "problems" = pending + failed + crash-looping (CrashLoopBackOff) pods in
+# that namespace. Depends on zabbix-pod-crashloopbackoff.yml having already
+# run - the crashloopbackoff item must exist before this play's expressions
+# can reference it.
+#
+# NAMESPACE LIST: hand-maintained here rather than discovered, because Zabbix
+# calculated items are declared per-namespace ahead of time, not LLD-driven.
+# The drift check below fails loudly if the live cluster's namespaces no
+# longer match, rather than silently monitoring a stale list - same pattern as
+# zabbix-metallb-vip-monitoring.yml's VIP drift check.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-pod-namespace-breakdown.yml --check --diff
+#   ansible-playbook playbooks/zabbix-pod-namespace-breakdown.yml
+
+- name: Per-namespace pod count calculated items
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    k8s_host: "k8s-master.home.lan"
+    k8s_control_node: "k8s-master.home.lan"
+
+    # Live set as of 2026-08-29 (121 pods). Keep sorted; the drift check below
+    # will fail the play if this no longer matches the cluster.
+    namespaces:
+      - argocd
+      - cattle-capi-system
+      - cattle-fleet-local-system
+      - cattle-fleet-system
+      - cattle-monitoring-system
+      - cattle-system
+      - cattle-turtles-system
+      - cert-manager
+      - fleet-default
+      - fleet-local
+      - gpu-operator
+      - kube-system
+      - langflow
+      - litellm
+      - longhorn-system
+      - metallb-system
+      - open-webui
+      - postgrest
+      - yugabytedb
+
+  tasks:
+    - name: Read the live namespace list from the cluster
+      ansible.builtin.shell:
+        cmd: >-
+          /var/lib/rancher/rke2/bin/kubectl get namespaces
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      delegate_to: "{{ k8s_control_node }}"
+      become: true
+      register: live_namespaces
+      changed_when: false
+      check_mode: false
+
+    - name: Compare the declared namespace list against the cluster
+      vars:
+        live: "{{ live_namespaces.stdout_lines | map('trim') | reject('eq', '') | sort | list }}"
+        declared: "{{ namespaces | sort | list }}"
+      ansible.builtin.assert:
+        that:
+          - live == declared
+        fail_msg: |-
+          The namespace list in this playbook no longer matches the cluster.
+          Update `namespaces` and re-run - do not bypass this, or a new
+          namespace's pods silently won't appear in the breakdown and a
+          removed namespace's tiles will silently read stale/zero forever.
+            only in cluster: {{ live | difference(declared) }}
+            only in file:    {{ declared | difference(live) }}
+        success_msg: "{{ declared | length }} namespaces declared and all match the live cluster."
+
+    - name: Resolve the Kubernetes host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectItems: ["itemid", "key_"]
+            filter:
+              host: ["{{ k8s_host }}"]
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Create the per-namespace total-pods items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "Namespace [{{ item }}]: pods total"
+            key_: "kube.namespace.pods.total[{{ item }}]"
+            type: 15
+            value_type: 3
+            delay: "1m"
+            params: >-
+              count(last_foreach(/{{ k8s_host }}/kube.pod.ready[*]?[tag="namespace:{{ item }}"]))
+          id: 1
+      register: total_create
+      loop: "{{ namespaces }}"
+      loop_control:
+        label: "{{ item }}"
+      when: >-
+        ("kube.namespace.pods.total[" ~ item ~ "]")
+        not in (host_lookup.json.result[0]['items'] | map(attribute='key_') | list)
+      failed_when: total_create.json.error is defined
+      changed_when: total_create.json.result is defined
+
+    - name: Create the per-namespace problem-pods items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ host_lookup.json.result[0].hostid }}"
+            name: "Namespace [{{ item }}]: pods with problems"
+            key_: "kube.namespace.pods.problems[{{ item }}]"
+            type: 15
+            value_type: 3
+            delay: "1m"
+            params: >-
+              sum(last_foreach(/{{ k8s_host }}/kube.pod.phase.pending[*]?[tag="namespace:{{ item }}"]))+sum(last_foreach(/{{ k8s_host }}/kube.pod.phase.failed[*]?[tag="namespace:{{ item }}"]))+sum(last_foreach(/{{ k8s_host }}/kube.pod.container.crashloopbackoff[*]?[tag="namespace:{{ item }}"]))
+            description: "Pending + failed + CrashLoopBackOff pods in this namespace."
+          id: 1
+      register: problem_create
+      loop: "{{ namespaces }}"
+      loop_control:
+        label: "{{ item }}"
+      when: >-
+        ("kube.namespace.pods.problems[" ~ item ~ "]")
+        not in (host_lookup.json.result[0]['items'] | map(attribute='key_') | list)
+      failed_when: problem_create.json.error is defined
+      changed_when: problem_create.json.result is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ namespaces | length }} namespaces:
+          {{ total_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          total-items created,
+          {{ problem_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          problem-items created (rest already existed).

@@ -1,0 +1,265 @@
+---
+# Adds per-container CPU usage to the three Kubelet hosts, alongside the
+# per-container memory items the vendor "Kubernetes Kubelet by HTTP" template
+# already ships.
+#
+# WHY THIS IS A GAP IN THE VENDOR TEMPLATE, NOT A SCRAPE-SCOPE PROBLEM: each
+# Kubelet host's "Get cadvisor metrics" item (kube.cadvisor.metrics) is an
+# HTTP agent item that pulls the kubelet's ENTIRE /metrics/cadvisor endpoint
+# as raw Prometheus text - the same one scrape already backing the template's
+# six memory item prototypes (working_set, usage, swap, rss, max_usage, cache;
+# see "Container memory discovery", one of only four discovery rules the
+# template ships - there is no "Container CPU discovery" rule at all).
+# container_cpu_usage_seconds_total is a standard cadvisor series, so it's
+# already arriving in every one-minute poll; nothing scrapes it into a Zabbix
+# item. This adds one more host-level item prototype on the SAME discovery
+# rule and master item the memory prototypes use - no new RBAC, no new master
+# item.
+#
+# THE ONE THING THAT'S GENUINELY NEW HERE (no precedent anywhere else in this
+# repo): container_cpu_usage_seconds_total is a COUNTER (cumulative CPU-seconds
+# since container start), not a gauge like the memory metrics. Extracting it
+# with a plain Prometheus-pattern step gives an ever-increasing number, not a
+# usage rate. Preprocessing type 10 ("Change per second") is added as a SECOND
+# step to convert it - Zabbix computes (value2-value1)/(time2-time1)
+# automatically, giving cores actually used. Units are set to "cores" so 1.0
+# reads as "one full core," matching how Kubernetes itself reports CPU.
+#
+# GOTCHA, found live 2026-08-29, budget time for it if this needs
+# re-verifying: this template's discovery rules end their LLD preprocessing
+# with a "discard unchanged, keep-alive every 3h" step (type 20, params "3h")
+# on the discovered ENTITY LIST itself, not just on individual item values -
+# see the rule's own selectPreprocessing. A brand-new item prototype added to
+# an already-fully-discovered container set does NOT get backfilled onto
+# those already-known containers until the entity list either genuinely
+# changes (a pod reschedules, a container restarts under a new name, etc.) or
+# the 3-hour heartbeat elapses - whichever comes first. This is unrelated to
+# the item's own `delay` and unrelated to LLD permissions; it's a deliberate
+# anti-churn design in the vendor template. kube.pod.discovery (see
+# zabbix-pod-crashloopbackoff.yml) has no such step and materializes new
+# per-pod items within one poll cycle - do not assume the two discovery rules
+# behave the same way. Confirmed via itemprototype.create succeeding
+# immediately (no error) while item.get for the new key kept returning zero
+# rows for several minutes after; this is expected, not a fault to debug
+# further.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-kubelet-cpu-items.yml --check --diff
+#   ansible-playbook playbooks/zabbix-kubelet-cpu-items.yml
+
+- name: Add per-container CPU usage items to the Kubelet hosts
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    k8s_host: "k8s-master.home.lan"     # where the per-node totals live
+    # {% raw %} is required below - Zabbix LLD macros are written {#NAME}, and
+    # Ansible/Jinja treats a bare "{#" as the start of a comment tag. See
+    # smart-monitor-zabbix-setup.yml for the same gotcha solved the same way.
+    cpu_item_key: >-
+      {% raw %}kube.kubelet.container.cpu.usage["{#CONTAINER}", "{#NAMESPACE}", "{#POD}"]{% endraw %}
+
+    # Each Kubelet host's own "Container memory discovery" rule and its
+    # master cadvisor-scrape item - both looked up live, not guessed, since
+    # the discovery rule id differs per host.
+    kubelet_nodes:
+      - node: "k8s-master.home.lan"
+        kubelet_host: "Kubelet k8s-master.home.lan"
+      - node: "k8s-worker.home.lan"
+        kubelet_host: "Kubelet k8s-worker.home.lan"
+      - node: "k8s-worker-2.home.lan"
+        kubelet_host: "Kubelet k8s-worker-2.home.lan"
+
+  tasks:
+    - name: Resolve the Kubelet hosts and their Container memory discovery rules
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter:
+              host: "{{ kubelet_nodes | map(attribute='kubelet_host') | list }}"
+          id: 1
+      register: kubelet_host_lookup
+      check_mode: false
+      failed_when: >-
+        kubelet_host_lookup.json.error is defined
+        or (kubelet_host_lookup.json.result | default([]) | length) != (kubelet_nodes | length)
+
+    - name: Index Kubelet hostids by hostname
+      ansible.builtin.set_fact:
+        kubelet_hostids: >-
+          {{ dict(kubelet_host_lookup.json.result | map(attribute='host')
+                  | zip(kubelet_host_lookup.json.result | map(attribute='hostid'))) }}
+
+    - name: Find the Container memory discovery rule on each Kubelet host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.get
+          params:
+            hostids: ["{{ kubelet_hostids[item.kubelet_host] }}"]
+            output: ["itemid", "master_itemid"]
+            filter:
+              key_: ["kube.kubelet.container.memory.cache.discovery"]
+          id: 1
+      register: rule_lookup
+      loop: "{{ kubelet_nodes }}"
+      loop_control:
+        label: "{{ item.kubelet_host }}"
+      check_mode: false
+      failed_when: >-
+        rule_lookup.json.error is defined
+        or (rule_lookup.json.result | default([]) | length) != 1
+
+    - name: Look for the CPU item prototype on each rule
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.get
+          params:
+            discoveryids: ["{{ item.json.result[0].itemid }}"]
+            output: ["itemid", "key_"]
+            filter:
+              key_: ["{{ cpu_item_key }}"]
+          id: 1
+      register: proto_lookup
+      loop: "{{ rule_lookup.results }}"
+      loop_control:
+        label: "{{ item.item.kubelet_host }}"
+      check_mode: false
+      failed_when: proto_lookup.json.error is defined
+
+    - name: Create the CPU item prototype where it's missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: itemprototype.create
+          params:
+            hostid: "{{ kubelet_hostids[item.item.item.kubelet_host] }}"
+            ruleid: "{{ item.item.json.result[0].itemid }}"
+            master_itemid: "{{ item.item.json.result[0].master_itemid }}"
+            name: >-
+              {% raw %}Namespace [{#NAMESPACE}] Pod [{#POD}] Container [{#CONTAINER}]: CPU usage{% endraw %}
+            key_: "{{ cpu_item_key }}"
+            type: 18
+            value_type: 0
+            delay: "0"
+            history: "31d"
+            trends: "365d"
+            units: "cores"
+            tags:
+              - {tag: "component", value: "cpu"}
+              - tag: "container"
+                value: "{% raw %}{#CONTAINER}{% endraw %}"
+              - tag: "namespace"
+                value: "{% raw %}{#NAMESPACE}{% endraw %}"
+              - tag: "pod"
+                value: "{% raw %}{#POD}{% endraw %}"
+            preprocessing:
+              - type: 22   # Prometheus pattern - raw counter value
+                params: >-
+                  {% raw %}container_cpu_usage_seconds_total{container="{#CONTAINER}", namespace="{#NAMESPACE}", pod="{#POD}"}
+                  value{% endraw %}
+                error_handler: 1
+                error_handler_params: ""
+              - type: 10   # Change per second - counter -> cores used
+                params: ""
+                error_handler: 1
+                error_handler_params: ""
+          id: 1
+      register: proto_create
+      loop: "{{ proto_lookup.results }}"
+      loop_control:
+        label: "{{ item.item.item.kubelet_host }}"
+      when: item.json.result | length == 0
+      failed_when: proto_create.json.error is defined
+      changed_when: proto_create.json.result is defined
+
+    - name: Resolve the aggregation host (k8s-master.home.lan)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            selectItems: ["itemid", "key_"]
+            filter:
+              host: ["{{ k8s_host }}"]
+          id: 1
+      register: agg_host_lookup
+      check_mode: false
+      failed_when: >-
+        agg_host_lookup.json.error is defined
+        or (agg_host_lookup.json.result | default([]) | length) != 1
+
+    - name: Create the per-node CPU usage total, if missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ agg_host_lookup.json.result[0].hostid }}"
+            name: "Node [{{ item.node }}]: containers CPU usage, total"
+            key_: "kube.kubelet.container.cpu.usage.total[{{ item.node }}]"
+            type: 15
+            value_type: 0
+            units: "cores"
+            delay: "1m"
+            params: >-
+              sum(last_foreach(/{{ item.kubelet_host }}/kube.kubelet.container.cpu.usage[*,*,*]))
+          id: 1
+      register: agg_create
+      loop: "{{ kubelet_nodes }}"
+      loop_control:
+        label: "{{ item.node }}"
+      when: >-
+        ("kube.kubelet.container.cpu.usage.total[" ~ item.node ~ "]")
+        not in (agg_host_lookup.json.result[0]['items'] | map(attribute='key_') | list)
+      failed_when: agg_create.json.error is defined
+      changed_when: agg_create.json.result is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          CPU item prototypes: {{ proto_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          created of {{ kubelet_nodes | length }}. Per-node totals:
+          {{ agg_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          created. Per-container items materialize on this rule's own
+          schedule - see the header note on the 3-hour discard-unchanged
+          heartbeat before assuming a fresh run means fresh data.
