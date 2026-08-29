@@ -1,0 +1,105 @@
+---
+# Repin pve-ai's boot kernel from 6.17.9-1-pve to 7.0.14-14-pve.
+#
+# Usage:
+#   ansible-playbook playbooks/pve-ai-kernel-pin-bump.yml --check --diff
+#   ansible-playbook playbooks/pve-ai-kernel-pin-bump.yml
+#   ansible-playbook playbooks/pve-ai-kernel-pin-bump.yml -e pve_ai_target_kernel=6.17.13-21-pve
+#
+# Background (2026-08-29): pve-ai's host kernel is pinned via
+# `/etc/kernel/proxmox-boot-pin` at 6.17.9-1-pve, unlike pve/pve-router/pbs,
+# which have all moved to 7.0.14-14-pve. The pin's origin is undocumented in
+# either homelab-ansible or homelab-vault -- it looks like general caution
+# from when GPU passthrough (VM 100, k8s-worker-2, RTX 5090 via
+# hostpci0: 0000:01:00) was set up, not a response to an observed
+# passthrough regression on a newer kernel.
+#
+# Checked before writing this (see conversation, not repeated in full here):
+#   - GPU's IOMMU group (13) contains ONLY the GPU + its audio function --
+#     clean isolation, a hardware/firmware (ACS) property, not kernel-version
+#     dependent. No acs_override hack in use here, unlike pve.
+#   - Kernel build-config diff between 6.17.9-1-pve and 7.0.14-14-pve for
+#     every VFIO/IOMMU-relevant CONFIG_* option is clean: nothing removed,
+#     one internal rename (CONFIG_IOMMU_IO_PGTABLE split into per-arch
+#     options, AMD's CONFIG_IOMMU_PT_AMDV1=y still present), one addition
+#     (CONFIG_VFIO_PCI_DMABUF=y).
+#   - The vfio-pci binding (`/etc/modprobe.d/vfio.conf`,
+#     `/etc/modules` loading vfio/vfio_iommu_type1/vfio_pci, nvidia/nouveau
+#     blacklisted on the host) is all userspace config, independent of
+#     kernel version.
+#   - No custom GRUB cmdline trick here (unlike pve's local-display entry) --
+#     plain GRUB_CMDLINE_LINUX_DEFAULT="quiet amd_iommu=on" applies to
+#     whichever kernel proxmox-boot-tool boots.
+#
+# Pins to a SPECIFIC version rather than unpinning outright, on purpose: an
+# unpinned host reverts to "boot newest kernel" (GRUB_DEFAULT=0), which is
+# exactly the trap that bit k8s-worker-2's GUEST kernel (see homelab-vault
+# TODO.md, the k8s-worker-2 GRUB entry) -- unattended-upgrades installing a
+# kernel nothing has verified yet, then a reboot silently booting it. Explicit
+# beats automatic here.
+#
+# This playbook does NOT reboot.
+
+- name: Repin pve-ai's boot kernel
+  hosts: "{{ pve_ai_kernel_hosts | default('pve-ai.home.lan') }}"
+  become: true
+  vars:
+    pve_ai_target_kernel: 7.0.14-14-pve
+
+  tasks:
+    - name: Confirm the target kernel and initrd are actually installed
+      ansible.builtin.stat:
+        path: "/boot/{{ item }}-{{ pve_ai_target_kernel }}"
+      loop:
+        - vmlinuz
+        - initrd.img
+      register: pve_ai_kernel_images
+
+    - name: Refuse to proceed if either is missing
+      ansible.builtin.assert:
+        that: pve_ai_kernel_images.results | map(attribute='stat.exists') | list is all
+        fail_msg: >-
+          /boot is missing vmlinuz-{{ pve_ai_target_kernel }} or
+          initrd.img-{{ pve_ai_target_kernel }} on {{ inventory_hostname }}.
+          Refusing to pin a kernel that isn't actually present.
+
+    - name: Read the current pin
+      ansible.builtin.command: cat /etc/kernel/proxmox-boot-pin
+      register: pve_ai_pin_before
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Pin the target kernel
+      ansible.builtin.command: "proxmox-boot-tool kernel pin {{ pve_ai_target_kernel }}"
+      when: pve_ai_pin_before.stdout | trim != pve_ai_target_kernel
+      register: pve_ai_pin_result
+
+    - name: Read the pin back
+      ansible.builtin.command: cat /etc/kernel/proxmox-boot-pin
+      register: pve_ai_pin_after
+      changed_when: false
+      check_mode: false
+
+    - name: Verify the pin took (skipped under --check)
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that: pve_ai_pin_after.stdout | trim == pve_ai_target_kernel
+        fail_msg: >-
+          proxmox-boot-tool reports pin '{{ pve_ai_pin_after.stdout | trim }}',
+          expected '{{ pve_ai_target_kernel }}'.
+
+    - name: Confirm both ESPs are synced to the new pin
+      ansible.builtin.command: proxmox-boot-tool status
+      register: pve_ai_boot_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "pin before: {{ pve_ai_pin_before.stdout | trim | default('(none)', true) }}"
+          - "pin after:  {{ pve_ai_pin_after.stdout | trim }}"
+          - "boot status: {{ pve_ai_boot_status.stdout_lines }}"
+          - "Not rebooted. VM 100 (k8s-worker-2, onboot=1) restarts with the host on the next reboot."
