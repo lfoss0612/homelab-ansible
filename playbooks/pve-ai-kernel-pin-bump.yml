@@ -38,6 +38,14 @@
 # kernel nothing has verified yet, then a reboot silently booting it. Explicit
 # beats automatic here.
 #
+# IMPORTANT, learned the hard way: `proxmox-boot-tool kernel pin` alone is
+# NOT enough. It only rewrites the pin file and `kernel list`'s output -- it
+# does not resync the boot entries actually copied onto each ESP. The first
+# run of this playbook pinned correctly, but a subsequent reboot still came
+# back on the OLD kernel; only a manual `proxmox-boot-tool refresh`
+# afterward actually re-copied the kernels and recreated the ESP boot
+# entries. This playbook now always runs `refresh` after pinning.
+#
 # This playbook does NOT reboot.
 
 - name: Repin pve-ai's boot kernel
@@ -75,6 +83,25 @@
       when: pve_ai_pin_before.stdout | trim != pve_ai_target_kernel
       register: pve_ai_pin_result
 
+    - name: Resync bootloader entries on both ESPs
+      # `kernel pin` only rewrites /etc/kernel/proxmox-boot-pin and updates
+      # `kernel list` output -- it does NOT itself resync the boot entries
+      # proxmox-boot-tool copies onto each ESP. That resync normally happens
+      # as a side effect of a kernel install/removal's postinst/postrm hook;
+      # calling `kernel pin` directly, outside that path, skips it entirely.
+      #
+      # Verified 2026-08-29 the hard way: after pinning here and rebooting,
+      # the host still came back on the OLD kernel despite
+      # /etc/kernel/proxmox-boot-pin and `kernel list` both correctly
+      # showing the new one pinned. A manual `proxmox-boot-tool refresh`
+      # afterward visibly re-copied all three kernels and recreated boot
+      # entries on both ESPs (B349-0C55, B349-677E) -- proof the sync had
+      # never happened. Always run this, unconditionally, so ESP state can't
+      # silently drift from the pin file the way it just did.
+      ansible.builtin.command: proxmox-boot-tool refresh
+      register: pve_ai_refresh
+      changed_when: "'Copying kernel' in pve_ai_refresh.stdout"
+
     - name: Read the pin back
       ansible.builtin.command: cat /etc/kernel/proxmox-boot-pin
       register: pve_ai_pin_after
@@ -101,5 +128,6 @@
         msg:
           - "pin before: {{ pve_ai_pin_before.stdout | trim | default('(none)', true) }}"
           - "pin after:  {{ pve_ai_pin_after.stdout | trim }}"
+          - "ESP refresh: {{ 'ran, resynced boot entries' if pve_ai_refresh is changed else 'ran, already in sync' }}"
           - "boot status: {{ pve_ai_boot_status.stdout_lines }}"
           - "Not rebooted. VM 100 (k8s-worker-2, onboot=1) restarts with the host on the next reboot."
