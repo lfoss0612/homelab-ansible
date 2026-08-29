@@ -1,0 +1,257 @@
+---
+# Recreate k8s-master's orphaned "Kubernetes nodes by HTTP" objects from git.
+#
+# THE PROBLEM: 44 objects on k8s-master.home.lan exist in Zabbix but nowhere
+# else - one script master item (kube.nodes), 28 dependent item prototypes and
+# 15 trigger prototypes, all at templateid: 0. They are the entire Nodes page of
+# dashboard 403 and all node-level alerting (conditions, capacity/allocatable,
+# requests, limits, node info, uptime, addresses, the pressure/not-Ready
+# triggers). Nothing recreates them: "Kubernetes nodes by HTTP" is not linked to
+# the host, and the "Kubernetes cluster state by HTTP" template that owns their
+# discovery rule defines only 8 of the 36 prototypes on it. If this Zabbix host
+# were ever rebuilt, those 44 would simply not come back.
+#
+# Most likely how they got that way (inferred from the object shapes, not read
+# anywhere): "Kubernetes nodes by HTTP" was linked once and later unlinked
+# WITHOUT clearing, which leaves objects behind at templateid: 0 still working.
+# When cluster-state was linked, Zabbix adopted the same-key kube.node.discovery
+# rule into it and the nodes-template prototypes underneath stayed orphaned.
+#
+# WHAT THIS DOES NOT DO: it does not de-orphan anything. templateid is not
+# writable through the API - only template linkage sets it - so no
+# itemprototype.update re-parents these. Re-linking "Kubernetes nodes by HTTP"
+# is blocked too, because both templates define a rule keyed
+# kube.node.discovery and the host's rule already belongs to cluster-state.
+# This play makes the objects REPRODUCIBLE, not template-managed. That is the
+# achievable half.
+#
+# Definitions live in vars/zabbix-k8s-node-objects.json, captured from the live
+# server on 2026-08-29 (configuration.export is refused to the automation
+# token, so they were read back with item.get / itemprototype.get /
+# triggerprototype.get). The kube.nodes script body is a separate file,
+# playbooks/files/zabbix/kube-nodes-script.js, so it stays diffable.
+#
+# IDEMPOTENT: creates only what is missing, keyed on item key and on
+# (description, priority) for triggers. Against the current server every object
+# already exists, so a run reports 0 created and changes nothing.
+#
+# !! THE CREATE PATH IS UNTESTED !!  Every object it would create already
+# exists, and item.delete / itemprototype.delete are refused to this token - so
+# a test run that created something wrong could not be cleaned up through the
+# API. It is written to fail loudly on the first API error rather than continue.
+# The first real exercise of it will be a rebuild; check the summary at the end
+# and expect to fix something.
+#
+# NOT COVERED - both needed on a real rebuild, neither recoverable from here:
+#   - {$KUBE.API.TOKEN} is a secret macro. The API does not return its value,
+#     so it cannot live in this file. Supply it from the vault.
+#   - {$KUBE.NODES.ENDPOINT.NAME}, {$KUBE.POD.FILTER.*} and {$KUBE.NODE.FILTER.*}
+#     are referenced by the kube.nodes script parameters but are NOT defined on
+#     the host today - they came from the template that was unlinked. The item
+#     works anyway (the endpoint lookup silently finds nothing, which is why the
+#     {#ENDPOINT} macro and status.agent are empty). Left as-is deliberately:
+#     defining them now would change collection behaviour, which is a separate
+#     decision from making the objects reproducible.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-adopt-k8s-node-objects.yml --check --diff
+#   ansible-playbook playbooks/zabbix-adopt-k8s-node-objects.yml
+
+- name: Adopt k8s-master's orphaned Kubernetes node objects into git
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    k8s_host: "k8s-master.home.lan"
+    lld_key: "kube.node.discovery"
+    api_headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+
+  tasks:
+    # lookup()+from_json, NOT include_vars. Every key, description and
+    # expression in this data contains an LLD macro like {#NAME}, and "{#" opens
+    # a Jinja comment - include_vars' values get templated on use and die with
+    # "Missing end of comment tag". Lookup results come back marked unsafe, so
+    # they are never re-templated. Same reason zabbix-remove-orphan-pod-
+    # prototypes.yml uses !unsafe for its {#POD} literals. Verified both ways
+    # against the live server before choosing this one.
+    - name: Load the captured object definitions
+      ansible.builtin.set_fact:
+        zbx: "{{ lookup('file', playbook_dir ~ '/vars/zabbix-k8s-node-objects.json') | from_json }}"
+
+    - name: Load the kube.nodes script body
+      ansible.builtin.set_fact:
+        kube_nodes_script: "{{ lookup('file', playbook_dir ~ '/files/zabbix/kube-nodes-script.js') }}"
+
+    - name: Resolve the host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter: {host: ["{{ k8s_host }}"]}
+          id: 1
+      register: host_lookup
+      check_mode: false
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: Resolve the node discovery rule
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: discoveryrule.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ host_lookup.json.result[0].hostid }}"]
+            filter: {key_: ["{{ lld_key }}"]}
+          id: 1
+      register: rule_lookup
+      check_mode: false
+      failed_when: >-
+        rule_lookup.json.error is defined
+        or (rule_lookup.json.result | default([]) | length) != 1
+
+    - name: Set the resolved ids
+      ansible.builtin.set_fact:
+        hostid: "{{ host_lookup.json.result[0].hostid }}"
+        ruleid: "{{ rule_lookup.json.result[0].itemid }}"
+
+    # ---------------------------------------------------------------- master
+    - name: Look up the kube.nodes master item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ hostid }}"]
+            filter: {key_: ["{{ zbx.master_item.key_ }}"]}
+          id: 1
+      register: master_lookup
+      check_mode: false
+      failed_when: master_lookup.json.error is defined
+
+    - name: Create the kube.nodes master item when missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params: >-
+            {{ zbx.master_item
+               | combine({'hostid': hostid, 'params': kube_nodes_script}) }}
+          id: 1
+      register: master_create
+      when: (master_lookup.json.result | length) == 0
+      failed_when: master_create.json.error is defined
+      changed_when: master_create.json.result is defined
+
+    - name: Re-resolve the master item id
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ hostid }}"]
+            filter: {key_: ["{{ zbx.master_item.key_ }}"]}
+          id: 1
+      register: master_final
+      check_mode: false
+      failed_when: master_final.json.error is defined
+
+    # ------------------------------------------------------------ prototypes
+    # Two tiers: 5 prototypes hang off kube.nodes, 23 off kube.node.get[{#NAME}]
+    # which is itself one of the 5. Tier 1 must exist before tier 2 can name it
+    # as a master, so the id map is rebuilt between the two passes.
+    - name: Create the item prototypes, tier by tier
+      ansible.builtin.include_tasks: tasks/zabbix-node-prototype-tier.yml
+      # !unsafe for the same reason as above: a bare literal here is parsed as
+      # an unterminated Jinja comment.
+      loop:
+        - "{{ zbx.master_item.key_ }}"
+        - !unsafe "kube.node.get[{#NAME}]"
+      loop_control:
+        loop_var: tier_master_key
+
+    # -------------------------------------------------------------- triggers
+    - name: List existing trigger prototypes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.get
+          params:
+            output: ["triggerid", "description", "priority"]
+            discoveryids: ["{{ ruleid }}"]
+          id: 1
+      register: trig_existing
+      check_mode: false
+      failed_when: trig_existing.json.error is defined
+
+    - name: Create the missing trigger prototypes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: triggerprototype.create
+          params: >-
+            {{ item
+               | dict2items | rejectattr('key', 'in', ['dependencies'])
+               | rejectattr('value', 'eq', '') | items2dict
+               | combine({'expression': item.expression | replace('@@ZBX_HOST@@', k8s_host)})
+               | combine({'recovery_expression':
+                          item.recovery_expression | replace('@@ZBX_HOST@@', k8s_host)}
+                         if item.recovery_expression else {}) }}
+          id: 1
+      register: trig_create
+      loop: "{{ zbx.trigger_prototypes }}"
+      loop_control:
+        label: "{{ item.description }} (prio {{ item.priority }})"
+      when: >-
+        (trig_existing.json.result
+         | selectattr('description', 'eq', item.description)
+         | selectattr('priority', 'eq', item.priority) | list | length) == 0
+      failed_when: trig_create.json.error is defined
+      changed_when: trig_create.json.result is defined
+
+    - name: Report what was missing
+      ansible.builtin.debug:
+        msg: >-
+          host={{ k8s_host }} rule={{ ruleid }}.
+          master item {{ 'CREATED' if (master_lookup.json.result | length) == 0 else 'present' }};
+          trigger prototypes created:
+          {{ trig_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          of {{ zbx.trigger_prototypes | length }}.
+          Item prototype counts are reported by the per-tier tasks above.
+          A run against a healthy server should create nothing.

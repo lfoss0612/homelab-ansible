@@ -1,0 +1,1333 @@
+{
+  "_comment": "Captured from the live Zabbix server 2026-08-29 via item.get / itemprototype.get / triggerprototype.get, because configuration.export is refused to the automation token. JSON rather than YAML so the descriptions, expressions and preprocessing params round-trip without hand-rolled quoting. Regenerate with the same three calls; do not hand-edit.",
+  "_source_host": "k8s-master.home.lan",
+  "_discovery_rule_key": "kube.node.discovery",
+  "master_item": {
+    "name": "Get nodes",
+    "key_": "kube.nodes",
+    "type": "21",
+    "value_type": "4",
+    "delay": "0;s00",
+    "history": "0",
+    "trends": "0",
+    "timeout": "10s",
+    "description": "Collecting and processing cluster nodes data via Kubernetes API.",
+    "status": "0",
+    "parameters": [
+      {
+        "name": "endpoint_name",
+        "value": "{$KUBE.NODES.ENDPOINT.NAME}"
+      },
+      {
+        "name": "api_url",
+        "value": "{$KUBE.API.URL}"
+      },
+      {
+        "name": "api_token",
+        "value": "{$KUBE.API.TOKEN}"
+      },
+      {
+        "name": "pod_filter_labels",
+        "value": "{$KUBE.POD.FILTER.LABELS}"
+      },
+      {
+        "name": "pod_filter_annotations",
+        "value": "{$KUBE.POD.FILTER.ANNOTATIONS}"
+      },
+      {
+        "name": "node_filter_labels",
+        "value": "{$KUBE.NODE.FILTER.LABELS}"
+      },
+      {
+        "name": "node_filter_annotations",
+        "value": "{$KUBE.NODE.FILTER.ANNOTATIONS}"
+      },
+      {
+        "name": "http_proxy",
+        "value": "{$KUBE.HTTP.PROXY}"
+      }
+    ],
+    "tags": [
+      {
+        "tag": "component",
+        "value": "raw"
+      }
+    ]
+  },
+  "item_prototypes": [
+    {
+      "name": "Node [{#NAME}] Addresses: External IP",
+      "key_": "kube.node.addresses.external_ip[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Typically the IP address of the node that is externally routable (available from outside the cluster).",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.addresses[?(@.type == \"ExternalIP\")].address.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "addresses"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Addresses: Internal IP",
+      "key_": "kube.node.addresses.internal_ip[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Typically the IP address of the node that is routable only within the cluster.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.addresses[?(@.type == \"InternalIP\")].address.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "addresses"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Allocatable: CPU",
+      "key_": "kube.node.allocatable.cpu[{#NAME}]",
+      "type": "18",
+      "value_type": "0",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Allocatable CPU.\r\n\r\n'Allocatable' on a Kubernetes node is defined as the amount of compute resources that are available for pods. The scheduler does not over-subscribe 'Allocatable'. 'CPU', 'memory' and 'ephemeral-storage' are supported as of now.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.allocatable.cpu",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "allocatable"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Allocatable: Memory",
+      "key_": "kube.node.allocatable.memory[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "B",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Allocatable Memory.\r\n\r\n'Allocatable' on a Kubernetes node is defined as the amount of compute resources that are available for pods. The scheduler does not over-subscribe 'Allocatable'. 'CPU', 'memory' and 'ephemeral-storage' are supported as of now.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.allocatable.memory",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "allocatable"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Allocatable: Pods",
+      "key_": "kube.node.allocatable.pods[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.allocatable.pods",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "allocatable"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Capacity: CPU",
+      "key_": "kube.node.capacity.cpu[{#NAME}]",
+      "type": "18",
+      "value_type": "0",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "CPU resource capacity.\r\n\r\nhttps://kubernetes.io/docs/concepts/architecture/nodes/#capacity",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.capacity.cpu",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "capacity"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Capacity: Memory",
+      "key_": "kube.node.capacity.memory[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "B",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Memory resource capacity.\r\n\r\nhttps://kubernetes.io/docs/concepts/architecture/nodes/#capacity",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.capacity.memory",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "capacity"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Capacity: Pods",
+      "key_": "kube.node.capacity.pods[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.capacity.pods",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "capacity"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Conditions: Disk pressure",
+      "key_": "kube.node.conditions.diskpressure[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "True if pressure exists on the disk size - that is, if the disk capacity is low; otherwise False.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.conditions[?(@.type == \"DiskPressure\")].status.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "21",
+          "params": "return ['True', 'False', 'Unknown'].indexOf(value) + 1 || 'Problem with status processing in JS';",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "conditions"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Conditions: Memory pressure",
+      "key_": "kube.node.conditions.memorypressure[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "True if pressure exists on the node memory - that is, if the node memory is low; otherwise False.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.conditions[?(@.type == \"MemoryPressure\")].status.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "21",
+          "params": "return ['True', 'False', 'Unknown'].indexOf(value) + 1 || 'Problem with status processing in JS';",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "conditions"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Conditions: Network unavailable",
+      "key_": "kube.node.conditions.networkunavailable[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "True if the network for the node is not correctly configured, otherwise False.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.conditions[?(@.type == \"NetworkUnavailable\")].status.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "21",
+          "params": "return ['True', 'False', 'Unknown'].indexOf(value) + 1 || 'Problem with status processing in JS';",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "conditions"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Conditions: PID pressure",
+      "key_": "kube.node.conditions.pidpressure[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "True if pressure exists on the processes - that is, if there are too many processes on the node; otherwise False.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.conditions[?(@.type == \"PIDPressure\")].status.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "21",
+          "params": "return ['True', 'False', 'Unknown'].indexOf(value) + 1 || 'Problem with status processing in JS';",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "conditions"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Conditions: Ready",
+      "key_": "kube.node.conditions.ready[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "True if the node is healthy and ready to accept pods, False if the node is not healthy and is not accepting pods, and Unknown if the node controller has not heard from the node in the last node-monitor-grace-period (default is 40 seconds).",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.conditions[?(@.type == \"Ready\")].status.first()",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "21",
+          "params": "return ['True', 'False', 'Unknown'].indexOf(value) + 1 || 'Problem with status processing in JS';",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "conditions"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}]: Get data",
+      "key_": "kube.node.get[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "0",
+      "trends": "0",
+      "description": "Collecting and processing cluster by node [{#NAME}] data via Kubernetes API.",
+      "status": "0",
+      "master_key": "kube.nodes",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.nodes..[?(@.metadata.name == \"{#NAME}\")].first()",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "raw"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: Architecture",
+      "key_": "kube.node.info.architecture[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Node architecture.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.architecture",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: Container runtime",
+      "key_": "kube.node.info.containerruntime[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Container runtime.\r\n\r\nhttps://kubernetes.io/docs/setup/production-environment/container-runtimes/",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.containerRuntimeVersion",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: Kernel version",
+      "key_": "kube.node.info.kernelversion[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Node kernel version.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.kernelVersion",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: Kubelet version",
+      "key_": "kube.node.info.kubeletversion[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Version of Kubelet.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.kubeletVersion",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: KubeProxy version",
+      "key_": "kube.node.info.kubeproxyversion[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Version of KubeProxy.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.kubeProxyVersion",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: Operating system",
+      "key_": "kube.node.info.operatingsystem[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Node operating system.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.operatingSystem",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: OS image",
+      "key_": "kube.node.info.osversion[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Node OS image.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.nodeInfo.kernelVersion",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Info: Roles",
+      "key_": "kube.node.info.roles[{#NAME}]",
+      "type": "18",
+      "value_type": "1",
+      "units": "",
+      "history": "31d",
+      "trends": "0",
+      "description": "Node roles.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.roles",
+          "error_handler": "0",
+          "error_handler_params": ""
+        },
+        {
+          "type": "20",
+          "params": "3h",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "info"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Limits: CPU",
+      "key_": "kube.node.limits.cpu[{#NAME}]",
+      "type": "18",
+      "value_type": "0",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Node CPU limits.\r\n\r\nhttps://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+      "status": "0",
+      "master_key": "kube.nodes",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.Pods[?(@.hostname == \"{#NAME}\")].containers.limits.cpu.sum()",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "limits"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Limits: Memory",
+      "key_": "kube.node.limits.memory[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "B",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Node Memory limits.\r\n\r\nhttps://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+      "status": "0",
+      "master_key": "kube.nodes",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.Pods[?(@.hostname == \"{#NAME}\")].containers.limits.memory.sum()",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "limits"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Requests: CPU",
+      "key_": "kube.node.requests.cpu[{#NAME}]",
+      "type": "18",
+      "value_type": "0",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Node CPU requests.\r\n\r\nhttps://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+      "status": "0",
+      "master_key": "kube.nodes",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.Pods[?(@.hostname == \"{#NAME}\")].containers.requests.cpu.sum()",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "requests"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Requests: Memory",
+      "key_": "kube.node.requests.memory[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "B",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Node Memory requests.\r\n\r\nhttps://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+      "status": "0",
+      "master_key": "kube.nodes",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.Pods[?(@.hostname == \"{#NAME}\")].containers.requests.memory.sum()",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "requests"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Uptime",
+      "key_": "kube.node.uptime[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "s",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Node uptime.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.metadata.creationTimestamp",
+          "error_handler": "1",
+          "error_handler_params": ""
+        },
+        {
+          "type": "21",
+          "params": "return Math.floor((Date.now() - new Date(value)) / 1000);",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "uptime"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    },
+    {
+      "name": "Node [{#NAME}] Used: Pods",
+      "key_": "kube.node.used.pods[{#NAME}]",
+      "type": "18",
+      "value_type": "3",
+      "units": "",
+      "history": "31d",
+      "trends": "365d",
+      "description": "Current number of pods on the node.",
+      "status": "0",
+      "master_key": "kube.node.get[{#NAME}]",
+      "preprocessing": [
+        {
+          "type": "12",
+          "params": "$.status.podsCount",
+          "error_handler": "0",
+          "error_handler_params": ""
+        }
+      ],
+      "tags": [
+        {
+          "tag": "component",
+          "value": "used"
+        },
+        {
+          "tag": "node",
+          "value": "{#NAME}"
+        }
+      ]
+    }
+  ],
+  "trigger_prototypes": [
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Conditions: Is not in Ready state",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Conditions: Is not in Ready state (state: {ITEM.VALUE})",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.conditions.ready[{#NAME}])<>1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "",
+      "comments": "False - if the node is not healthy and is not accepting pods.\r\nUnknown - if the node controller has not heard from the node in the last node-monitor-grace-period (default is 40 seconds).",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "availability"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Conditions: Network is not correctly configured",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Conditions: Network is not correctly configured (state: {ITEM.VALUE})",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.conditions.networkunavailable[{#NAME}])=1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "",
+      "comments": "True - the network for the node is not correctly configured, otherwise False",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "availability"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Conditions: Pressure exists on the disk size",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Conditions: Pressure exists on the disk size (state: {ITEM.VALUE})",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.conditions.diskpressure[{#NAME}])=1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "",
+      "comments": "True - pressure exists on the disk size - that is, if the disk capacity is low; otherwise False.",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Conditions: Pressure exists on the node memory",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Conditions: Pressure exists on the node memory (state: {ITEM.VALUE})",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.conditions.memorypressure[{#NAME}])=1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "",
+      "comments": "True - pressure exists on the node memory - that is, if the node memory is low; otherwise False",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Conditions: Pressure exists on the processes",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Conditions: Pressure exists on the processes (state: {ITEM.VALUE})",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.conditions.pidpressure[{#NAME}])=1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "",
+      "comments": "True - pressure exists on the processes - that is, if there are too many processes on the node; otherwise False",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Limits: Total CPU limits are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Limits: Total CPU limits are too high (more than 90% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.limits.cpu[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.cpu[{#NAME}]) > 0.9",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Limits: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": [
+        {
+          "description": "Kubernetes nodes: Node [{#NAME}] Limits: Total CPU limits are too high",
+          "priority": "3"
+        }
+      ]
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Limits: Total CPU limits are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Limits: Total CPU limits are too high (more than 100% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.limits.cpu[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.cpu[{#NAME}]) > 1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "3",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Limits: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Limits: Total memory limits are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Limits: Total memory limits are too high (more than 90% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.limits.memory[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.memory[{#NAME}]) > 0.9",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Limits: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": [
+        {
+          "description": "Kubernetes nodes: Node [{#NAME}] Limits: Total memory limits are too high",
+          "priority": "3"
+        }
+      ]
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Limits: Total memory limits are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Limits: Total memory limits are too high (more than 100% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.limits.memory[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.memory[{#NAME}]) > 1",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "3",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Limits: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Requests: Total CPU requests are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Requests: Total CPU requests are too high (more than 50% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.requests.cpu[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.cpu[{#NAME}]) > 0.5",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Requests: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": [
+        {
+          "description": "Kubernetes nodes: Node [{#NAME}] Requests: Total CPU requests are too high",
+          "priority": "3"
+        }
+      ]
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Requests: Total CPU requests are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Requests: Total CPU requests are too high (more than 80% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.requests.cpu[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.cpu[{#NAME}]) > 0.8",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "3",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Requests: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Requests: Total memory requests are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Requests: Total memory requests are too high (more than 50% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.requests.memory[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.memory[{#NAME}]) > 0.5",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Requests: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": [
+        {
+          "description": "Kubernetes nodes: Node [{#NAME}] Requests: Total memory requests are too high",
+          "priority": "3"
+        }
+      ]
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Requests: Total memory requests are too high",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Requests: Total memory requests are too high (more than 80% of allocatable)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.requests.memory[{#NAME}]) / last(/@@ZBX_HOST@@/kube.node.allocatable.memory[{#NAME}]) > 0.8",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "3",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Requests: {ITEM.LASTVALUE1}, Allocatable: {ITEM.LASTVALUE2}",
+      "comments": "",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] Used: Kubelet too many pods",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] Used: Kubelet too many pods (more than 95% of capacity)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.used.pods[{#NAME}])/ last(/@@ZBX_HOST@@/kube.node.capacity.pods[{#NAME}]) > 0.9",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "2",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "Used: {ITEM.LASTVALUE1}, Capacity: {ITEM.LASTVALUE2}",
+      "comments": "Kubelet is running at capacity.",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "performance"
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "description": "Kubernetes nodes: Node [{#NAME}] has been restarted",
+      "event_name": "Kubernetes nodes: Node [{#NAME}] has been restarted (uptime < 10m)",
+      "expression": "last(/@@ZBX_HOST@@/kube.node.uptime[{#NAME}])<10",
+      "recovery_mode": "0",
+      "recovery_expression": "",
+      "priority": "1",
+      "status": "0",
+      "type": "0",
+      "manual_close": "0",
+      "opdata": "",
+      "comments": "Uptime is less than 10 minutes.",
+      "url": "",
+      "tags": [
+        {
+          "tag": "scope",
+          "value": "notice"
+        }
+      ],
+      "dependencies": []
+    }
+  ],
+  "_host_placeholder": "@@ZBX_HOST@@ in trigger expressions is replaced with the target host by the play."
+}

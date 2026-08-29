@@ -1,0 +1,76 @@
+---
+# One tier of the kube.node.* item prototypes. Included once per master key by
+# playbooks/zabbix-adopt-k8s-node-objects.yml, because the 23 prototypes that
+# depend on kube.node.get[{#NAME}] cannot be created until that prototype
+# exists and has an id. YAML anchors do not cross file boundaries, so the uri
+# parameters are spelled out here rather than reused from the parent play.
+
+- name: "Tier {{ tier_master_key }}: list existing item prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_url }}/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    headers: "{{ api_headers }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.get
+      params:
+        output: ["itemid", "key_"]
+        discoveryids: ["{{ ruleid }}"]
+      id: 1
+  register: tier_existing
+  check_mode: false
+  failed_when: tier_existing.json.error is defined
+
+- name: "Tier {{ tier_master_key }}: resolve this tier's master item id"
+  ansible.builtin.set_fact:
+    tier_master_id: >-
+      {{ (master_final.json.result | first).itemid
+         if tier_master_key == zbx.master_item.key_
+         else (tier_existing.json.result
+               | selectattr('key_', 'eq', tier_master_key)
+               | map(attribute='itemid') | first | default('')) }}
+
+- name: "Tier {{ tier_master_key }}: refuse to continue without a master id"
+  ansible.builtin.assert:
+    that:
+      - tier_master_id | length > 0
+    fail_msg: >-
+      Master item "{{ tier_master_key }}" does not exist on rule {{ ruleid }},
+      so the prototypes depending on it cannot be created. Under --check this is
+      expected when the master itself would have been created this run.
+  when: not (ansible_check_mode and tier_master_key != zbx.master_item.key_)
+
+- name: "Tier {{ tier_master_key }}: create the missing item prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_url }}/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    headers: "{{ api_headers }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.create
+      params: >-
+        {{ item
+           | dict2items | rejectattr('key', 'in', ['master_key']) | items2dict
+           | combine({'ruleid': ruleid,
+                      'hostid': hostid,
+                      'master_itemid': tier_master_id}) }}
+      id: 1
+  register: tier_create
+  loop: "{{ zbx.item_prototypes | selectattr('master_key', 'eq', tier_master_key) | list }}"
+  loop_control:
+    label: "{{ item.key_ }}"
+  when:
+    - (tier_existing.json.result | selectattr('key_', 'eq', item.key_) | list | length) == 0
+    - tier_master_id | length > 0
+  failed_when: tier_create.json.error is defined
+  changed_when: tier_create.json.result is defined
+
+- name: "Tier {{ tier_master_key }}: report"
+  ansible.builtin.debug:
+    msg: >-
+      {{ tier_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+      created of
+      {{ zbx.item_prototypes | selectattr('master_key', 'eq', tier_master_key) | list | length }}
+      prototypes depending on {{ tier_master_key }}.
