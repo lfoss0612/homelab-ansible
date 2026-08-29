@@ -1,0 +1,134 @@
+---
+# Move pve's "local display" GRUB entry to a newer, already-installed kernel.
+#
+# Usage:
+#   ansible-playbook playbooks/pve-local-display-kernel-bump.yml --check --diff
+#   ansible-playbook playbooks/pve-local-display-kernel-bump.yml
+#   ansible-playbook playbooks/pve-local-display-kernel-bump.yml -e pve_local_display_kernel=7.0.14-14-pve
+#
+# Background (2026-08-29): pve boots a custom GRUB entry, id `local-display`,
+# defined in /etc/grub.d/40_custom as "Proxmox VE (Local Display - no
+# passthrough)". It hardcodes a specific vmlinuz/initrd pair, which is why
+# rebooting pve during the fleet kernel update left it on 6.17.9-1-pve even
+# though 7.0.14-14-pve was installed and is proxmox-default-kernel's pick --
+# GRUB_DEFAULT=saved just replays whatever this custom --id last booted, and
+# this entry never referenced the new kernel at all.
+#
+# The entry is deliberate, not stale: it is the only boot path that OMITS
+# $GRUB_CMDLINE_LINUX_DEFAULT, which on this host is
+#   quiet amd_iommu=on iommu=pt pcie_acs_override=downstream,multifunction
+# Every auto-generated "Proxmox VE GNU/Linux" entry includes that IOMMU/ACS
+# tuning; this one exists specifically so the host can boot WITHOUT it, for
+# whatever local-display/GPU reason motivated "no passthrough" in the name.
+# No VM config currently sets hostpci and nothing is bound to vfio-pci, but
+# that is exactly why this playbook edits 40_custom in place rather than
+# switching pve to a standard GRUB_DEFAULT — the point is a newer kernel with
+# the SAME cmdline behavior, not a change to IOMMU/passthrough handling.
+#
+# This playbook does NOT reboot.
+
+- name: Bump the kernel behind pve's local-display GRUB entry
+  hosts: "{{ pve_local_display_hosts | default('pve.home.lan') }}"
+  become: true
+  vars:
+    pve_local_display_kernel: 7.0.14-14-pve
+
+  tasks:
+    - name: Confirm the target kernel and initrd are actually installed
+      ansible.builtin.stat:
+        path: "/boot/{{ item }}-{{ pve_local_display_kernel }}"
+      loop:
+        - vmlinuz
+        - initrd.img
+      register: pve_local_display_images
+
+    - name: Refuse to proceed if either is missing
+      ansible.builtin.assert:
+        that: pve_local_display_images.results | map(attribute='stat.exists') | list is all
+        fail_msg: >-
+          /boot is missing vmlinuz-{{ pve_local_display_kernel }} or
+          initrd.img-{{ pve_local_display_kernel }} on {{ inventory_hostname }}.
+          Refusing to point the local-display entry at a kernel that isn't
+          actually present.
+
+    - name: Read the boot partition UUID the existing entry searches for
+      # Preserved verbatim rather than hardcoded again here, so this playbook
+      # can't drift from whatever ESP/boot UUID this host actually has.
+      ansible.builtin.command:
+        cmd: grep -oP "search --no-floppy --fs-uuid --set=root \K\S+" /etc/grub.d/40_custom
+      register: pve_local_display_uuid
+      changed_when: false
+      check_mode: false
+
+    - name: Render the local-display entry against the new kernel
+      ansible.builtin.copy:
+        dest: /etc/grub.d/40_custom
+        mode: "0755"
+        owner: root
+        group: root
+        backup: true
+        content: |
+          #!/bin/sh
+          exec tail -n +3 $0
+          # This file provides an easy way to add custom menu entries.  Simply type the
+          # menu entries you want to add after this comment.  Be careful not to change
+          # the 'exec tail' line above.
+          menuentry 'Proxmox VE (Local Display - no passthrough)' --class proxmox --class gnu-linux --class gnu --class os --id local-display {
+                  load_video
+                  insmod gzio
+                  insmod part_gpt
+                  insmod fat
+                  search --no-floppy --fs-uuid --set=root {{ pve_local_display_uuid.stdout }}
+                  echo    'Loading Linux {{ pve_local_display_kernel }} (local display mode)...'
+                  linux   /vmlinuz-{{ pve_local_display_kernel }} root=ZFS=/ROOT/pve-1 ro root=ZFS=rpool/ROOT/pve-1 boot=zfs quiet
+                  echo    'Loading initial ramdisk ...'
+                  initrd  /initrd.img-{{ pve_local_display_kernel }}
+          }
+      register: pve_local_display_render
+
+    - name: Regenerate grub.cfg
+      # update-grub has no check-mode support, so under --check this only
+      # ever reports "Command would have run if not in check mode" -- that is
+      # expected, not a sign the templating above didn't take.
+      ansible.builtin.command: update-grub
+      when: pve_local_display_render is changed
+      register: pve_local_display_update
+      changed_when: "'done' in pve_local_display_update.stdout | lower or pve_local_display_update.rc == 0"
+
+    - name: Verify grub.cfg now boots the target kernel from this entry
+      ansible.builtin.command:
+        cmd: >-
+          awk '/--id local-display/,/^}/' /boot/grub/grub.cfg
+      register: pve_local_display_cfg
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Assert the rendered entry matches (skipped under --check)
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that:
+          - "('vmlinuz-' ~ pve_local_display_kernel) in pve_local_display_cfg.stdout"
+          - "('initrd.img-' ~ pve_local_display_kernel) in pve_local_display_cfg.stdout"
+        fail_msg: >-
+          grub.cfg's local-display entry does not reference
+          {{ pve_local_display_kernel }} after update-grub. Got:
+          {{ pve_local_display_cfg.stdout }}
+
+    - name: Confirm the saved boot entry is still local-display
+      # GRUB_DEFAULT=saved replays whatever --id was last booted; regenerating
+      # grub.cfg does not change grubenv, so this should read unchanged.
+      ansible.builtin.command: grub-editenv list
+      register: pve_local_display_env
+      changed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "target kernel: {{ pve_local_display_kernel }}"
+          - "grubenv: {{ pve_local_display_env.stdout }}"
+          - >-
+            {{ 'Next boot will use ' ~ pve_local_display_kernel ~ ' in local-display mode.'
+               if 'local-display' in pve_local_display_env.stdout
+               else 'WARNING: saved_entry is not local-display -- next boot will not use this entry at all.' }}
