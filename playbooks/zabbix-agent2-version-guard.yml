@@ -102,6 +102,12 @@
           before this play touches anything here; do not let it silently downgrade.
         success_msg: "{{ inventory_hostname }}: installed {{ installed_version }} is not ahead of the server."
 
+    - name: Release the hold where the candidate no longer exceeds the server
+      ansible.builtin.dpkg_selections:
+        name: zabbix-agent2
+        selection: install
+      when: not (candidate_version is version(zabbix_server_version, '>'))
+
     - name: Report hosts with nothing at risk (candidate can't exceed the server anyway)
       ansible.builtin.debug:
         msg: >-
