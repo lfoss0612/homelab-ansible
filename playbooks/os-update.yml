@@ -31,10 +31,12 @@
 - name: Apply pending OS upgrades
   hosts: >-
     {{ os_update_hosts | default(
-         'all:!api_managed:!pve-router.home.lan:!k8s-worker-2.home.lan') }}
+         'all:!api_managed:!pve-router.home.lan:!k8s-worker-2.home.lan'
+         ':!cockpit.home.lan') }}
   become: true
   # Batch rather than all-at-once so a bad upgrade can't take the whole fleet
-  # down before anyone notices. cockpit is deliberately NOT in this play.
+  # down before anyone notices. cockpit is deliberately NOT in this play — it
+  # is subtracted above and handled by the trailing play instead.
   serial: "{{ os_update_serial | default(4) }}"
 
   tasks:
