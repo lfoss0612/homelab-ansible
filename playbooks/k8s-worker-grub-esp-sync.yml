@@ -134,5 +134,5 @@
         msg:
           - "{{ k8s_worker_grub_kernels.stdout_lines }}"
           - "ESP grub.cfg default entry now: {{ k8s_worker_grub_verify.stdout | trim }}"
-          - "Sync hook installed: {{ k8s_worker_grub_hook.results | map(attribute='dest') | list }}"
+          - "Sync hook installed: {{ k8s_worker_grub_hook.results | map(attribute='item') | list }}"
           - "Not rebooted -- verify with a reboot when ready."
