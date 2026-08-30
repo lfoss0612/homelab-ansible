@@ -83,13 +83,17 @@
       ansible.builtin.meta: flush_handlers
 
     - name: Run an initial check
+      # Depends on the script actually being on disk, which --check only
+      # simulates -- the copy task above never really writes it in a dry run,
+      # so this can't run for real either without producing a false failure.
       ansible.builtin.command: /usr/local/bin/os-update-status {{ item }}
       loop: [pending, reboot]
+      when: not ansible_check_mode
       register: os_update_status_check
       changed_when: false
-      check_mode: false
 
     - name: Show the initial results
+      when: not ansible_check_mode
       ansible.builtin.debug:
         msg: >-
           pending={{ os_update_status_check.results[0].stdout }}
