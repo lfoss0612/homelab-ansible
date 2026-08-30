@@ -1,0 +1,118 @@
+---
+# Repin pve-router's boot kernel from 6.17.9-1-pve to 7.0.14-14-pve.
+#
+# Usage:
+#   ansible-playbook playbooks/pve-router-kernel-pin-bump.yml --check --diff
+#   ansible-playbook playbooks/pve-router-kernel-pin-bump.yml
+#
+# Background (2026-08-30): pve-router's host kernel is pinned via
+# `/etc/kernel/proxmox-boot-pin` at 6.17.9-1-pve, the same undocumented-origin
+# pin already found on pve-ai (see playbooks/pve-ai-kernel-pin-bump.yml) --
+# neither homelab-ansible nor homelab-vault records why either was set.
+# Unlike pve-ai there is no GPU passthrough here to reason about, and unlike
+# pve there is no custom GRUB entry (`grep -c '^menuentry' /etc/grub.d/40_custom`
+# is 0, `GRUB_DEFAULT=0`) -- this is a plain proxmox-boot-tool pin, structurally
+# identical to pve-ai's case, so the same fix applies directly.
+#
+# One structural difference worth knowing: `proxmox-boot-tool status` lists
+# only ONE ESP here (pve/pve-ai each have two, mirrored). Language below says
+# "its ESP", not "both ESPs".
+#
+# Pins to a SPECIFIC version rather than unpinning outright, on purpose: an
+# unpinned host reverts to "boot newest kernel" (GRUB_DEFAULT=0), which is
+# exactly the trap that bit k8s-worker-2's GUEST kernel and, differently,
+# k8s-worker's stale ESP grub.cfg (homelab-vault TODO.md) -- unattended
+# upgrades installing a kernel nothing has verified yet, then a reboot
+# silently booting it. Explicit beats automatic here, especially on the host
+# that carries 3 of the cluster's 5 corosync votes and hosts the OPNsense VM
+# for the whole house network.
+#
+# IMPORTANT, learned on pve-ai and confirmed to apply here too:
+# `proxmox-boot-tool kernel pin` alone is NOT enough. It only rewrites the pin
+# file and `kernel list`'s output -- it does not resync the boot entries
+# proxmox-boot-tool copies onto the ESP. This playbook always runs
+# `proxmox-boot-tool refresh` after pinning, unconditionally, so that gap
+# can't repeat itself here.
+#
+# This playbook does NOT reboot.
+
+- name: Repin pve-router's boot kernel
+  hosts: "{{ pve_router_kernel_hosts | default('pve-router.home.lan') }}"
+  become: true
+  vars:
+    pve_router_target_kernel: 7.0.14-14-pve
+
+  tasks:
+    - name: Confirm the target kernel and initrd are actually installed
+      ansible.builtin.stat:
+        path: "/boot/{{ item }}-{{ pve_router_target_kernel }}"
+      loop:
+        - vmlinuz
+        - initrd.img
+      register: pve_router_kernel_images
+
+    - name: Refuse to proceed if either is missing
+      ansible.builtin.assert:
+        that: pve_router_kernel_images.results | map(attribute='stat.exists') | list is all
+        fail_msg: >-
+          /boot is missing vmlinuz-{{ pve_router_target_kernel }} or
+          initrd.img-{{ pve_router_target_kernel }} on {{ inventory_hostname }}.
+          Refusing to pin a kernel that isn't actually present.
+
+    - name: Read the current pin
+      ansible.builtin.command: cat /etc/kernel/proxmox-boot-pin
+      register: pve_router_pin_before
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Pin the target kernel
+      ansible.builtin.command: "proxmox-boot-tool kernel pin {{ pve_router_target_kernel }}"
+      when: pve_router_pin_before.stdout | trim != pve_router_target_kernel
+      register: pve_router_pin_result
+
+    - name: Resync bootloader entries on the ESP
+      # `kernel pin` only rewrites /etc/kernel/proxmox-boot-pin and updates
+      # `kernel list` output -- it does not itself resync the boot entries
+      # proxmox-boot-tool copies onto the ESP. That resync normally happens
+      # as a side effect of a kernel install/removal's postinst/postrm hook;
+      # calling `kernel pin` directly, outside that path, skips it entirely.
+      # Confirmed on pve-ai the hard way: pinning without this left the host
+      # booting the OLD kernel anyway. Always run this, unconditionally.
+      ansible.builtin.command: proxmox-boot-tool refresh
+      register: pve_router_refresh
+      changed_when: "'Copying kernel' in pve_router_refresh.stdout"
+
+    - name: Read the pin back
+      ansible.builtin.command: cat /etc/kernel/proxmox-boot-pin
+      register: pve_router_pin_after
+      changed_when: false
+      check_mode: false
+
+    - name: Verify the pin took (skipped under --check)
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that: pve_router_pin_after.stdout | trim == pve_router_target_kernel
+        fail_msg: >-
+          proxmox-boot-tool reports pin '{{ pve_router_pin_after.stdout | trim }}',
+          expected '{{ pve_router_target_kernel }}'.
+
+    - name: Confirm the ESP is synced to the new pin
+      ansible.builtin.command: proxmox-boot-tool status
+      register: pve_router_boot_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "pin before: {{ pve_router_pin_before.stdout | trim | default('(none)', true) }}"
+          - "pin after:  {{ pve_router_pin_after.stdout | trim }}"
+          - "ESP refresh: {{ 'ran, resynced boot entries' if pve_router_refresh is changed else 'ran, already in sync' }}"
+          - "boot status: {{ pve_router_boot_status.stdout_lines }}"
+          - >-
+            Not rebooted. VM 101 (zabbix), VM 106 (OPNsense), CT 107 (cockpit)
+            and CT 108 (pdm) all restart with the host on the next reboot --
+            cockpit included, so that reboot severs the SSH/Ansible path this
+            playbook itself runs through.
