@@ -141,15 +141,42 @@
       # dependencies, not a useful preview -- the repair has to happen first
       # so the simulate step (and the real install after it) run against a
       # clean baseline, exactly like a first-ever run would see.
-      ansible.builtin.apt:
-        name:
-          - libnvidia-egl-xcb1
-          - libnvidia-egl-xlib1
-        state: absent
+      #
+      # Uses `dpkg --remove` directly, NOT the `apt` module (`apt-get
+      # remove`): once the host is in this broken state, `apt-get remove`
+      # itself refuses to run at all -- "E: Unmet dependencies" blocks any
+      # apt-level transaction system-wide, even one unrelated to the broken
+      # packages, unless you pass --fix-broken. dpkg has no such whole-system
+      # check; it only verifies nothing installed depends on the package
+      # being removed, which is exactly the property already confirmed via
+      # `apt-cache rdepends --installed` for both packages.
+      ansible.builtin.command: "dpkg --remove {{ item }}"
+      loop:
+        - libnvidia-egl-xcb1
+        - libnvidia-egl-xlib1
+      register: nvidia_latest_egl_removal
+      changed_when: "'Removing' in nvidia_latest_egl_removal.stdout"
+      failed_when: >-
+        nvidia_latest_egl_removal.rc != 0
+        and 'not installed' not in nvidia_latest_egl_removal.stderr
 
-    - name: Finish configuring anything left half-unpacked by a prior failed attempt
-      # No-op on a clean host; repairs the exact state above if this
-      # playbook previously failed mid-transaction.
+    - name: Resolve the broken dependency state left by the earlier failed unpack
+      # Removing the two orphans above clears the FILE conflict, but
+      # libnvidia-gl-610 itself is still "not-installed" (its unpack failed
+      # outright, it never even got to half-installed) and
+      # nvidia-driver-610-open/nvidia-dkms-610-open are stuck "unpacked" but
+      # unconfigured. `apt --fix-broken install` is apt's explicit repair
+      # entrypoint for exactly this -- it re-attempts the failed unpack (now
+      # unobstructed) and configures everything left pending, including
+      # triggering the dkms build via nvidia-driver-610-open's postinst.
+      ansible.builtin.command: apt-get install -f -y
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: nvidia_latest_fix_broken
+      changed_when: "'Setting up' in nvidia_latest_fix_broken.stdout"
+
+    - name: Finish configuring anything still left half-unpacked
+      # Safety net; should be a no-op after the fix-broken install above.
       ansible.builtin.command: dpkg --configure -a
       register: nvidia_latest_dpkg_configure
       changed_when: "'Setting up' in nvidia_latest_dpkg_configure.stdout"
