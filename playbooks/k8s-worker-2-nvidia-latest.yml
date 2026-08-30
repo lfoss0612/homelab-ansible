@@ -112,19 +112,28 @@
       changed_when: false
       check_mode: false
 
+    - name: Compute which removals (if any) fall outside the expected list
+      # Precomputed once into a fact rather than repeated inline in the
+      # assert's `that` and `fail_msg` -- an earlier version duplicated this
+      # filter chain in both places and the two somehow evaluated
+      # differently (assert saw a non-empty list, fail_msg rendered empty),
+      # which pointed at a YAML folded-scalar/Jinja quirk rather than a real
+      # dependency shift. A single fact removes the chance of the two
+      # diverging again.
+      ansible.builtin.set_fact:
+        nvidia_latest_unexpected_removals: >-
+          {{ nvidia_latest_sim.stdout_lines
+             | select('match', '^Remv ')
+             | map('regex_replace', '^Remv (\S+).*', '\1')
+             | reject('in', nvidia_latest_expected_removals)
+             | list }}
+
     - name: Refuse to proceed if anything outside the expected list would be removed
       ansible.builtin.assert:
-        that: >-
-          (nvidia_latest_sim.stdout_lines
-           | select('match', '^Remv ')
-           | map('regex_replace', '^Remv (\S+).*', '\1')
-           | reject('in', nvidia_latest_expected_removals)
-           | list) | length == 0
+        that: nvidia_latest_unexpected_removals | length == 0
         fail_msg: >-
           Simulation would remove packages NOT on the expected list:
-          {{ nvidia_latest_sim.stdout_lines | select('match', '^Remv ')
-             | map('regex_replace', '^Remv (\S+).*', '\1')
-             | reject('in', nvidia_latest_expected_removals) | list | join(', ') }}.
+          {{ nvidia_latest_unexpected_removals | join(', ') }}.
           Refusing -- dependency resolution has shifted since this playbook
           was written; re-verify before proceeding.
 
