@@ -1,0 +1,191 @@
+---
+# Bump k8s-worker-2 to the latest available NVIDIA driver branch (610) and
+# CUDA toolkit (13.3).
+#
+# Usage:
+#   ansible-playbook playbooks/k8s-worker-2-nvidia-latest.yml --check --diff
+#   ansible-playbook playbooks/k8s-worker-2-nvidia-latest.yml
+#
+# Background (2026-08-29): playbooks/fix-k8s-worker-2-nvidia.yml got this
+# host from a driver-less kernel back to a working 580.178.04. This playbook
+# goes further, to the newest driver branch (610) and CUDA toolkit (13.3)
+# actually installable today.
+#
+# Two things worth understanding before running this:
+#
+# 1. NVIDIA's `cuda-drivers` tracking meta-package is currently BROKEN for
+#    the 610 branch. It demands `nvidia-driver >= 610.57.04`, but no repo --
+#    not even NVIDIA's own CUDA repo -- actually publishes concrete 610.57.04
+#    packages yet (apt: "some required packages have not yet been created or
+#    been moved out of Incoming"). The only place 610-branch packages exist
+#    at all right now is Ubuntu's OWN archive (noble-updates/noble-security,
+#    multiverse), at 610.43.02 -- a different version, from a different repo,
+#    with different package versioning ("-0ubuntu0.24.04.1" vs the CUDA
+#    repo's "-1ubuntu1" scheme). `cuda-drivers` can't be satisfied by either
+#    version, so it (and `cuda-drivers-580`, `cuda-13-0`, `cuda-runtime-13-0`)
+#    get REMOVED as an unavoidable side effect of moving branches. This is
+#    the same cross-repo version-scheme clash documented in
+#    fix-k8s-worker-2-nvidia.yml, resurfacing one branch further up.
+#    Functionally nothing is lost -- the driver, dkms module, and utilities
+#    all install fine under their explicit `*-610` names -- only the generic
+#    bookkeeping meta-package goes away.
+# 2. CUDA toolkit 13.3 (`cuda-toolkit-13-3`) is fully decoupled from the
+#    driver at the apt level (Depends only on other cuda-toolkit-13-3-*
+#    packages) and installs standalone with zero removals regardless of
+#    driver branch.
+#
+# Simulated 2026-08-29: driver 610.43.02 (pinned explicitly, bypassing the
+# broken `cuda-drivers`/`nvidia-open` meta packages) + cuda-toolkit-13-3
+# together resolve with exactly 17 removals, all superseded 580-branch
+# packages -- see pve_ai_610_expected_removals below. Nothing outside that
+# list.
+#
+# This playbook installs packages but does NOT force-reload the kernel
+# module and does NOT reboot. The currently loaded nvidia 580 module stays
+# resident and serving traffic (this host runs live LiteLLM/Ollama workloads
+# against the GPU) until a reboot activates the new module -- switching it
+# live would mean unloading a module that's actively in use. Report at the
+# end makes clear whether the installed module matches the loaded one.
+
+- name: Bump k8s-worker-2 to the latest NVIDIA driver and CUDA toolkit
+  hosts: "{{ nvidia_latest_hosts | default('k8s-worker-2.home.lan') }}"
+  become: true
+  vars:
+    nvidia_latest_driver_pkg: nvidia-driver-610-open
+    nvidia_latest_driver_version: 610.43.02-0ubuntu0.24.04.1
+    nvidia_latest_toolkit_pkg: cuda-toolkit-13-3
+    # Packages this branch bump is known to remove -- confirmed by
+    # simulation before writing this playbook. Anything removed OUTSIDE this
+    # list means the dependency resolution shifted since, and the playbook
+    # should stop rather than proceed blind.
+    nvidia_latest_expected_removals:
+      - cuda-13-0
+      - cuda-drivers
+      - cuda-drivers-580
+      - cuda-runtime-13-0
+      - nvidia-driver-580-open
+      - xserver-xorg-video-nvidia-580
+      - libnvidia-encode-580
+      - libnvidia-gl-580
+      - libnvidia-compute-580
+      - libnvidia-decode-580
+      - nvidia-persistenced
+      - libnvidia-cfg1-580
+      - libnvidia-egl-gbm1
+      - libnvidia-fbc1-580
+      - nvidia-dkms-580-open
+      - nvidia-kernel-common-580
+      - nvidia-kernel-source-580-open
+
+  tasks:
+    - name: Record the running kernel
+      ansible.builtin.command: uname -r
+      register: nvidia_latest_kernel
+      changed_when: false
+      check_mode: false
+
+    - name: Record what currently uses the GPU
+      # Informational only. This host actively serves LiteLLM/Ollama; a
+      # busy GPU right now is a reason to pick a quieter moment, not a
+      # reason for this playbook to behave differently.
+      ansible.builtin.command:
+        cmd: nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader
+      register: nvidia_latest_gpu_users
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Simulate the combined driver + toolkit install
+      ansible.builtin.command:
+        cmd: >-
+          apt-get -s -o Debug::NoLocking=1 install
+          {{ nvidia_latest_driver_pkg }}={{ nvidia_latest_driver_version }}
+          {{ nvidia_latest_toolkit_pkg }}
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: nvidia_latest_sim
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to proceed if anything outside the expected list would be removed
+      ansible.builtin.assert:
+        that: >-
+          (nvidia_latest_sim.stdout_lines
+           | select('match', '^Remv ')
+           | map('regex_replace', '^Remv (\S+).*', '\1')
+           | reject('in', nvidia_latest_expected_removals)
+           | list) | length == 0
+        fail_msg: >-
+          Simulation would remove packages NOT on the expected list:
+          {{ nvidia_latest_sim.stdout_lines | select('match', '^Remv ')
+             | map('regex_replace', '^Remv (\S+).*', '\1')
+             | reject('in', nvidia_latest_expected_removals) | list | join(', ') }}.
+          Refusing -- dependency resolution has shifted since this playbook
+          was written; re-verify before proceeding.
+
+    - name: Install the driver and CUDA toolkit
+      ansible.builtin.apt:
+        name:
+          - "{{ nvidia_latest_driver_pkg }}={{ nvidia_latest_driver_version }}"
+          - "{{ nvidia_latest_toolkit_pkg }}"
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: nvidia_latest_install
+
+    - name: Verify dpkg is clean
+      ansible.builtin.command: dpkg --audit
+      register: nvidia_latest_audit
+      changed_when: false
+      check_mode: false
+      failed_when: nvidia_latest_audit.stdout | trim != ''
+
+    - name: Read dkms state
+      ansible.builtin.command: dkms status
+      register: nvidia_latest_dkms
+      changed_when: false
+      check_mode: false
+
+    - name: Require a 610 dkms build for the RUNNING kernel
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that: >-
+          nvidia_latest_dkms.stdout_lines
+          | select('search', nvidia_latest_kernel.stdout | trim)
+          | select('search', 'installed')
+          | select('search', '610')
+          | list | length > 0
+        fail_msg: >-
+          No 610-branch dkms build for {{ nvidia_latest_kernel.stdout | trim }}
+          after install. dkms status: {{ nvidia_latest_dkms.stdout | trim }}.
+
+    - name: Check which module is actually loaded right now
+      # Package install alone does not swap the live module out from under
+      # running GPU workloads -- confirm what's actually resident.
+      ansible.builtin.command:
+        cmd: modinfo -F version nvidia
+      register: nvidia_latest_loaded_version
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "kernel:        {{ nvidia_latest_kernel.stdout | trim }}"
+          - "GPU users before: {{ nvidia_latest_gpu_users.stdout | trim | default('(none)', true) }}"
+          - "dkms 610 build: {{ nvidia_latest_dkms.stdout_lines | select('search', nvidia_latest_kernel.stdout | trim) | select('search', '610') | join('; ') | default('none', true) }}"
+          - "on-disk module target: 610.43.02 | currently loaded (modinfo): {{ nvidia_latest_loaded_version.stdout | trim | default('unknown', true) }}"
+          - >-
+            {{ 'Loaded module still reports the OLD branch -- expected. A
+                reboot (or a controlled module reload during a maintenance
+                window, given active GPU workloads) is required to actually
+                activate 610.43.02.'
+               if '610' not in nvidia_latest_loaded_version.stdout
+               else 'Loaded module already reports 610 -- unexpected without a
+                     reboot, worth double-checking nvidia-smi.' }}
