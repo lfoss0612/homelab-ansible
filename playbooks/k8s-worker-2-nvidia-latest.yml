@@ -280,6 +280,7 @@
       # Evicting proactively here, before attempting the unload, rather than
       # requiring someone to notice the failure and do this by hand.
       delegate_to: k8s-master.home.lan
+      when: not ansible_check_mode
       environment:
         KUBECONFIG: /etc/rancher/rke2/rke2.yaml
       ansible.builtin.shell: >-
@@ -290,7 +291,6 @@
       register: nvidia_latest_evict
       changed_when: "'deleted' in nvidia_latest_evict.stdout"
       failed_when: false
-      check_mode: false
 
     - name: Give kubelet a moment to finish tearing the evicted containers down
       ansible.builtin.pause:
