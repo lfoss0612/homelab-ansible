@@ -71,7 +71,14 @@
         group_lookup.json.error is defined
         or (group_lookup.json.result | default([]) | length) != 1
 
-    - name: List every host in that group
+    - name: List every host in that group, with its agent interface
+      # selectInterfaces rather than a separate hostinterface.get call: this
+      # API token's role has no permission for that method ("No permissions
+      # to call hostinterface.get", confirmed live), but the same interface
+      # data is reachable as part of the already-permitted host.get output.
+      # interfaceid is mandatory on item.create for type=0 (Zabbix agent,
+      # passive) items -- discovered the hard way, first real run failed
+      # every single item with "the parameter interfaceid is missing".
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
@@ -83,6 +90,7 @@
           method: host.get
           params:
             output: ["hostid", "host"]
+            selectInterfaces: ["interfaceid", "type", "main"]
             groupids: ["{{ group_lookup.json.result[0].groupid }}"]
           id: 1
       register: hosts_lookup
@@ -124,6 +132,15 @@
             name: "{{ reboot_item_name }}"
             key_: "{{ reboot_item_key }}"
             type: 0          # Zabbix agent (passive) -- matches ZBX_PASSIVE_ALLOW=true
+            # Mandatory for a passive item, discovered the hard way: the
+            # first real run failed every host with "the parameter
+            # interfaceid is missing". Resolved via host.get's
+            # selectInterfaces above, since this token's role has no
+            # permission for the more obvious hostinterface.get.
+            interfaceid: >-
+              {{ item.interfaces | selectattr('type', 'equalto', '1')
+                 | selectattr('main', 'equalto', '1')
+                 | map(attribute='interfaceid') | list | first }}
             value_type: 3    # unsigned int
             delay: 1h
             description: >-
@@ -176,6 +193,10 @@
             name: "{{ pending_item_name }}"
             key_: "{{ pending_item_key }}"
             type: 0
+            interfaceid: >-
+              {{ item.interfaces | selectattr('type', 'equalto', '1')
+                 | selectattr('main', 'equalto', '1')
+                 | map(attribute='interfaceid') | list | first }}
             value_type: 3
             delay: 1h
             description: >-
