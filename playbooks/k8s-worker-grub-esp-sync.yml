@@ -1,0 +1,138 @@
+---
+# Fix k8s-worker's stale ESP grub.cfg and stop it from recurring.
+#
+# Usage:
+#   ansible-playbook playbooks/k8s-worker-grub-esp-sync.yml --check --diff
+#   ansible-playbook playbooks/k8s-worker-grub-esp-sync.yml
+#
+# Background (2026-08-30): k8s-worker rebooted (it's a guest VM on pve,
+# cycled by pve's own kernel-update reboot that day) but stayed on
+# 6.8.0-79-generic despite linux-image-6.8.0-85-generic being installed.
+#
+# Root cause, verified by actually READING the file content, not just
+# grepping for a kernel version and trusting a 0 match: this host is UEFI,
+# and the ESP's OWN grub.cfg (`/boot/efi/EFI/ubuntu/grub.cfg`) is a full,
+# standalone grub-mkconfig render -- not a small stub that configfile-
+# redirects to /boot/grub/grub.cfg, which would be the normal, simpler
+# Ubuntu layout. `efibootmgr` confirms firmware boots Boot0001 ->
+# \EFI\ubuntu\shimx64.efi on the ESP, i.e. THIS is the config that matters,
+# and it was last regenerated 2025-09-07 -- it still lists 6.8.0-79-generic
+# and 6.8.0-78-generic only. Meanwhile /boot/grub/grub.cfg on the root
+# filesystem IS current (correctly lists 6.8.0-85-generic), because the
+# kernel postinst hook `/etc/kernel/postinst.d/zz-update-grub` calls plain
+# `update-grub` (== `grub-mkconfig -o /boot/grub/grub.cfg`), which has no
+# knowledge of the ESP's separate copy at all. Nothing on this host has ever
+# kept the two in sync since whatever process first rendered the ESP's copy
+# in September 2025 -- every kernel installed since has updated the root
+# filesystem's config only, so this was silently getting worse on every
+# kernel bump, not something that just happened to break today.
+#
+# This is a THIRD distinct "kernel installed but the boot config didn't
+# follow" pattern found in the same 24h window (after pve's custom
+# local-display GRUB entry and pve-ai's proxmox-boot-tool pin -- see
+# playbooks/pve-local-display-kernel-bump.yml and
+# playbooks/pve-ai-kernel-pin-bump.yml), with yet another different root
+# cause. No single fix covers all three.
+#
+# Fixes it two ways:
+#   1. Regenerates /boot/efi/EFI/ubuntu/grub.cfg directly, right now.
+#   2. Installs a second kernel postinst/postrm hook
+#      (zz-update-grub-esp, named to sort immediately after zz-update-grub
+#      so it runs right after the root filesystem's config is fresh) that
+#      mirrors zz-update-grub's exact guard logic but targets the ESP path,
+#      so a future kernel install/removal keeps both in sync automatically
+#      instead of drifting again the way this one did for ~11 months.
+#
+# This playbook does NOT reboot.
+
+- name: Fix k8s-worker's ESP grub.cfg and keep it synced going forward
+  hosts: "{{ k8s_worker_grub_hosts | default('k8s-worker.home.lan') }}"
+  become: true
+  vars:
+    esp_grub_cfg: /boot/efi/EFI/ubuntu/grub.cfg
+
+  tasks:
+    - name: Record the running and newest-installed kernel
+      ansible.builtin.shell:
+        cmd: |
+          echo "running=$(uname -r)"
+          echo "newest=$(ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -1)"
+      register: k8s_worker_grub_kernels
+      changed_when: false
+      check_mode: false
+
+    - name: Regenerate the ESP grub.cfg
+      ansible.builtin.command: "grub-mkconfig -o {{ esp_grub_cfg }}"
+      register: k8s_worker_grub_regen
+      changed_when: "'done' in k8s_worker_grub_regen.stderr | lower or k8s_worker_grub_regen.rc == 0"
+
+    - name: Read back the ESP grub.cfg's default entry
+      ansible.builtin.shell:
+        cmd: "awk '/BEGIN .etc.grub.d.10_linux/,/END .etc.grub.d.10_linux/' {{ esp_grub_cfg }} | grep -m1 '^\tlinux'"
+      register: k8s_worker_grub_verify
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Assert the ESP now boots the newest installed kernel (skipped under --check)
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that: >-
+          (k8s_worker_grub_kernels.stdout_lines
+           | select('match', '^newest=')
+           | first | regex_replace('^newest=', ''))
+          in k8s_worker_grub_verify.stdout
+        fail_msg: >-
+          ESP grub.cfg's default entry is
+          '{{ k8s_worker_grub_verify.stdout | trim }}', which does not
+          reference the newest installed kernel
+          ({{ k8s_worker_grub_kernels.stdout_lines | select('match', '^newest=') | first }}).
+          Regeneration did not take effect as expected.
+
+    - name: Install the ESP-sync kernel hook
+      # Named to sort right after zz-update-grub (run-parts executes
+      # /etc/kernel/postinst.d/* in lexical order), so /boot/grub/grub.cfg
+      # is already fresh by the time this runs and just needs mirroring to
+      # the ESP. Mirrors zz-update-grub's exact guard conditions
+      # (skip containers, only fire on postinst configure / postrm remove)
+      # so it behaves identically, just against a different output path.
+      ansible.builtin.copy:
+        dest: "{{ item }}"
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #! /bin/sh
+          set -e
+
+          command -v grub-mkconfig >/dev/null || exit 0
+
+          if type systemd-detect-virt >/dev/null 2>&1 &&
+             systemd-detect-virt --quiet --container; then
+          	exit 0
+          fi
+
+          set -- $DEB_MAINT_PARAMS
+          mode="${1#\'}"
+          mode="${mode%\'}"
+          case $0:$mode in
+              */postinst.d/*:|*/postinst.d/*:configure|*/postrm.d/*:|*/postrm.d/*:remove)
+          	if [ -e {{ esp_grub_cfg }} ]; then
+          		exec grub-mkconfig -o {{ esp_grub_cfg }}
+          	fi
+          	;;
+          esac
+
+          exit 0
+      loop:
+        - /etc/kernel/postinst.d/zz-update-grub-esp
+        - /etc/kernel/postrm.d/zz-update-grub-esp
+      register: k8s_worker_grub_hook
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "{{ k8s_worker_grub_kernels.stdout_lines }}"
+          - "ESP grub.cfg default entry now: {{ k8s_worker_grub_verify.stdout | trim }}"
+          - "Sync hook installed: {{ k8s_worker_grub_hook.results | map(attribute='dest') | list }}"
+          - "Not rebooted -- verify with a reboot when ready."
