@@ -263,16 +263,54 @@
       failed_when: false
       check_mode: false
 
-    - name: Confirm nothing currently holds the GPU device open
+    - name: Evict gpu-operator pods on this node so they release GPU device handles
       # Installing new userspace libs (libnvidia-compute-610 etc.) already
       # breaks nvidia-smi/NVML immediately -- ldconfig picks up the new .so
       # files right away, while the OLD kernel module stays resident until
       # reloaded. There is no "defer to next reboot" option that avoids this:
       # nvidia-smi and anything linking libnvidia-ml.so (gpu-operator's
       # device-plugin, dcgm-exporter) are already mismatched the moment this
-      # install finishes. Reload the module now, but only once confirmed
-      # nothing has an open handle on it.
-      ansible.builtin.command: fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm
+      # install finishes.
+      #
+      # The first real run of this playbook found dcgm-exporter and a
+      # containerd shim still holding /dev/nvidia* open, which blocked
+      # modprobe -r ("Module nvidia_uvm is in use") after the install
+      # completed -- deleting the daemonset pods on this node (kubelet
+      # recreates them automatically) released the handles cleanly.
+      # Evicting proactively here, before attempting the unload, rather than
+      # requiring someone to notice the failure and do this by hand.
+      delegate_to: k8s-master.home.lan
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      ansible.builtin.shell: >-
+        kubectl get pods -n gpu-operator --field-selector spec.nodeName={{ inventory_hostname }}
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+        | grep -E '^(gpu-feature-discovery|nvidia-dcgm-exporter|nvidia-device-plugin-daemonset|nvidia-operator-validator)-'
+        | xargs -r kubectl delete pod -n gpu-operator --wait=false
+      register: nvidia_latest_evict
+      changed_when: "'deleted' in nvidia_latest_evict.stdout"
+      failed_when: false
+      check_mode: false
+
+    - name: Give kubelet a moment to finish tearing the evicted containers down
+      ansible.builtin.pause:
+        seconds: 10
+      when: nvidia_latest_evict is changed
+
+    - name: Confirm nothing currently holds the GPU device open
+      # fuser against the device special files is NOT reliable here --
+      # confirmed empirically it reported clear while dcgm-exporter and a
+      # containerd shim held real open file descriptors on the device,
+      # visible only via /proc/<pid>/fd. Scan that directly instead.
+      ansible.builtin.shell: |
+        set -o pipefail
+        for p in /proc/[0-9]*; do
+          readlink "$p"/fd/* 2>/dev/null | grep -q '/dev/nvidia' && \
+            echo "$p $(cat "$p"/comm 2>/dev/null)"
+        done
+        true
+      args:
+        executable: /bin/bash
       register: nvidia_latest_fuser
       changed_when: false
       failed_when: false
