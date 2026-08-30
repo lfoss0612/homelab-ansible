@@ -40,12 +40,31 @@
 # packages -- see pve_ai_610_expected_removals below. Nothing outside that
 # list.
 #
-# This playbook installs packages but does NOT force-reload the kernel
-# module and does NOT reboot. The currently loaded nvidia 580 module stays
-# resident and serving traffic (this host runs live LiteLLM/Ollama workloads
-# against the GPU) until a reboot activates the new module -- switching it
-# live would mean unloading a module that's actively in use. Report at the
-# end makes clear whether the installed module matches the loaded one.
+# This playbook DOES reload the kernel module live, deliberately, and does
+# NOT reboot. The original design deferred module activation to "the next
+# reboot," reasoning the old 580 module would keep serving traffic
+# undisturbed in the meantime. That reasoning was wrong: installing new
+# userspace libraries (libnvidia-compute-610 etc.) replaces the .so files
+# ldconfig serves IMMEDIATELY, while the OLD kernel module stays loaded --
+# so nvidia-smi/NVML (and anything linking libnvidia-ml.so: gpu-operator's
+# device-plugin, dcgm-exporter) break with a "Driver/library version
+# mismatch" the moment the packages are unpacked, reboot or not. There is no
+# version of this upgrade that avoids a brief GPU interruption; the only
+# choice is whether it's a controlled reload (confirmed no process holds
+# /dev/nvidia* open first) or an unverified gap until whenever someone next
+# reboots the host. This playbook does the former.
+#
+# Discovered the hard way, 2026-08-29: the first real run hit a genuine
+# Ubuntu packaging gap -- libnvidia-gl-610 ships a file already owned by
+# libnvidia-egl-xcb1 (orphaned once the old 580 stack is removed) without
+# declaring Replaces against it, so dpkg aborted mid-unpack, leaving
+# nvidia-driver-610-open/nvidia-dkms-610-open "unpacked" but never
+# configured (no dkms build triggered) -- while the userspace libs that HAD
+# unpacked already broke nvidia-smi. Both orphaned EGL packages have zero
+# reverse dependencies (verified via `apt-cache rdepends --installed`), so
+# this playbook removes them before installing, and runs
+# `dpkg --configure -a` first to repair that exact half-unpacked state if
+# it's already been hit.
 
 - name: Bump k8s-worker-2 to the latest NVIDIA driver and CUDA toolkit
   hosts: "{{ nvidia_latest_hosts | default('k8s-worker-2.home.lan') }}"
@@ -137,6 +156,33 @@
           Refusing -- dependency resolution has shifted since this playbook
           was written; re-verify before proceeding.
 
+    - name: Remove orphaned EGL platform packages that conflict with libnvidia-gl-610
+      # Found the hard way, mid-incident, 2026-08-29: libnvidia-gl-610 ships
+      # /usr/share/egl/egl_external_platform.d/20_nvidia_xcb.json, the same
+      # path libnvidia-egl-xcb1 already owns, and does not declare Replaces
+      # against it -- an Ubuntu packaging gap, not something on this host.
+      # dpkg refuses to overwrite a file it doesn't own, aborting the WHOLE
+      # unpack batch (leaving nvidia-driver-610-open/nvidia-dkms-610-open
+      # stuck at "unpacked", never configured, no dkms build triggered) --
+      # while cuda-toolkit-13-3's userspace libs (already unpacked earlier in
+      # the same batch) left nvidia-smi reporting "Driver/library version
+      # mismatch" against the still-loaded 580 kernel module. Confirmed via
+      # `apt-cache rdepends --installed` that nothing else depends on either
+      # package, so removing them is safe on any branch, not just 610.
+      ansible.builtin.apt:
+        name:
+          - libnvidia-egl-xcb1
+          - libnvidia-egl-xlib1
+        state: absent
+
+    - name: Finish configuring anything left half-unpacked by a prior failed attempt
+      # No-op on a clean host; repairs the exact state above if this
+      # playbook previously failed mid-transaction.
+      ansible.builtin.command: dpkg --configure -a
+      register: nvidia_latest_dpkg_configure
+      changed_when: "'Setting up' in nvidia_latest_dpkg_configure.stdout"
+      failed_when: false
+
     - name: Install the driver and CUDA toolkit
       ansible.builtin.apt:
         name:
@@ -174,8 +220,6 @@
           after install. dkms status: {{ nvidia_latest_dkms.stdout | trim }}.
 
     - name: Check which module is actually loaded right now
-      # Package install alone does not swap the live module out from under
-      # running GPU workloads -- confirm what's actually resident.
       ansible.builtin.command:
         cmd: modinfo -F version nvidia
       register: nvidia_latest_loaded_version
@@ -183,18 +227,78 @@
       failed_when: false
       check_mode: false
 
+    - name: Confirm nothing currently holds the GPU device open
+      # Installing new userspace libs (libnvidia-compute-610 etc.) already
+      # breaks nvidia-smi/NVML immediately -- ldconfig picks up the new .so
+      # files right away, while the OLD kernel module stays resident until
+      # reloaded. There is no "defer to next reboot" option that avoids this:
+      # nvidia-smi and anything linking libnvidia-ml.so (gpu-operator's
+      # device-plugin, dcgm-exporter) are already mismatched the moment this
+      # install finishes. Reload the module now, but only once confirmed
+      # nothing has an open handle on it.
+      ansible.builtin.command: fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm
+      register: nvidia_latest_fuser
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Refuse to reload the kernel module while something holds the GPU open
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that: nvidia_latest_fuser.stdout | trim == ''
+        fail_msg: >-
+          GPU device still has open handles: {{ nvidia_latest_fuser.stdout | trim }}.
+          Not unloading the kernel module while it's in use. nvidia-smi is
+          ALREADY mismatched at this point (new userspace libs installed,
+          old module still loaded) -- stop whatever holds the device open,
+          then re-run this playbook to complete the reload.
+
+    - name: Unload the old nvidia kernel modules
+      # Leaf-first: nvidia_drm depends on nvidia_modeset; nvidia_uvm and
+      # nvidia_modeset both depend on nvidia itself. Confirmed this exact
+      # order via `lsmod` before writing this task.
+      ansible.builtin.command: "modprobe -r {{ item }}"
+      loop:
+        - nvidia_drm
+        - nvidia_modeset
+        - nvidia_uvm
+        - nvidia
+      when: not ansible_check_mode
+      register: nvidia_latest_unload
+      changed_when: nvidia_latest_unload.rc == 0
+      failed_when: false
+
+    - name: Load the new nvidia kernel module
+      ansible.builtin.command: modprobe nvidia
+      when: not ansible_check_mode
+      register: nvidia_latest_load
+      changed_when: nvidia_latest_load.rc == 0
+
+    - name: Query the GPU after the reload
+      ansible.builtin.command:
+        cmd: nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+      when: not ansible_check_mode
+      register: nvidia_latest_smi
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require nvidia-smi to succeed and report the new branch
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that:
+          - nvidia_latest_smi.rc == 0
+          - "'610.43.02' in nvidia_latest_smi.stdout"
+        fail_msg: >-
+          nvidia-smi after reload: rc={{ nvidia_latest_smi.rc }}
+          stdout={{ nvidia_latest_smi.stdout | trim }}
+          stderr={{ nvidia_latest_smi.stderr | trim }}.
+          The GPU is NOT confirmed working -- do not assume success.
+
     - name: Report
       ansible.builtin.debug:
         msg:
           - "kernel:        {{ nvidia_latest_kernel.stdout | trim }}"
-          - "GPU users before: {{ nvidia_latest_gpu_users.stdout | trim | default('(none)', true) }}"
+          - "GPU users before install: {{ nvidia_latest_gpu_users.stdout | trim | default('(none)', true) }}"
           - "dkms 610 build: {{ nvidia_latest_dkms.stdout_lines | select('search', nvidia_latest_kernel.stdout | trim) | select('search', '610') | join('; ') | default('none', true) }}"
-          - "on-disk module target: 610.43.02 | currently loaded (modinfo): {{ nvidia_latest_loaded_version.stdout | trim | default('unknown', true) }}"
-          - >-
-            {{ 'Loaded module still reports the OLD branch -- expected. A
-                reboot (or a controlled module reload during a maintenance
-                window, given active GPU workloads) is required to actually
-                activate 610.43.02.'
-               if '610' not in nvidia_latest_loaded_version.stdout
-               else 'Loaded module already reports 610 -- unexpected without a
-                     reboot, worth double-checking nvidia-smi.' }}
+          - "nvidia-smi after reload: {{ nvidia_latest_smi.stdout | trim | default('(check mode -- not attempted)', true) }}"
