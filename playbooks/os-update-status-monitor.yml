@@ -1,0 +1,169 @@
+---
+# Deploy OS patch-status monitoring (pending package count, reboot-required)
+# to Zabbix across the fleet.
+#
+# Usage:
+#   ansible-playbook playbooks/os-update-status-monitor.yml --check --diff
+#   ansible-playbook playbooks/os-update-status-monitor.yml
+#
+# A native UserParameter, polled by the Zabbix agent -- not a timer+trapper
+# push like smart-monitor.yml/oom-kill-monitor.yml -- matching the mechanism
+# homelab-vault's TODO.md itself suggested for this item. Server-side items
+# and the dashboard are created separately by
+# playbooks/os-update-status-dashboard.yml -- run that one too, or every
+# value this exposes is polled by nothing and never shows anywhere (the same
+# two-halves trap docs/smart-monitoring.md already documents for SMART).
+#
+# TWO REPORTING PATHS, because the fleet runs two fundamentally different
+# Zabbix agent deployments (confirmed live 2026-08-30, not assumed):
+#
+#   * 11 hosts run zabbix-agent2 as a normal OS package. UserParameter goes
+#     directly into /etc/zabbix/zabbix_agent2.d/, runs natively, restart the
+#     systemd service to pick it up.
+#   * The 3 k8s nodes run zabbix-agent2 as a DaemonSet pod
+#     (cattle-monitoring-system, image zabbix/zabbix-agent2:alpine-7.4.1) --
+#     uid 1997 (zabbix), non-root, no added capabilities, Alpine base with no
+#     apt/dpkg at all. Its UserParameter config comes from a HOST directory
+#     (/etc/zabbix/agent2-userparams.d) bind-mounted into the pod's include
+#     path -- the exact mechanism openclaw.version already uses there (see
+#     collections/ansible_collections/openclaw/node/roles/common/tasks/main.yml).
+#     Both `chroot /hostfs/root` and `nsenter --target 1 ...` into the host's
+#     real mount namespace are BLOCKED there ("Operation not permitted" /
+#     "Permission denied"), verified live, despite hostPID: true and a
+#     read-only /hostfs/root bind mount of the whole node filesystem. So
+#     pending-package count CANNOT be collected on these 3 hosts without a
+#     security-posture change to that DaemonSet (adding CAP_SYS_CHROOT or
+#     similar) -- a real security decision this playbook does not make on its
+#     own. Reboot-required DOES work there with zero extra privilege: uname -r
+#     inside any container always reports the real host kernel (there is only
+#     one kernel, shared unconditionally), and the newest installed kernel is
+#     a plain file read through the existing read-only /hostfs/root mount --
+#     no chroot/nsenter needed.
+#
+# Net result: os.update.reboot.required is genuinely fleet-wide (14 hosts).
+# os.update.pending.count is 11 of 14 -- everything except k8s-master,
+# k8s-worker, k8s-worker-2. The dashboard playbook only builds a pending-count
+# column for the 11; those 3 rows show "No data" there rather than a
+# misleading 0.
+#
+# Same script (scripts/os-update-status.sh, subcommands pending/reboot) is
+# used both ways -- only the UserParameter line invoking it differs.
+
+- name: Deploy OS patch-status monitoring (native agent2 hosts)
+  hosts: "all:!api_managed:!k8s"
+  become: true
+
+  handlers:
+    - name: restart_zabbix_agent2
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: restarted
+
+  tasks:
+    - name: Install the status script
+      ansible.builtin.copy:
+        src: ../scripts/os-update-status.sh
+        dest: /usr/local/bin/os-update-status
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Publish the UserParameters
+      ansible.builtin.copy:
+        dest: /etc/zabbix/zabbix_agent2.d/os-update-status.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          UserParameter=os.update.pending.count,/usr/local/bin/os-update-status pending
+          UserParameter=os.update.reboot.required,/usr/local/bin/os-update-status reboot
+      notify: restart_zabbix_agent2
+
+    - name: Flush handlers now so the initial check below sees the new UserParameters
+      ansible.builtin.meta: flush_handlers
+
+    - name: Run an initial check
+      ansible.builtin.command: /usr/local/bin/os-update-status {{ item }}
+      loop: [pending, reboot]
+      register: os_update_status_check
+      changed_when: false
+      check_mode: false
+
+    - name: Show the initial results
+      ansible.builtin.debug:
+        msg: >-
+          pending={{ os_update_status_check.results[0].stdout }}
+          reboot={{ os_update_status_check.results[1].stdout }}
+
+- name: Deploy reboot-required monitoring (k8s DaemonSet agent hosts)
+  hosts: k8s
+  become: true
+
+  tasks:
+    - name: Ensure the DaemonSet UserParameter host directory exists
+      ansible.builtin.file:
+        path: /etc/zabbix/agent2-userparams.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the status script (reached via the DaemonSet's /hostfs/root mount)
+      ansible.builtin.copy:
+        src: ../scripts/os-update-status.sh
+        dest: /usr/local/bin/os-update-status
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Publish the reboot-required UserParameter for the DaemonSet agent
+      # No pending-count UserParameter here -- see the playbook header for why.
+      ansible.builtin.copy:
+        dest: /etc/zabbix/agent2-userparams.d/os-update-status.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          UserParameter=os.update.reboot.required,sh /hostfs/root/usr/local/bin/os-update-status reboot /hostfs/root
+      register: os_update_status_k8s_conf
+
+- name: Restart the zabbix-agent DaemonSet to pick up the new UserParameter
+  # agent2 only reads UserParameter definitions at process start, and the
+  # DaemonSet is a pod, not a host unit -- a plain systemd restart handler
+  # cannot reach it. Gated on whether any of the 3 hosts' conf file actually
+  # changed, so a re-run of this playbook doesn't churn the DaemonSet's pods
+  # for no reason every time.
+  hosts: k8s_master
+  become: true
+  gather_facts: false
+
+  vars:
+    os_update_status_any_k8s_conf_changed: >-
+      {{ groups['k8s']
+         | map('extract', hostvars, 'os_update_status_k8s_conf')
+         | selectattr('changed')
+         | list | length > 0 }}
+
+  tasks:
+    - name: Roll out restart
+      ansible.builtin.shell: |
+        export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+        kubectl rollout restart daemonset/zabbix-agent -n cattle-monitoring-system
+      when: os_update_status_any_k8s_conf_changed
+      register: os_update_status_rollout
+      changed_when: "'restarted' in os_update_status_rollout.stdout"
+
+    - name: Wait for the rollout to finish
+      ansible.builtin.shell: |
+        export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+        kubectl rollout status daemonset/zabbix-agent -n cattle-monitoring-system --timeout=120s
+      when: os_update_status_any_k8s_conf_changed
+      register: os_update_status_rollout_wait
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ os_update_status_rollout_wait.stdout
+             if os_update_status_any_k8s_conf_changed
+             else 'No change to the k8s UserParameter conf -- rollout skipped.' }}

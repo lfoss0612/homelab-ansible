@@ -1,0 +1,315 @@
+---
+# Create the server-side Zabbix objects that os.update.pending.count and
+# os.update.reboot.required (UserParameters installed by
+# playbooks/os-update-status-monitor.yml) feed into: the items themselves --
+# these are polled UserParameters, not LLD, so nothing auto-creates them --
+# plus the "Patch / Update Status" dashboard.
+#
+# Counterpart to playbooks/os-update-status-monitor.yml, which installs the
+# script and UserParameter config that feed these. Both are needed: the
+# UserParameter alone answers Zabbix agent polls that nothing is listening
+# for, and this alone creates items nothing feeds (the same two-halves trap
+# docs/smart-monitoring.md already documents for SMART).
+#
+# Usage:
+#   ansible-playbook playbooks/os-update-status-zabbix-setup.yml --check --diff
+#   ansible-playbook playbooks/os-update-status-zabbix-setup.yml
+#
+# Idempotent: every item and the dashboard are looked up before being
+# created/updated, so re-running is a no-op once set up (same pattern as
+# playbooks/zabbix-agent-version-dashboard.yml).
+#
+# os.update.pending.count is only created on 11 of 14 hosts -- see
+# playbooks/os-update-status-monitor.yml for exactly why (the 3 k8s nodes run
+# the Zabbix agent as a DaemonSet pod with no apt/dpkg and no way to reach the
+# host's package state). The dashboard's pending-count column simply shows
+# "No data" for those 3 rows rather than a misleading 0.
+
+- name: Configure Zabbix items and dashboard for OS patch-status monitoring
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "Patch / Update Status"
+    linux_group_name: "Linux servers"
+
+    pending_item_key: "os.update.pending.count"
+    pending_item_name: "OS updates: pending package count"
+    reboot_item_key: "os.update.reboot.required"
+    reboot_item_name: "OS updates: reboot required"
+
+    # No apt/dpkg reachable from the DaemonSet agent pod on these -- see
+    # playbooks/os-update-status-monitor.yml for the full explanation.
+    pending_excluded_hosts:
+      - k8s-master.home.lan
+      - k8s-worker.home.lan
+      - k8s-worker-2.home.lan
+
+  tasks:
+    - name: Resolve the Linux servers host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ linux_group_name }}"]
+          id: 1
+      register: group_lookup
+      check_mode: false
+      failed_when: >-
+        group_lookup.json.error is defined
+        or (group_lookup.json.result | default([]) | length) != 1
+
+    - name: List every host in that group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            groupids: ["{{ group_lookup.json.result[0].groupid }}"]
+          id: 1
+      register: hosts_lookup
+      check_mode: false
+      failed_when: hosts_lookup.json.error is defined
+
+    - name: Look up existing reboot-required items (all 14 hosts)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "hostid"]
+            hostids: "{{ hosts_lookup.json.result | map(attribute='hostid') | list }}"
+            filter:
+              key_: ["{{ reboot_item_key }}"]
+          id: 1
+      register: reboot_items_lookup
+      check_mode: false
+      failed_when: reboot_items_lookup.json.error is defined
+
+    - name: Create the reboot-required item on any host that's missing it
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "{{ reboot_item_name }}"
+            key_: "{{ reboot_item_key }}"
+            type: 0          # Zabbix agent (passive) -- matches ZBX_PASSIVE_ALLOW=true
+            value_type: 3    # unsigned int
+            delay: 1h
+            description: >-
+              0 = no reboot needed, 1 = a newer kernel is installed than what's
+              running (or /var/run/reboot-required exists), 2 = this host is an
+              LXC container, whose own kernel version is meaningless (it always
+              reports the shared host's).
+          id: 1
+      loop: "{{ hosts_lookup.json.result }}"
+      when: item.hostid not in (reboot_items_lookup.json.result | map(attribute='hostid') | list)
+      register: reboot_item_create
+      failed_when: reboot_item_create.json is defined and reboot_item_create.json.error is defined
+      changed_when: reboot_item_create.json.result is defined
+
+    - name: Look up existing pending-count items (the 11 covered hosts)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "hostid"]
+            hostids: >-
+              {{ hosts_lookup.json.result
+                 | rejectattr('host', 'in', pending_excluded_hosts)
+                 | map(attribute='hostid') | list }}
+            filter:
+              key_: ["{{ pending_item_key }}"]
+          id: 1
+      register: pending_items_lookup
+      check_mode: false
+      failed_when: pending_items_lookup.json.error is defined
+
+    - name: Create the pending-count item on any covered host that's missing it
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "{{ pending_item_name }}"
+            key_: "{{ pending_item_key }}"
+            type: 0
+            value_type: 3
+            delay: 1h
+            description: >-
+              Count of packages `apt-get -s dist-upgrade` would install.
+              Not collected on the 3 k8s nodes -- their Zabbix agent runs as a
+              DaemonSet pod with no apt/dpkg and no way to reach the host's
+              package state (see playbooks/os-update-status-monitor.yml).
+          id: 1
+      loop: >-
+        {{ hosts_lookup.json.result | rejectattr('host', 'in', pending_excluded_hosts) | list }}
+      when: item.hostid not in (pending_items_lookup.json.result | map(attribute='hostid') | list)
+      register: pending_item_create
+      failed_when: pending_item_create.json is defined and pending_item_create.json.error is defined
+      changed_when: pending_item_create.json.result is defined
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Patch status"
+            widgets:
+              - type: tophosts
+                name: "Pending updates and reboot status by host"
+                x: 0
+                y: 0
+                width: 72
+                height: 26
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 1, name: "columns.0.name", value: "Host"}
+                  - {type: 0, name: "columns.0.data", value: "2"}
+
+                  - {type: 1, name: "columns.1.name", value: "Pending updates"}
+                  - {type: 0, name: "columns.1.data", value: "1"}
+                  - {type: 1, name: "columns.1.item", value: "{{ pending_item_name }}"}
+                  - {type: 0, name: "columns.1.decimal_places", value: "0"}
+                  - {type: 1, name: "columns.1.base_color", value: "4CAF50"}
+                  # 1+ pending is amber, 100+ (a host missing multiple point
+                  # releases, e.g. pve-router at 226 the day this was built)
+                  # is red.
+                  - {type: 1, name: "columnsthresholds.1.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.0", value: "1"}
+                  - {type: 1, name: "columnsthresholds.1.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.1", value: "100"}
+
+                  - {type: 1, name: "columns.2.name", value: "Reboot required"}
+                  - {type: 0, name: "columns.2.data", value: "1"}
+                  - {type: 1, name: "columns.2.item", value: "{{ reboot_item_name }}"}
+                  - {type: 0, name: "columns.2.decimal_places", value: "0"}
+                  - {type: 1, name: "columns.2.base_color", value: "4CAF50"}
+                  # 1 = reboot needed (red). 2 = n/a container (grey) -- a
+                  # container's own uname -r is the shared host's kernel, not
+                  # its own, so this is genuinely a different answer than "no",
+                  # not a value worth hiding.
+                  - {type: 1, name: "columnsthresholds.2.color.0", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.2.threshold.0", value: "1"}
+                  - {type: 1, name: "columnsthresholds.2.color.1", value: "9E9E9E"}
+                  - {type: 1, name: "columnsthresholds.2.threshold.1", value: "2"}
+
+                  - {type: 0, name: "column", value: "1"}
+                  # Default host limit is 10, which would silently truncate
+                  # this 14-host fleet -- see zabbix-fleet-dashboard.yml's
+                  # identical note.
+                  - {type: 0, name: "count", value: "50"}
+                  - {type: 1, name: "reference", value: "PTCHST"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            # dashboard.create defaults to private:1 with zero shares -- every
+            # dashboard built by this fleet of playbooks hit this once already
+            # (see TODO.md's "invisible to the user" writeup on dashboards
+            # 402/403/404). Explicit here so a from-scratch run doesn't repeat it.
+            private: 0
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}
