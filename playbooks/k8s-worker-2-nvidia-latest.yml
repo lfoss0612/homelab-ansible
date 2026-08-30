@@ -65,6 +65,22 @@
 # this playbook removes them before installing, and runs
 # `dpkg --configure -a` first to repair that exact half-unpacked state if
 # it's already been hit.
+#
+# Also discovered the hard way: the module reload above fixes the HOST, but
+# every pod on this node using `runtimeClassName: nvidia` has its NVIDIA
+# userspace libraries bind-mounted in at container start, frozen at whatever
+# driver was present then. A host-side reload does not retroactively refresh
+# an already-running container's mounts. open-webui-ollama kept reporting
+# the OLD driver version to nvidia-smi indefinitely after a fully successful
+# host-side reload, until manually restarted -- this playbook's first
+# version only evicted gpu-operator's own pods by hardcoded name, which
+# never touched it. Fixed by querying every pod on this node with
+# `runtimeClassName: nvidia` (the actual criterion the NVIDIA container
+# toolkit itself uses, not an approximation of one) and evicting them
+# TWICE: once before the reload (releases device handles blocking modprobe
+# -r) and once after nvidia-smi is confirmed working at the host level
+# (catches anything not touched by the first pass, and refreshes anything
+# recreated by it that raced the reload).
 
 - name: Bump k8s-worker-2 to the latest NVIDIA driver and CUDA toolkit
   hosts: "{{ nvidia_latest_hosts | default('k8s-worker-2.home.lan') }}"
@@ -263,31 +279,48 @@
       failed_when: false
       check_mode: false
 
-    - name: Evict gpu-operator pods on this node so they release GPU device handles
+    - name: Evict every GPU-using pod on this node so they release device handles
       # Installing new userspace libs (libnvidia-compute-610 etc.) already
       # breaks nvidia-smi/NVML immediately -- ldconfig picks up the new .so
       # files right away, while the OLD kernel module stays resident until
       # reloaded. There is no "defer to next reboot" option that avoids this:
-      # nvidia-smi and anything linking libnvidia-ml.so (gpu-operator's
-      # device-plugin, dcgm-exporter) are already mismatched the moment this
-      # install finishes.
+      # nvidia-smi and anything linking libnvidia-ml.so are already
+      # mismatched the moment this install finishes.
       #
-      # The first real run of this playbook found dcgm-exporter and a
+      # The first real run of this playbook only evicted the four known
+      # gpu-operator pod names, hardcoded, and found dcgm-exporter and a
       # containerd shim still holding /dev/nvidia* open, which blocked
-      # modprobe -r ("Module nvidia_uvm is in use") after the install
-      # completed -- deleting the daemonset pods on this node (kubelet
-      # recreates them automatically) released the handles cleanly.
-      # Evicting proactively here, before attempting the unload, rather than
-      # requiring someone to notice the failure and do this by hand.
+      # modprobe -r ("Module nvidia_uvm is in use"). Deleting them (kubelet
+      # recreates them automatically) released the handles. But that
+      # hardcoded list missed the actual GPU WORKLOAD -- open-webui-ollama --
+      # which doesn't block the unload (it wasn't actively holding the
+      # device at reload time) but silently breaks anyway: its userspace
+      # NVIDIA libraries are bind-mounted from the host at container start,
+      # frozen at whatever driver was present then, and a live host-side
+      # module reload does not retroactively refresh an already-running
+      # container's mounts. It kept reporting the OLD driver version to
+      # nvidia-smi indefinitely until manually restarted.
+      #
+      # Query every pod scheduled on this node, in any namespace, and match
+      # on `runtimeClassName: nvidia` rather than a fixed name list -- this
+      # is how the nvidia-container-toolkit identifies which pods get GPU
+      # library injection in the first place, so it is the correct
+      # criterion, not an approximation of one, and it automatically covers
+      # any future GPU workload without needing this playbook edited again.
       delegate_to: k8s-master.home.lan
       when: not ansible_check_mode
       environment:
         KUBECONFIG: /etc/rancher/rke2/rke2.yaml
       ansible.builtin.shell: >-
-        kubectl get pods -n gpu-operator --field-selector spec.nodeName={{ inventory_hostname }}
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
-        | grep -E '^(gpu-feature-discovery|nvidia-dcgm-exporter|nvidia-device-plugin-daemonset|nvidia-operator-validator)-'
-        | xargs -r kubectl delete pod -n gpu-operator --wait=false
+        kubectl get pods -A --field-selector spec.nodeName={{ inventory_hostname }} -o json
+        | python3 -c "
+        import json, sys
+        d = json.load(sys.stdin)
+        for p in d['items']:
+            if p['spec'].get('runtimeClassName') == 'nvidia':
+                print(p['metadata']['namespace'], p['metadata']['name'])
+        "
+        | while read -r ns name; do kubectl delete pod -n "$ns" "$name" --wait=false; done
       register: nvidia_latest_evict
       changed_when: "'deleted' in nvidia_latest_evict.stdout"
       failed_when: false
@@ -369,6 +402,37 @@
           stderr={{ nvidia_latest_smi.stderr | trim }}.
           The GPU is NOT confirmed working -- do not assume success.
 
+    - name: Evict every GPU-using pod on this node again, now that the host is consistent
+      # The pre-reload eviction above exists to free device handles so the
+      # unload can proceed; whatever gets recreated in that window still
+      # races against the reload and can come back with transiently
+      # mismatched libraries. Anything that was NOT evicted at all in that
+      # pass (because it wasn't blocking the unload -- open-webui-ollama's
+      # actual failure mode, confirmed 2026-08-29) never gets touched
+      # otherwise and keeps serving against stale bind-mounted libraries
+      # indefinitely. Running the identical broad query again here, only
+      # after nvidia-smi is confirmed working at the host level, guarantees
+      # every GPU-using pod on this node ends up running against the final,
+      # fully-consistent driver -- in one restart, not a guessing game about
+      # which ones needed it.
+      delegate_to: k8s-master.home.lan
+      when: not ansible_check_mode
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      ansible.builtin.shell: >-
+        kubectl get pods -A --field-selector spec.nodeName={{ inventory_hostname }} -o json
+        | python3 -c "
+        import json, sys
+        d = json.load(sys.stdin)
+        for p in d['items']:
+            if p['spec'].get('runtimeClassName') == 'nvidia':
+                print(p['metadata']['namespace'], p['metadata']['name'])
+        "
+        | while read -r ns name; do kubectl delete pod -n "$ns" "$name" --wait=false; done
+      register: nvidia_latest_evict_final
+      changed_when: "'deleted' in nvidia_latest_evict_final.stdout"
+      failed_when: false
+
     - name: Report
       ansible.builtin.debug:
         msg:
@@ -376,3 +440,11 @@
           - "GPU users before install: {{ nvidia_latest_gpu_users.stdout | trim | default('(none)', true) }}"
           - "dkms 610 build: {{ nvidia_latest_dkms.stdout_lines | select('search', nvidia_latest_kernel.stdout | trim) | select('search', '610') | join('; ') | default('none', true) }}"
           - "nvidia-smi after reload: {{ nvidia_latest_smi.stdout | trim | default('(check mode -- not attempted)', true) }}"
+          - "pre-reload pod eviction: {{ nvidia_latest_evict.stdout | trim | default('(check mode -- not attempted)', true) }}"
+          - "post-reload pod eviction: {{ nvidia_latest_evict_final.stdout | trim | default('(check mode -- not attempted)', true) }}"
+          - >-
+            Every pod using runtimeClassName: nvidia on this node was
+            restarted twice (once to free device handles, once against the
+            final driver state) -- verify any GPU workload you care about
+            (e.g. open-webui-ollama) directly, this playbook does not know
+            about workloads outside gpu-operator by name.
