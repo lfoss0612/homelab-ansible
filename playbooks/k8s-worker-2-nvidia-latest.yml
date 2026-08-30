@@ -119,6 +119,42 @@
         update_cache: true
         cache_valid_time: 0
 
+    - name: Remove orphaned EGL platform packages that conflict with libnvidia-gl-610
+      # Found the hard way, mid-incident, 2026-08-29: libnvidia-gl-610 ships
+      # /usr/share/egl/egl_external_platform.d/20_nvidia_xcb.json, the same
+      # path libnvidia-egl-xcb1 already owns, and does not declare Replaces
+      # against it -- an Ubuntu packaging gap, not something on this host.
+      # dpkg refuses to overwrite a file it doesn't own, aborting the WHOLE
+      # unpack batch (leaving nvidia-driver-610-open/nvidia-dkms-610-open
+      # stuck at "unpacked", never configured, no dkms build triggered) --
+      # while cuda-toolkit-13-3's userspace libs (already unpacked earlier in
+      # the same batch) left nvidia-smi reporting "Driver/library version
+      # mismatch" against the still-loaded 580 kernel module. Confirmed via
+      # `apt-cache rdepends --installed` that nothing else depends on either
+      # package, so removing them is safe on any branch, not just 610.
+      #
+      # Runs BEFORE the simulate/assert step below, not after: the first
+      # real run of this playbook failed mid-transaction and left the host
+      # with nvidia-driver-610-open "already the newest version" yet
+      # dependency-broken (libnvidia-gl-610 unconfigured). Simulating against
+      # that broken baseline just reports "already newest" + unmet
+      # dependencies, not a useful preview -- the repair has to happen first
+      # so the simulate step (and the real install after it) run against a
+      # clean baseline, exactly like a first-ever run would see.
+      ansible.builtin.apt:
+        name:
+          - libnvidia-egl-xcb1
+          - libnvidia-egl-xlib1
+        state: absent
+
+    - name: Finish configuring anything left half-unpacked by a prior failed attempt
+      # No-op on a clean host; repairs the exact state above if this
+      # playbook previously failed mid-transaction.
+      ansible.builtin.command: dpkg --configure -a
+      register: nvidia_latest_dpkg_configure
+      changed_when: "'Setting up' in nvidia_latest_dpkg_configure.stdout"
+      failed_when: false
+
     - name: Simulate the combined driver + toolkit install
       ansible.builtin.command:
         cmd: >-
@@ -155,33 +191,6 @@
           {{ nvidia_latest_unexpected_removals | join(', ') }}.
           Refusing -- dependency resolution has shifted since this playbook
           was written; re-verify before proceeding.
-
-    - name: Remove orphaned EGL platform packages that conflict with libnvidia-gl-610
-      # Found the hard way, mid-incident, 2026-08-29: libnvidia-gl-610 ships
-      # /usr/share/egl/egl_external_platform.d/20_nvidia_xcb.json, the same
-      # path libnvidia-egl-xcb1 already owns, and does not declare Replaces
-      # against it -- an Ubuntu packaging gap, not something on this host.
-      # dpkg refuses to overwrite a file it doesn't own, aborting the WHOLE
-      # unpack batch (leaving nvidia-driver-610-open/nvidia-dkms-610-open
-      # stuck at "unpacked", never configured, no dkms build triggered) --
-      # while cuda-toolkit-13-3's userspace libs (already unpacked earlier in
-      # the same batch) left nvidia-smi reporting "Driver/library version
-      # mismatch" against the still-loaded 580 kernel module. Confirmed via
-      # `apt-cache rdepends --installed` that nothing else depends on either
-      # package, so removing them is safe on any branch, not just 610.
-      ansible.builtin.apt:
-        name:
-          - libnvidia-egl-xcb1
-          - libnvidia-egl-xlib1
-        state: absent
-
-    - name: Finish configuring anything left half-unpacked by a prior failed attempt
-      # No-op on a clean host; repairs the exact state above if this
-      # playbook previously failed mid-transaction.
-      ansible.builtin.command: dpkg --configure -a
-      register: nvidia_latest_dpkg_configure
-      changed_when: "'Setting up' in nvidia_latest_dpkg_configure.stdout"
-      failed_when: false
 
     - name: Install the driver and CUDA toolkit
       ansible.builtin.apt:
