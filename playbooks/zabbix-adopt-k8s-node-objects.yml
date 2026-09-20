@@ -35,12 +35,15 @@
 # (description, priority) for triggers. Against the current server every object
 # already exists, so a run reports 0 created and changes nothing.
 #
-# !! THE CREATE PATH IS UNTESTED !!  Every object it would create already
-# exists, and item.delete / itemprototype.delete are refused to this token - so
-# a test run that created something wrong could not be cleaned up through the
-# API. It is written to fail loudly on the first API error rather than continue.
-# The first real exercise of it will be a rebuild; check the summary at the end
-# and expect to fix something.
+# CREATE PATH TESTED 2026-09-20 against a disposable throwaway host, since
+# item.delete / itemprototype.delete / host.delete are all refused to this
+# token - nothing created during a test can be cleaned up through the API on
+# ANY host, not just k8s-master. Gave the throwaway host a minimal
+# kube.node.discovery LLD rule (type 5, no master-item dependency needed) and
+# ran this play against it with -e k8s_host=<throwaway host>: created the
+# master item, all 28 item prototypes and all 15 trigger prototypes correctly
+# in one pass, 0 of each on a second run. It still fails loudly on the first
+# API error rather than continuing.
 #
 # NOT COVERED - both needed on a real rebuild, neither recoverable from here:
 #   - {$KUBE.API.TOKEN} is a secret macro. The API does not return its value,
@@ -245,6 +248,71 @@
       failed_when: trig_create.json.error is defined
       changed_when: trig_create.json.result is defined
 
+    # ------------------------------------------------------- kube api macros
+    # {$KUBE.API.URL}/{$KUBE.API.TOKEN} are not part of zbx.* - they are host
+    # macros, not discovery-rule objects - but a rebuild needs them too, and
+    # the play that originally set them (configure-kubernetes-monitoring.yml)
+    # is no longer safe to rerun: it uses host.update's `macros` array, which
+    # REPLACES every macro on the host (wiping other secrets - see
+    # configure-mac-inventory.yml), and it re-links "Kubernetes nodes by
+    # HTTP", which now conflicts with cluster-state owning the same
+    # kube.node.discovery rule. This sets the same two macros the safe,
+    # additive way (usermacro.create, only when missing), sourced from the
+    # same host_vars entry (zbx_kube_api_url / zbx_kube_api_token,
+    # host_vars/k8s-master.home.lan.yml) so a rebuild does not depend on
+    # remembering where that value came from. Skipped entirely when the
+    # target host has no such host_vars (e.g. the disposable host this play
+    # was tested against on 2026-09-20).
+    - name: Check for the existing kube.nodes API macros
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: usermacro.get
+          params:
+            hostids: ["{{ hostid }}"]
+            filter: {macro: ["{$KUBE.API.URL}", "{$KUBE.API.TOKEN}"]}
+          id: 1
+      register: kube_macros_existing
+      check_mode: false
+      failed_when: kube_macros_existing.json.error is defined
+      when: hostvars[k8s_host].zbx_kube_api_token is defined
+
+    - name: Set the kube.nodes API macros when missing
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: "{{ api_headers }}"
+        body:
+          jsonrpc: "2.0"
+          method: usermacro.create
+          params:
+            hostid: "{{ hostid }}"
+            macro: "{{ item.macro }}"
+            value: "{{ item.value }}"
+            type: "{{ item.type }}"
+          id: 1
+      register: kube_macro_create
+      loop:
+        - macro: "{$KUBE.API.URL}"
+          value: "{{ hostvars[k8s_host].zbx_kube_api_url | default('') }}"
+          type: "0"
+        - macro: "{$KUBE.API.TOKEN}"
+          value: "{{ hostvars[k8s_host].zbx_kube_api_token | default('') }}"
+          type: "1"
+      loop_control:
+        label: "{{ item.macro }}"
+      when:
+        - hostvars[k8s_host].zbx_kube_api_token is defined
+        - (kube_macros_existing.json.result | selectattr('macro', 'eq', item.macro) | list | length) == 0
+      failed_when: kube_macro_create.json.error is defined
+      changed_when: kube_macro_create.json.result is defined
+      no_log: true
+
     - name: Report what was missing
       ansible.builtin.debug:
         msg: >-
@@ -254,4 +322,7 @@
           {{ trig_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
           of {{ zbx.trigger_prototypes | length }}.
           Item prototype counts are reported by the per-tier tasks above.
+          kube.nodes API macros: {{ 'not applicable, no host_vars for ' + k8s_host
+          if hostvars[k8s_host].zbx_kube_api_token is not defined
+          else (kube_macro_create.results | default([]) | rejectattr('skipped', 'defined') | list | length | string) + ' of 2 created' }}.
           A run against a healthy server should create nothing.
