@@ -45,16 +45,11 @@
 # in one pass, 0 of each on a second run. It still fails loudly on the first
 # API error rather than continuing.
 #
-# NOT COVERED - both needed on a real rebuild, neither recoverable from here:
-#   - {$KUBE.API.TOKEN} is a secret macro. The API does not return its value,
-#     so it cannot live in this file. Supply it from the vault.
-#   - {$KUBE.NODES.ENDPOINT.NAME}, {$KUBE.POD.FILTER.*} and {$KUBE.NODE.FILTER.*}
-#     are referenced by the kube.nodes script parameters but are NOT defined on
-#     the host today - they came from the template that was unlinked. The item
-#     works anyway (the endpoint lookup silently finds nothing, which is why the
-#     {#ENDPOINT} macro and status.agent are empty). Left as-is deliberately:
-#     defining them now would change collection behaviour, which is a separate
-#     decision from making the objects reproducible.
+# The kube.nodes script's 7 macros ({$KUBE.API.URL}/{$KUBE.API.TOKEN},
+# {$KUBE.NODES.ENDPOINT.NAME}, {$KUBE.POD.FILTER.*}, {$KUBE.NODE.FILTER.*})
+# are host macros, not discovery-rule objects, so they are not in zbx.* - but
+# a rebuild needs them too. Set additively near the end of this play; see the
+# comment there for what each is set to and why.
 #
 # Usage:
 #   ansible-playbook playbooks/zabbix-adopt-k8s-node-objects.yml --check --diff
@@ -69,6 +64,12 @@
     zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
     k8s_host: "k8s-master.home.lan"
     lld_key: "kube.node.discovery"
+    # The zabbix-agent DaemonSet's Endpoints object (homelab-gitops's
+    # zabbix-proxy-agent.yaml, one pod per node) - confirmed live 2026-09-20
+    # via the cluster API (ready=3, one per node), not guessed. Distinct from
+    # zabbix-proxy-agent-zabbix-helm-chrt-proxy, the single centralized proxy
+    # pod, which is not what {#NAME}-per-node status.agent should track.
+    kube_nodes_endpoint_name: "zabbix-proxy-agent-zabbix-helm-chrt-agent"
     api_headers:
       Authorization: "Bearer {{ zabbix_api_token }}"
 
@@ -248,22 +249,38 @@
       failed_when: trig_create.json.error is defined
       changed_when: trig_create.json.result is defined
 
-    # ------------------------------------------------------- kube api macros
-    # {$KUBE.API.URL}/{$KUBE.API.TOKEN} are not part of zbx.* - they are host
-    # macros, not discovery-rule objects - but a rebuild needs them too, and
-    # the play that originally set them (configure-kubernetes-monitoring.yml)
-    # is no longer safe to rerun: it uses host.update's `macros` array, which
-    # REPLACES every macro on the host (wiping other secrets - see
-    # configure-mac-inventory.yml), and it re-links "Kubernetes nodes by
-    # HTTP", which now conflicts with cluster-state owning the same
-    # kube.node.discovery rule. This sets the same two macros the safe,
-    # additive way (usermacro.create, only when missing), sourced from the
-    # same host_vars entry (zbx_kube_api_url / zbx_kube_api_token,
-    # host_vars/k8s-master.home.lan.yml) so a rebuild does not depend on
-    # remembering where that value came from. Skipped entirely when the
-    # target host has no such host_vars (e.g. the disposable host this play
-    # was tested against on 2026-09-20).
-    - name: Check for the existing kube.nodes API macros
+    # -------------------------------------------------------- kube.nodes macros
+    # All 7 macros the kube.nodes script reads. The play that originally set
+    # the first two (configure-kubernetes-monitoring.yml) is no longer safe to
+    # rerun: it uses host.update's `macros` array, which REPLACES every macro
+    # on the host (wiping other secrets - see configure-mac-inventory.yml),
+    # and it re-links "Kubernetes nodes by HTTP", which now conflicts with
+    # cluster-state owning the same kube.node.discovery rule. This sets all 7
+    # the safe, additive way (usermacro.create, only when missing) instead.
+    # Skipped entirely when the target host has no zbx_kube_api_token
+    # host_vars (e.g. the disposable host this play was tested against on
+    # 2026-09-20) - such a host has no real Kubernetes API behind it, so none
+    # of these 7 would mean anything there either.
+    #
+    # {$KUBE.API.URL} / {$KUBE.API.TOKEN}: sourced from host_vars
+    # (zbx_kube_api_url / zbx_kube_api_token, host_vars/k8s-master.home.lan.yml,
+    # itself ansible-vault encrypted) so a rebuild does not depend on
+    # remembering where that value came from.
+    #
+    # {$KUBE.NODE.FILTER.*} / {$KUBE.POD.FILTER.*}: left "" - confirmed
+    # 2026-09-20 (no filtering was ever wanted) and proven a true no-op by
+    # reading kube-nodes-script.js: parseFilters('') returns [], and
+    # Kube.filter() against an empty filter list passes everything, which is
+    # exactly what an *undefined* macro already does today (Zabbix resolves
+    # an undefined user macro to '' in script item parameters). So setting
+    # these explicitly changes nothing live - it only makes the current
+    # "everything passes" state explicit and reproducible in git.
+    #
+    # {$KUBE.NODES.ENDPOINT.NAME}: unlike the filters, this ONE is a real
+    # behaviour change, not a no-op - status.agent and {#ENDPOINT} go from
+    # always-empty to actually reporting per-node zabbix-agent health. Value
+    # is kube_nodes_endpoint_name (see vars above).
+    - name: Check for the existing kube.nodes script macros
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
@@ -274,14 +291,22 @@
           method: usermacro.get
           params:
             hostids: ["{{ hostid }}"]
-            filter: {macro: ["{$KUBE.API.URL}", "{$KUBE.API.TOKEN}"]}
+            filter:
+              macro:
+                - "{$KUBE.API.URL}"
+                - "{$KUBE.API.TOKEN}"
+                - "{$KUBE.NODES.ENDPOINT.NAME}"
+                - "{$KUBE.NODE.FILTER.LABELS}"
+                - "{$KUBE.NODE.FILTER.ANNOTATIONS}"
+                - "{$KUBE.POD.FILTER.LABELS}"
+                - "{$KUBE.POD.FILTER.ANNOTATIONS}"
           id: 1
       register: kube_macros_existing
       check_mode: false
       failed_when: kube_macros_existing.json.error is defined
       when: hostvars[k8s_host].zbx_kube_api_token is defined
 
-    - name: Set the kube.nodes API macros when missing
+    - name: Set the kube.nodes script macros when missing
       ansible.builtin.uri:
         url: "{{ zabbix_url }}/api_jsonrpc.php"
         method: POST
@@ -304,6 +329,21 @@
         - macro: "{$KUBE.API.TOKEN}"
           value: "{{ hostvars[k8s_host].zbx_kube_api_token | default('') }}"
           type: "1"
+        - macro: "{$KUBE.NODES.ENDPOINT.NAME}"
+          value: "{{ kube_nodes_endpoint_name }}"
+          type: "0"
+        - macro: "{$KUBE.NODE.FILTER.LABELS}"
+          value: ""
+          type: "0"
+        - macro: "{$KUBE.NODE.FILTER.ANNOTATIONS}"
+          value: ""
+          type: "0"
+        - macro: "{$KUBE.POD.FILTER.LABELS}"
+          value: ""
+          type: "0"
+        - macro: "{$KUBE.POD.FILTER.ANNOTATIONS}"
+          value: ""
+          type: "0"
       loop_control:
         label: "{{ item.macro }}"
       when:
@@ -322,7 +362,7 @@
           {{ trig_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
           of {{ zbx.trigger_prototypes | length }}.
           Item prototype counts are reported by the per-tier tasks above.
-          kube.nodes API macros: {{ 'not applicable, no host_vars for ' + k8s_host
+          kube.nodes script macros: {{ 'not applicable, no host_vars for ' + k8s_host
           if hostvars[k8s_host].zbx_kube_api_token is not defined
-          else (kube_macro_create.results | default([]) | rejectattr('skipped', 'defined') | list | length | string) + ' of 2 created' }}.
+          else (kube_macro_create.results | default([]) | rejectattr('skipped', 'defined') | list | length | string) + ' of 7 created' }}.
           A run against a healthy server should create nothing.
