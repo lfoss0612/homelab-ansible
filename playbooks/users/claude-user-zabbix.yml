@@ -38,9 +38,14 @@
     # a real invocation rather than a guessed one.
     zabbix_server_bin: /usr/sbin/zabbix_server
     zabbix_server_conf: /etc/zabbix/zabbix_server.conf
-    # Fixed, full commands only - no bare binary, no wildcard args. This is
-    # runtime control (config cache reload) and a status query, not the
-    # ability to stop/restart/reconfigure the server.
+    # Fixed, full commands only - no bare binary, no wildcard args. Escalates
+    # to root, not the zabbix user: /etc/zabbix/zabbix_server.conf is 0600
+    # root:root (verified live - it holds DB credentials), and -R subcommands
+    # read it to locate the runtime control sockets before they can do
+    # anything, so even a read-only -R call fails as the zabbix user with
+    # "Permission denied" on the config file. Still tightly scoped: these are
+    # two fixed, full commands (config cache reload, a status query), not the
+    # ability to stop/restart/reconfigure the server or run arbitrary flags.
     claude_sudo_commands:
       - "{{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R config_cache_reload"
       - "{{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R ha_status"
@@ -97,17 +102,17 @@
         validate: /usr/sbin/visudo -cf %s
         content: |
           # Managed by playbooks/users/claude-user-zabbix.yml — do not edit by hand.
-          {{ claude_user }} ALL=(zabbix) NOPASSWD: {{ claude_sudo_commands | join(', ') }}
+          {{ claude_user }} ALL=(root) NOPASSWD: {{ claude_sudo_commands | join(', ') }}
           Defaults:{{ claude_user }} !requiretty
 
     # Harmless, read-only -R subcommand (reports HA cluster status, does not
-    # change anything) - proves the sudoers rule and the zabbix-run-as
-    # escalation both actually work, without invoking config_cache_reload
-    # for real on every provisioning run.
+    # change anything) - proves the sudoers rule and the root escalation both
+    # actually work, without invoking config_cache_reload for real on every
+    # provisioning run.
     - name: Verify claude can escalate to run zabbix_server -R commands
       ansible.builtin.command: >-
         runuser -u {{ claude_user }} --
-        /usr/bin/sudo -n -H -u zabbix
+        /usr/bin/sudo -n -H
         {{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R ha_status
       changed_when: false
       register: claude_sudo_check

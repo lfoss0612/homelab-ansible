@@ -175,7 +175,7 @@ both hosts unchanged. It differs from `claude-user.yml` in what it actually gran
 
 | | cockpit (`claude-user.yml`) | zabbix.home.lan (`claude-user-zabbix.yml`) |
 |---|---|---|
-| Escalates to | `ansible` user, running `ansible`/`ansible-playbook`/`ansible-inventory` | `zabbix` user, running exactly two fixed `zabbix_server -R <subcommand>` invocations |
+| Escalates to | `ansible` user, running `ansible`/`ansible-playbook`/`ansible-inventory` | `root`, running exactly two fixed `zabbix_server -R <subcommand>` invocations — `zabbix_server.conf` is `0600 root:root` (holds DB credentials), so even a read-only `-R` call must read it as root first |
 | Extra group | `ansible` (read `/opt/ansible`) | `zabbix` (read `/var/log/zabbix/zabbix_server.log`, mode `0640 zabbix:zabbix` — no sudo needed for this half) |
 | Grants | Effectively full fleet control via reviewed playbooks | `config_cache_reload` and `ha_status` only — cannot stop/restart/reconfigure the server, cannot run arbitrary `zabbix_server` flags |
 
@@ -207,7 +207,7 @@ talks to the Zabbix server itself rather than through Ansible:
 
 ```bash
 ssh zabbix 'tail -n 100 /var/log/zabbix/zabbix_server.log'
-ssh zabbix 'sudo -n -H -u zabbix /usr/sbin/zabbix_server -c /etc/zabbix/zabbix_server.conf -R config_cache_reload'
+ssh zabbix 'sudo -n -H /usr/sbin/zabbix_server -c /etc/zabbix/zabbix_server.conf -R config_cache_reload'
 ```
 
 If widening this beyond the two `-R` subcommands ever seems useful, add the new fixed
