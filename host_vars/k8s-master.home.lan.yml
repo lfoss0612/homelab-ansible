@@ -19,7 +19,25 @@
 #
 # Expires in 10 years (2036-08-21). Regenerate with the same command if the
 # ServiceAccount is ever recreated (new UID invalidates old tokens).
-zbx_kube_api_url: "https://k8s-master.home.lan:6443"
+#
+# zbx_kube_api_url changed 2026-09-20 from the external hostname
+# (https://k8s-master.home.lan:6443) to the in-cluster API service. All these
+# checks run inside the zabbix-proxy-agent pod (cattle-monitoring-system),
+# which resolves DNS through in-cluster CoreDNS, not host DNS - and the
+# CoreDNS replica co-located on k8s-master.home.lan was crash-looping (70
+# restarts), making the external hostname resolve unreliably from inside the
+# proxy. Root-caused via k8s-diagnostics: proxy logs showed "Could not
+# resolve hostname" / "Timeout was reached" on every kube.* Script/HTTP-agent
+# check (kube.nodes, kube.readyz, kube.livez, kube.componentstatuses,
+# kube.control_plane.lld, kube.node.lld, kube.state.metrics all share this
+# macro), silently - Zabbix's custom Kubernetes script module logs the
+# failure locally but never reports it as an item error, so the Zabbix API
+# just showed lastclock=0 forever with no error. kubernetes.default.svc is
+# resolvable from any in-cluster pod via cluster DNS with no dependency on
+# host DNS at all, and is covered by the API server's default certificate
+# SANs. No longer vault-encrypted - a Kubernetes Service DNS name isn't a
+# secret, unlike the token below.
+zbx_kube_api_url: "https://kubernetes.default.svc"
 zbx_kube_api_token: !vault |
           $ANSIBLE_VAULT;1.1;AES256
           39393133636138633863646266303338313736623430396263643064316331333038373263353730
