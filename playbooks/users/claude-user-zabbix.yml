@@ -1,0 +1,129 @@
+---
+# Bootstrap a `claude` diagnostic identity on zabbix.home.lan itself.
+#
+# Scope: zabbix.home.lan only, and deliberately separate from claude-user.yml's
+# "cockpit only" policy (see docs/claude-access.md). That policy holds because
+# cockpit is the Ansible control node - every other host is already reachable
+# from there through reviewed playbooks, so a second account elsewhere would be
+# redundant. This is an exception, not a reversal of that reasoning: the actual
+# need here is real-time server-side Zabbix diagnostics - tailing
+# zabbix_server.log and running `zabbix_server -R config_cache_reload` - which
+# an ansible-playbook run mediated through cockpit cannot do (a playbook task
+# can run a command once and capture its output, but that is not the same as
+# being able to read the live log directly while investigating, and there is
+# no reviewed-playbook shape for "run whatever -R subcommand the investigation
+# turns out to need next").
+#
+# Runbook: docs/claude-access.md. Revoke with:
+#   sudo userdel -r claude && sudo rm -f /etc/sudoers.d/claude
+
+- name: Bootstrap claude user on the Zabbix server (diagnostic access only)
+  hosts: "{{ claude_zabbix_hosts | default('zabbix.home.lan') }}"
+  become: true
+  remote_user: ansible
+  gather_facts: true
+
+  vars:
+    claude_user: claude
+    claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
+    # Same key, same source restriction as cockpit's claude-user.yml - one
+    # identity, reused across the two hosts it is actually granted on.
+    claude_key_from: "10.10.5.0/24"
+    # zabbix_server.log is 0640 zabbix:zabbix (verified live) - group
+    # membership alone gives read access, no sudo needed for that half.
+    claude_extra_groups:
+      - zabbix
+    # The zabbix_server binary's resolved path and the exact config flag it
+    # normally runs with (verified live via `ps`), so the sudoers rule matches
+    # a real invocation rather than a guessed one.
+    zabbix_server_bin: /usr/sbin/zabbix_server
+    zabbix_server_conf: /etc/zabbix/zabbix_server.conf
+    # Fixed, full commands only - no bare binary, no wildcard args. This is
+    # runtime control (config cache reload) and a status query, not the
+    # ability to stop/restart/reconfigure the server.
+    claude_sudo_commands:
+      - "{{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R config_cache_reload"
+      - "{{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R ha_status"
+
+  tasks:
+
+    - name: Assert the public key exists on the control machine
+      ansible.builtin.assert:
+        that:
+          - claude_pubkey_path is exists
+        fail_msg: >-
+          {{ claude_pubkey_path }} not found. This reuses the same keypair as
+          claude-user.yml - generate it there first if it does not exist yet.
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Ensure claude user exists (no sudo/wheel membership)
+      ansible.builtin.user:
+        name: "{{ claude_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: "{{ claude_extra_groups }}"
+        append: true
+        comment: "Claude Code diagnostic identity (zabbix_server, read-only + config cache reload)"
+
+    - name: Lock the password (key-only login)
+      ansible.builtin.user:
+        name: "{{ claude_user }}"
+        password_lock: true
+
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "/home/{{ claude_user }}/.ssh"
+        state: directory
+        owner: "{{ claude_user }}"
+        group: "{{ claude_user }}"
+        mode: "0700"
+
+    - name: Install authorized key for claude
+      ansible.posix.authorized_key:
+        user: "{{ claude_user }}"
+        state: present
+        key: "{{ lookup('file', claude_pubkey_path) }}"
+        key_options: "{{ ('from=\"' ~ claude_key_from ~ '\"') if claude_key_from else omit }}"
+        exclusive: true
+
+    - name: Install scoped sudoers rule (zabbix_server runtime control only)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/claude
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          # Managed by playbooks/users/claude-user-zabbix.yml — do not edit by hand.
+          {{ claude_user }} ALL=(zabbix) NOPASSWD: {{ claude_sudo_commands | join(', ') }}
+          Defaults:{{ claude_user }} !requiretty
+
+    # Harmless, read-only -R subcommand (reports HA cluster status, does not
+    # change anything) - proves the sudoers rule and the zabbix-run-as
+    # escalation both actually work, without invoking config_cache_reload
+    # for real on every provisioning run.
+    - name: Verify claude can escalate to run zabbix_server -R commands
+      ansible.builtin.command: >-
+        runuser -u {{ claude_user }} --
+        /usr/bin/sudo -n -H -u zabbix
+        {{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R ha_status
+      changed_when: false
+      register: claude_sudo_check
+      failed_when: claude_sudo_check.rc != 0
+
+    - name: Report escalation check
+      ansible.builtin.debug:
+        msg: "claude -> zabbix_server -R OK: {{ claude_sudo_check.stdout_lines }}"
+
+    - name: Verify claude can read the server log via group membership
+      ansible.builtin.command: >-
+        runuser -u {{ claude_user }} -- tail -n1 /var/log/zabbix/zabbix_server.log
+      changed_when: false
+      register: claude_log_check
+      failed_when: claude_log_check.rc != 0
+
+    - name: Report log read check
+      ansible.builtin.debug:
+        msg: "claude can read zabbix_server.log: {{ claude_log_check.stdout }}"

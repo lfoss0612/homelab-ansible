@@ -1,13 +1,17 @@
 # Claude Code access — the `claude` identity
 
 Runbook for `playbooks/users/claude-user.yml`, which provisions the account Claude Code
-uses to operate this repo.
+uses to operate this repo. A second, purpose-scoped playbook,
+`playbooks/users/claude-user-zabbix.yml`, extends the same identity to
+zabbix.home.lan — see [On zabbix.home.lan](#on-zabbixhomelan-exception-to-cockpit-only)
+below for why that host is an explicit, reasoned exception rather than a reversal of
+the policy.
 
 ## Design
 
 | Decision | Reason |
 |---|---|
-| **cockpit only** | cockpit is the Ansible control node, so the whole fleet is reachable from there through reviewed playbooks. No `claude` account exists on the other 12 hosts. |
+| **cockpit only, plus one reasoned exception** | cockpit is the Ansible control node, so the whole fleet is reachable from there through reviewed playbooks — a second account elsewhere is normally redundant. zabbix.home.lan is the one exception (2026-09-21): real-time Zabbix server diagnostics (tailing `zabbix_server.log`, running `zabbix_server -R <subcommand>` on demand) don't fit the "capture one command's output through a reviewed playbook" shape cockpit-mediated access gives. No `claude` account exists on the other 11 hosts. |
 | **Key auth, password locked** | Claude Code's shell calls have no TTY, so a password prompt cannot be answered. Every workaround (`sshpass`, a password in a file) writes the credential into the session transcript. Matches the keys-only convention from `ansible-user.yml`. |
 | **Not in `sudo`/`wheel`** | The only escalation is a scoped rule permitting Ansible as the `ansible` user. No direct root on cockpit. |
 | **`from=` on the key** | Restricts the key to the workstation it is used from. |
@@ -162,6 +166,55 @@ sudo userdel -r claude
 Automation is unaffected — the `ansible` identity is untouched. To re-grant, re-run the
 playbook.
 
+## On zabbix.home.lan (exception to cockpit-only)
+
+`playbooks/users/claude-user-zabbix.yml` grants a narrower, purpose-built version of the
+same identity directly on zabbix.home.lan, reusing the same keypair
+(`keys/claude_ed25519.pub`) so `~/.ssh/config`'s `IdentityFile ~/.ssh/id_claude` covers
+both hosts unchanged. It differs from `claude-user.yml` in what it actually grants:
+
+| | cockpit (`claude-user.yml`) | zabbix.home.lan (`claude-user-zabbix.yml`) |
+|---|---|---|
+| Escalates to | `ansible` user, running `ansible`/`ansible-playbook`/`ansible-inventory` | `zabbix` user, running exactly two fixed `zabbix_server -R <subcommand>` invocations |
+| Extra group | `ansible` (read `/opt/ansible`) | `zabbix` (read `/var/log/zabbix/zabbix_server.log`, mode `0640 zabbix:zabbix` — no sudo needed for this half) |
+| Grants | Effectively full fleet control via reviewed playbooks | `config_cache_reload` and `ha_status` only — cannot stop/restart/reconfigure the server, cannot run arbitrary `zabbix_server` flags |
+
+Bootstrap: same shape as cockpit's steps 3–5 above, run from cockpit as the `ansible`
+user (which already manages zabbix.home.lan, like every other inventory host):
+
+```bash
+sudo -iu ansible
+cd /opt/ansible
+ansible-playbook playbooks/users/claude-user-zabbix.yml --check --diff
+ansible-playbook playbooks/users/claude-user-zabbix.yml
+```
+
+Add a second block to `~/.ssh/config` on the workstation:
+
+```
+Host zabbix
+    HostName 10.0.5.9
+    User claude
+    IdentityFile ~/.ssh/id_claude
+    IdentitiesOnly yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+Operating pattern — direct SSH, no `ansible`/`sudo -u ansible` layer, since this identity
+talks to the Zabbix server itself rather than through Ansible:
+
+```bash
+ssh zabbix 'tail -n 100 /var/log/zabbix/zabbix_server.log'
+ssh zabbix 'sudo -n -H -u zabbix /usr/sbin/zabbix_server -c /etc/zabbix/zabbix_server.conf -R config_cache_reload'
+```
+
+If widening this beyond the two `-R` subcommands ever seems useful, add the new fixed
+command to `claude_sudo_commands` in the playbook and re-run it — do not hand-edit
+`/etc/sudoers.d/claude` on the host, the same "managed by this playbook" rule from
+cockpit applies here too.
+
 ## Variables
 
 | Variable | Default | Purpose |
@@ -173,6 +226,7 @@ playbook.
 
 ## Related
 
-- `playbooks/users/ansible-user.yml` — the automation identity this one escalates to
-- `playbooks/users/lfoss-user.yml` — the admin identity this playbook is modeled on
+- `playbooks/users/ansible-user.yml` — the automation identity `claude-user.yml` escalates to
+- `playbooks/users/lfoss-user.yml` — the admin identity `claude-user.yml` is modeled on
+- `playbooks/users/claude-user-zabbix.yml` — the zabbix.home.lan exception, see above
 - `docs/ansible-user.md` — original bootstrap notes
