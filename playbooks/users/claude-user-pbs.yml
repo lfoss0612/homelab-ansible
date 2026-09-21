@@ -1,0 +1,81 @@
+---
+# Add claude user to pbs for backup verification access.
+#
+# Scope: pbs only. Allows Claude Code to verify backup directory contents
+# and backup completion via SSH. No sudo access — read-only to backup paths.
+#
+# Runbook: see docs/claude-access.md. Revoke with:
+#   sudo userdel -r claude && sudo rm -f /etc/sudoers.d/claude
+
+- name: Add claude user to pbs for backup verification
+  hosts: pbs.home.lan
+  become: true
+  remote_user: ansible
+  gather_facts: true
+
+  vars:
+    claude_user: claude
+    claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
+    # Allow access from the same VLAN as cockpit (desktop/workstation)
+    claude_key_from: "10.10.5.0/24"
+    # Read access only, no ansible group
+    claude_extra_groups: []
+
+  tasks:
+
+    - name: Assert the public key exists on the control machine
+      ansible.builtin.assert:
+        that:
+          - claude_pubkey_path is exists
+        fail_msg: >-
+          {{ claude_pubkey_path }} not found. Generate the keypair first —
+          see docs/claude-access.md.
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Ensure claude user exists (no sudo/no groups)
+      ansible.builtin.user:
+        name: "{{ claude_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: []
+        comment: "Claude Code verification identity (pbs backups)"
+
+    - name: Lock the password (key-only login)
+      ansible.builtin.user:
+        name: "{{ claude_user }}"
+        password_lock: true
+
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "/home/{{ claude_user }}/.ssh"
+        state: directory
+        owner: "{{ claude_user }}"
+        group: "{{ claude_user }}"
+        mode: "0700"
+
+    - name: Install authorized key for claude
+      ansible.posix.authorized_key:
+        user: "{{ claude_user }}"
+        state: present
+        key: "{{ lookup('file', claude_pubkey_path) }}"
+        key_options: "{{ ('from=\"' ~ claude_key_from ~ '\"') if claude_key_from else omit }}"
+        exclusive: true
+
+    - name: Make backup directories readable by claude
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "o+rx"
+      loop:
+        - /mnt/backups
+        - /mnt/datastore
+        - /mnt/datastore/longhorn_backups
+      ignore_errors: true  # ignore if paths don't exist
+
+    - name: Report backup access
+      ansible.builtin.debug:
+        msg: >-
+          claude@pbs can now read backup directories.
+          Verify with: ssh pbs 'ls -lah /mnt/datastore/longhorn_backups/'
