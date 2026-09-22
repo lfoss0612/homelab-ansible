@@ -4,6 +4,13 @@ openclaw_group: openclaw
 openclaw_version: "latest"
 openclaw_node_min_version: "22.22.3"
 
+# Claude Code automation identity. Provisioned on all hosts for centralized
+# access and verification. Host-specific additional groups or sudoers rules
+# should be applied via standalone playbooks (e.g., claude-user.yml for cockpit's
+# ansible escalation, claude-user-pbs.yml for backup directory access).
+claude_user: claude
+claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
+
 # Root capabilities granted to the openclaw runtime user, as sudoers command
 # specs. Empty is the read-plane default: the agent observes, Ansible changes
 # things (docs/execution-model.md), so it needs no root at all. Any entry added

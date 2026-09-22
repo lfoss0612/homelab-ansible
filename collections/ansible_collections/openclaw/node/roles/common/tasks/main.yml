@@ -46,6 +46,30 @@
     shell: /bin/bash
     create_home: true
 
+- name: Create claude user (Claude Code automation identity)
+  ansible.builtin.user:
+    name: "{{ claude_user }}"
+    shell: /bin/bash
+    create_home: true
+    comment: "Claude Code automation identity"
+    password_lock: true
+
+- name: Ensure claude .ssh directory exists
+  ansible.builtin.file:
+    path: "/home/{{ claude_user }}/.ssh"
+    state: directory
+    owner: "{{ claude_user }}"
+    group: "{{ claude_user }}"
+    mode: "0700"
+
+- name: Install authorized key for claude (if key exists)
+  ansible.posix.authorized_key:
+    user: "{{ claude_user }}"
+    state: present
+    key: "{{ lookup('file', claude_pubkey_path) }}"
+    exclusive: true
+  ignore_errors: true
+
 # The read half of the read plane. Group membership, not sudo: it confers log
 # visibility and no ability to change anything. Intersected with the real group
 # database so a host missing one of them is skipped, never has it created.
@@ -64,6 +88,13 @@
     groups: "{{ openclaw_read_groups | intersect(ansible_facts.getent_group.keys() | list) }}"
     append: true
   notify: restart openclaw units for group membership
+  tags: privileges
+
+- name: Grant the claude user read-only log access (same as openclaw)
+  ansible.builtin.user:
+    name: "{{ claude_user }}"
+    groups: "{{ openclaw_read_groups | intersect(ansible_facts.getent_group.keys() | list) }}"
+    append: true
   tags: privileges
 
 # --- Read-plane enforcement -------------------------------------------------
