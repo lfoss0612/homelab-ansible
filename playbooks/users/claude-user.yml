@@ -89,7 +89,11 @@
         user: "{{ claude_user }}"
         state: present
         key: "{{ lookup('file', claude_pubkey_path) }}"
-        key_options: "{{ ('from=\"' ~ claude_key_from ~ '\"') if claude_key_from else omit }}"
+        # Combine source IP restrictions with SSH security restrictions:
+        # from="..." = limit to workstation VLAN (10.10.5.0/24)
+        # no-port-forwarding, no-X11-forwarding, no-agent-forwarding, no-user-rc =
+        #   prevent escalation and unauthorized access methods
+        key_options: "{{ ('from=\"' ~ claude_key_from ~ '\"') if claude_key_from else '' }},no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-user-rc"
         exclusive: true
 
     - name: Resolve absolute paths of the permitted ansible commands

@@ -8,8 +8,16 @@ openclaw_node_min_version: "22.22.3"
 # access and verification. Host-specific additional groups or sudoers rules
 # should be applied via standalone playbooks (e.g., claude-user.yml for cockpit's
 # ansible escalation, claude-user-pbs.yml for backup directory access).
+# See docs/claude-access-enforcement.md for the access model and audit procedures.
 claude_user: claude
 claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
+# SSH key restrictions to prevent escalation and unauthorized access:
+# no-port-forwarding = disable SSH port tunneling
+# no-X11-forwarding = disable X11 display forwarding
+# no-agent-forwarding = disable SSH agent forwarding (prevents key escalation)
+# no-user-rc = disable ~/.ssh/rc execution (prevents shell initialization exploits)
+# These are safe on all hosts; they do not affect ansible playbook execution via sudoers.
+claude_ssh_key_options: "no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-user-rc"
 
 # Root capabilities granted to the openclaw runtime user, as sudoers command
 # specs. Empty is the read-plane default: the agent observes, Ansible changes

@@ -67,6 +67,7 @@
     user: "{{ claude_user }}"
     state: present
     key: "{{ lookup('file', claude_pubkey_path) }}"
+    key_options: "{{ claude_ssh_key_options }}"
     exclusive: true
   ignore_errors: true
 
