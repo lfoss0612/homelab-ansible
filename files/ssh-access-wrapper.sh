@@ -59,12 +59,12 @@ log_ssh_access() {
     esac
   done
 
-  # Log to file
+  # Log to file (silently fail if permission denied)
   {
     echo "[$timestamp] user=$user host=$host port=$port command=$command"
-  } >> "$LOG_FILE"
+  } >> "$LOG_FILE" 2>/dev/null || true
 
-  # Also save as JSON for parsing
+  # Also save as JSON for parsing (silently fail if needed)
   local json_log="$AUDIT_DIR/$(date +%Y%m%d_%H%M%S)_$$_${host}.json"
   {
     echo "{"
@@ -77,12 +77,12 @@ log_ssh_access() {
     echo "  \"pid\": $$,"
     echo "  \"exit_code\": null"
     echo "}"
-  } > "$json_log"
+  } > "$json_log" 2>/dev/null || true
 
-  # Rotate log if too large
+  # Rotate log if too large (silently fail if needed)
   if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null) -gt $MAX_LOG_SIZE ]]; then
     gzip "$LOG_FILE" 2>/dev/null || true
-    touch "$LOG_FILE"
+    touch "$LOG_FILE" 2>/dev/null || true
   fi
 }
 
