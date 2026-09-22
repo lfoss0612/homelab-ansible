@@ -584,4 +584,7 @@ Not Ansible's to fix, recorded here only so the list is complete. Both live in
 
 - [`claude-access.md`](claude-access.md) — the scoped `claude` → `ansible` escalation, the
   model item 1 should follow
+- [`claude-access-enforcement.md`](claude-access-enforcement.md) — SSH key restrictions,
+  account isolation, and audit procedures to ensure `claude` can only use the `claude`
+  account (verified 2026-09-22)
 - `../README.md` — topology, playbooks, version pinning
