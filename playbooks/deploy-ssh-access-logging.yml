@@ -15,7 +15,7 @@
   gather_facts: true
 
   vars:
-    ssh_wrapper_src: "files/ssh-access-wrapper.sh"
+    ssh_wrapper_src: "../files/ssh-access-wrapper.sh"
     ssh_wrapper_dst: "/usr/local/bin/ssh-wrapper"
     ssh_bin: "/usr/bin/ssh"
     ssh_bin_real: "/usr/bin/ssh.real"
