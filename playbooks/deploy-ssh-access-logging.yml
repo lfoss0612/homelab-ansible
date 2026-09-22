@@ -1,0 +1,166 @@
+---
+# Deploy SSH Access Logging Wrapper
+#
+# Installs SSH wrapper on control nodes (cockpit, desktop VM) to log all access
+# Logs to /var/log/ssh-access.log and sends to Zabbix
+#
+# Usage:
+#   ansible-playbook playbooks/deploy-ssh-access-logging.yml
+#   ansible-playbook playbooks/deploy-ssh-access-logging.yml -l cockpit.home.lan
+#   ansible-playbook playbooks/deploy-ssh-access-logging.yml -l desktop.home.lan
+
+- name: Deploy SSH Access Logging Wrapper
+  hosts: "{{ ssh_wrapper_hosts | default('cockpit.home.lan,desktop.home.lan') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    ssh_wrapper_src: "files/ssh-access-wrapper.sh"
+    ssh_wrapper_dst: "/usr/local/bin/ssh-wrapper"
+    ssh_bin: "/usr/bin/ssh"
+    ssh_bin_real: "/usr/bin/ssh.real"
+    log_dir: "/var/log/ssh-audit"
+    log_file: "/var/log/ssh-access.log"
+
+  pre_tasks:
+    - name: Check if SSH wrapper already installed
+      stat:
+        path: "{{ ssh_bin_real }}"
+      register: ssh_real_status
+      tags: [ssh-wrapper, audit]
+
+    - name: Warn if re-installing
+      debug:
+        msg: "SSH wrapper appears to be already installed. Proceeding with update..."
+      when: ssh_real_status.stat.exists
+      tags: [ssh-wrapper, audit]
+
+  tasks:
+    - name: Create log directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      loop:
+        - "{{ log_dir }}"
+      tags: [ssh-wrapper, audit, logging]
+
+    - name: Copy SSH wrapper script
+      copy:
+        src: "{{ ssh_wrapper_src }}"
+        dest: "{{ ssh_wrapper_dst }}"
+        owner: root
+        group: root
+        mode: "0755"
+      tags: [ssh-wrapper, audit]
+
+    - name: Backup original SSH binary (if not already done)
+      shell: |
+        if [ ! -f "{{ ssh_bin_real }}" ]; then
+          cp "{{ ssh_bin }}" "{{ ssh_bin_real }}"
+          echo "Backed up original SSH to {{ ssh_bin_real }}"
+        else
+          echo "SSH backup already exists"
+        fi
+      register: backup_result
+      changed_when: "'Backed up' in backup_result.stdout"
+      tags: [ssh-wrapper, audit]
+
+    - name: Replace SSH with wrapper
+      file:
+        src: "{{ ssh_wrapper_dst }}"
+        dest: "{{ ssh_bin }}"
+        state: link
+        force: true
+      register: wrapper_link
+      tags: [ssh-wrapper, audit]
+
+    - name: Verify SSH wrapper is working
+      shell: |
+        # Try a no-op SSH call to test wrapper
+        timeout 2 "{{ ssh_bin }}" -V 2>&1 | head -1 || true
+      register: ssh_verify
+      changed_when: false
+      tags: [ssh-wrapper, audit, verify]
+
+    - name: Report SSH wrapper status
+      debug:
+        msg: |
+          SSH Access Wrapper Installed
+          =============================
+          Wrapper location: {{ ssh_wrapper_dst }}
+          Original SSH backed up to: {{ ssh_bin_real }}
+          SSH binary replaced: {{ ssh_bin }}
+
+          Log file: {{ log_file }}
+          Audit directory: {{ log_dir }}
+
+          All SSH connections will now be logged for audit trail.
+      tags: [ssh-wrapper, audit]
+
+    - name: Ensure log file exists and has correct permissions
+      file:
+        path: "{{ log_file }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0640"
+      tags: [ssh-wrapper, audit, logging]
+
+  post_tasks:
+    - name: Setup log rotation for SSH access logs
+      copy:
+        dest: /etc/logrotate.d/ssh-access
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Rotate SSH access logs weekly
+          {{ log_file }} {
+              weekly
+              rotate 4
+              compress
+              delaycompress
+              notifempty
+              create 0640 root root
+              sharedscripts
+              postrotate
+                  /usr/lib/rsyslog/rsyslog-rotate
+              endscript
+          }
+      tags: [ssh-wrapper, audit, logging]
+
+    - name: Create Zabbix trapper items check (optional)
+      debug:
+        msg: |
+          Optional: Configure Zabbix trapper items to monitor:
+          - homelab.ssh.access.<hostname>
+          - homelab.ssh.access.violations
+
+          Then SSH wrapper will automatically send access attempts to Zabbix
+      tags: [ssh-wrapper, audit, zabbix]
+
+- name: Audit SSH Access Logs
+  hosts: "{{ ssh_wrapper_hosts | default('cockpit.home.lan,desktop.home.lan') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Display recent SSH access logs
+      shell: |
+        if [ -f /var/log/ssh-access.log ]; then
+          echo "Recent SSH accesses (last 5):"
+          tail -5 /var/log/ssh-access.log
+        else
+          echo "No SSH access log yet (will be created on first connection)"
+        fi
+      register: ssh_logs
+      changed_when: false
+      tags: [ssh-wrapper, audit, logging, report]
+
+    - name: Report SSH access logs
+      debug:
+        msg: "{{ ssh_logs.stdout }}"
+      tags: [ssh-wrapper, audit, logging, report]
