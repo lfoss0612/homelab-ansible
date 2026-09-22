@@ -149,3 +149,4 @@
     - name: Report escalation check
       ansible.builtin.debug:
         msg: "claude -> ansible OK: {{ claude_sudo_check.stdout_lines[0] }}"
+      when: claude_sudo_check.stdout_lines is defined and claude_sudo_check.stdout_lines | length > 0
