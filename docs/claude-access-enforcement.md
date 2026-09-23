@@ -24,9 +24,13 @@ Defaults:claude !requiretty
 - No other escalation paths
 
 **pbs.home.lan, zabbix.home.lan:**
-- Host-specific sudoers via `claude-user-*.yml` playbooks
-- Escalation is to `root` only for specific diagnostic commands (zabbix_server -R, config cache reload)
-- Read access via group membership (zabbix, adm, systemd-journal)
+- No sudo/escalation of any kind on either host — `claude` cannot become `root`, `ansible`, or
+  anyone else here
+- Read access only, via group membership (zabbix, adm, systemd-journal)
+- zabbix.home.lan previously (until 2026-09-23) also granted root escalation for two fixed
+  `zabbix_server -R` diagnostic commands; removed per this document's own Goal above (no root
+  path anywhere, not even a narrowly-scoped one). Editing `zabbix_server.conf` and reloading its
+  config cache is now `ansible`'s job — see `playbooks/manage-zabbix-server-conf.yml`.
 
 ### 3. SSH Key Restrictions (Added) ✓
 SSH supports runtime restrictions in `authorized_keys`:

@@ -7,12 +7,19 @@
 # from there through reviewed playbooks, so a second account elsewhere would be
 # redundant. This is an exception, not a reversal of that reasoning: the actual
 # need here is real-time server-side Zabbix diagnostics - tailing
-# zabbix_server.log and running `zabbix_server -R config_cache_reload` - which
-# an ansible-playbook run mediated through cockpit cannot do (a playbook task
-# can run a command once and capture its output, but that is not the same as
-# being able to read the live log directly while investigating, and there is
-# no reviewed-playbook shape for "run whatever -R subcommand the investigation
-# turns out to need next").
+# zabbix_server.log while investigating - which an ansible-playbook run
+# mediated through cockpit cannot do as well (a playbook task can run a
+# command once and capture its output, but that is not the same as being able
+# to read the live log directly while investigating).
+#
+# No sudo/root escalation at all: claude only ever escalates to the ansible
+# user (on cockpit, for reviewed playbooks) - see docs/claude-access.md and
+# docs/claude-access-enforcement.md. A previous version of this playbook also
+# granted claude root escalation for two fixed, read-only `zabbix_server -R`
+# commands (needed because zabbix_server.conf is 0600 root:root) - removed
+# 2026-09-23 per policy: claude gets no root path anywhere, full stop, even a
+# narrowly-scoped one. Re-running this playbook actively removes that grant
+# from any host it was previously applied to.
 #
 # Runbook: docs/claude-access.md. Revoke with:
 #   sudo userdel -r claude && sudo rm -f /etc/sudoers.d/claude
@@ -33,22 +40,6 @@
     # membership alone gives read access, no sudo needed for that half.
     claude_extra_groups:
       - zabbix
-    # The zabbix_server binary's resolved path and the exact config flag it
-    # normally runs with (verified live via `ps`), so the sudoers rule matches
-    # a real invocation rather than a guessed one.
-    zabbix_server_bin: /usr/sbin/zabbix_server
-    zabbix_server_conf: /etc/zabbix/zabbix_server.conf
-    # Fixed, full commands only - no bare binary, no wildcard args. Escalates
-    # to root, not the zabbix user: /etc/zabbix/zabbix_server.conf is 0600
-    # root:root (verified live - it holds DB credentials), and -R subcommands
-    # read it to locate the runtime control sockets before they can do
-    # anything, so even a read-only -R call fails as the zabbix user with
-    # "Permission denied" on the config file. Still tightly scoped: these are
-    # two fixed, full commands (config cache reload, a status query), not the
-    # ability to stop/restart/reconfigure the server or run arbitrary flags.
-    claude_sudo_commands:
-      - "{{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R config_cache_reload"
-      - "{{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R ha_status"
 
   tasks:
 
@@ -70,7 +61,7 @@
         create_home: true
         groups: "{{ claude_extra_groups }}"
         append: true
-        comment: "Claude Code diagnostic identity (zabbix_server, read-only + config cache reload)"
+        comment: "Claude Code diagnostic identity (zabbix_server.log read-only; no sudo)"
 
     - name: Lock the password (key-only login)
       ansible.builtin.user:
@@ -93,34 +84,13 @@
         key_options: "{{ ('from=\"' ~ claude_key_from ~ '\"') if claude_key_from else '' }},no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-user-rc"
         exclusive: true
 
-    - name: Install scoped sudoers rule (zabbix_server runtime control only)
-      ansible.builtin.copy:
-        dest: /etc/sudoers.d/claude
-        owner: root
-        group: root
-        mode: "0440"
-        validate: /usr/sbin/visudo -cf %s
-        content: |
-          # Managed by playbooks/users/claude-user-zabbix.yml — do not edit by hand.
-          {{ claude_user }} ALL=(root) NOPASSWD: {{ claude_sudo_commands | join(', ') }}
-          Defaults:{{ claude_user }} !requiretty
-
-    # Harmless, read-only -R subcommand (reports HA cluster status, does not
-    # change anything) - proves the sudoers rule and the root escalation both
-    # actually work, without invoking config_cache_reload for real on every
-    # provisioning run.
-    - name: Verify claude can escalate to run zabbix_server -R commands
-      ansible.builtin.command: >-
-        runuser -u {{ claude_user }} --
-        /usr/bin/sudo -n -H
-        {{ zabbix_server_bin }} -c {{ zabbix_server_conf }} -R ha_status
-      changed_when: false
-      register: claude_sudo_check
-      failed_when: claude_sudo_check.rc != 0
-
-    - name: Report escalation check
-      ansible.builtin.debug:
-        msg: "claude -> zabbix_server -R OK: {{ claude_sudo_check.stdout_lines }}"
+    # No sudoers rule for claude here at all -- see the header comment. This
+    # actively removes any grant a previous run of this playbook left behind,
+    # rather than just not creating a new one.
+    - name: Remove any sudoers rule previously granted to claude
+      ansible.builtin.file:
+        path: /etc/sudoers.d/claude
+        state: absent
 
     - name: Verify claude can read the server log via group membership
       ansible.builtin.command: >-
@@ -132,3 +102,20 @@
     - name: Report log read check
       ansible.builtin.debug:
         msg: "claude can read zabbix_server.log: {{ claude_log_check.stdout }}"
+
+    # Positive proof of the policy this playbook exists to enforce: claude has
+    # no sudo path on this host at all, not even the narrow one this playbook
+    # used to grant. `sudo -n` never prompts, so a nonzero exit here means
+    # denied outright rather than "would have asked for a password" -- exact
+    # wording of sudo's denial message varies by version/distro, so this only
+    # asserts on exit status, not stderr text.
+    - name: Verify claude cannot escalate to root (or anyone else) at all
+      ansible.builtin.command: >-
+        runuser -u {{ claude_user }} -- sudo -n -l
+      changed_when: false
+      register: claude_sudo_denied_check
+      failed_when: claude_sudo_denied_check.rc == 0
+
+    - name: Report no-sudo verification
+      ansible.builtin.debug:
+        msg: "Confirmed: claude has no sudo path on this host."

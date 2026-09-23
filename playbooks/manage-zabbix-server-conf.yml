@@ -1,0 +1,77 @@
+---
+# Manage specific settings in /etc/zabbix/zabbix_server.conf, and reload the
+# config cache when anything actually changes.
+#
+# WHY THIS EXISTS: claude used to hold a narrow root sudoers grant on
+# zabbix.home.lan for two fixed, read-only `zabbix_server -R` commands
+# (config_cache_reload, ha_status) -- removed 2026-09-23 per policy (claude
+# gets no root escalation anywhere, not even a narrowly-scoped one; see
+# docs/claude-access.md's "On zabbix.home.lan" section and
+# docs/claude-access-enforcement.md). The `ansible` user already has
+# unconditional root on every host (`ansible ALL=(ALL,!openclaw,!lfoss)
+# NOPASSWD:ALL`, playbooks/users/ansible-user.yml) -- so editing this
+# 0600 root:root file and reloading the config cache afterward was never
+# actually blocked on permissions, only on there being a reviewed playbook to
+# do it through instead of an ad-hoc interactive command. This is that
+# playbook.
+#
+# SAFETY: this does NOT template or overwrite the whole file -- zabbix_server.conf
+# holds live DB credentials and dozens of settings this repo has never audited
+# in full (see zabbix-server-upgrade.yml, which reads DBUser/DBPassword/DBName
+# from it rather than assuming values). A full-file template here would risk
+# silently reverting or wiping settings nobody told this playbook about.
+# Instead, each entry in zabbix_server_conf_settings is applied with
+# `lineinfile`, touching only its own matching line (commented-default or
+# already-set) and leaving everything else in the file untouched -- the same
+# pattern already used for zabbix_agentd.conf in deploy-zabbix-agent.yml.
+#
+# zabbix_server_conf_settings is empty by default, making a bare run of this
+# playbook a true no-op (nothing to change, nothing to reload) -- safe to run
+# any time to confirm that. Supply real settings via -e or a vars file when
+# there's an actual change to make, e.g.:
+#
+#   ansible-playbook playbooks/manage-zabbix-server-conf.yml --check --diff \
+#     -e '{"zabbix_server_conf_settings": [{"key": "CacheSize", "value": "64M"}]}'
+#
+# Usage:
+#   ansible-playbook playbooks/manage-zabbix-server-conf.yml --check --diff
+#   ansible-playbook playbooks/manage-zabbix-server-conf.yml
+
+- name: Manage specific zabbix_server.conf settings and reload on change
+  hosts: "{{ zabbix_server_conf_hosts | default('zabbix.home.lan') }}"
+  become: true
+  remote_user: ansible
+  gather_facts: false
+
+  vars:
+    zabbix_server_conf_path: /etc/zabbix/zabbix_server.conf
+    zabbix_server_bin: /usr/sbin/zabbix_server
+    # List of {key, value} pairs. Each becomes a `Key=Value` line, matching
+    # either the commented-out default (`# Key=...`) or an already-uncommented
+    # line for that key -- never touching any line for a different key.
+    # Empty by default: see the header comment above.
+    zabbix_server_conf_settings: []
+
+  tasks:
+    - name: Apply each requested setting
+      # No `validate:` here -- zabbix_server has no config-only lint/test mode
+      # to shell out to (unlike sshd -t or visudo -cf elsewhere in this repo).
+      # Safety instead comes from lineinfile only ever touching one key's own
+      # line (see header comment) plus --check/--diff before a real run.
+      ansible.builtin.lineinfile:
+        path: "{{ zabbix_server_conf_path }}"
+        regexp: "^#?\\s*{{ item.key }}=.*"
+        line: "{{ item.key }}={{ item.value }}"
+        state: present
+      loop: "{{ zabbix_server_conf_settings }}"
+      loop_control:
+        label: "{{ item.key }}"
+      notify: reload zabbix config cache
+
+  handlers:
+    # Same command claude used to run directly; now runs as ansible, which
+    # already has unconditional root on this host.
+    - name: reload zabbix config cache
+      ansible.builtin.command: >-
+        {{ zabbix_server_bin }} -c {{ zabbix_server_conf_path }} -R config_cache_reload
+      changed_when: true

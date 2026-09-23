@@ -172,10 +172,13 @@ git add test.yml  # Should be blocked
 
 ### Layer 5: Sudoers Whitelisting
 - **File:** `/etc/sudoers.d/claude`
-- **Model:** Whitelist only specific commands per host
-- **Cockpit:** `ansible`, `ansible-playbook`, `ansible-inventory`
-- **PBS:** No escalation allowed
-- **Zabbix:** Specific diagnostic commands only
+- **Model:** Whitelist only specific commands per host — `claude` never escalates to `root` or
+  `lfoss` anywhere, no exceptions
+- **Cockpit:** escalates to `ansible` only, running `ansible`/`ansible-playbook`/`ansible-inventory`
+- **PBS:** no escalation allowed
+- **Zabbix:** no escalation allowed (until 2026-09-23, also had root for two fixed diagnostic
+  commands — removed per policy; `ansible` now owns `zabbix_server.conf` edits and config-cache
+  reloads via `playbooks/manage-zabbix-server-conf.yml`)
 
 ### Layer 6: SSH Access Logging
 - **Mechanism:** server-side, `/etc/ssh/sshd_config.d/10-claude-restrictions.conf`
