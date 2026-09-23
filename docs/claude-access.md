@@ -175,9 +175,16 @@ both hosts unchanged. It differs from `claude-user.yml` in what it actually gran
 
 | | cockpit (`claude-user.yml`) | zabbix.home.lan (`claude-user-zabbix.yml`) |
 |---|---|---|
-| Escalates to | `ansible` user, running `ansible`/`ansible-playbook`/`ansible-inventory` | `root`, running exactly two fixed `zabbix_server -R <subcommand>` invocations — `zabbix_server.conf` is `0600 root:root` (holds DB credentials), so even a read-only `-R` call must read it as root first |
-| Extra group | `ansible` (read `/opt/ansible`) | `zabbix` (read `/var/log/zabbix/zabbix_server.log`, mode `0640 zabbix:zabbix` — no sudo needed for this half) |
-| Grants | Effectively full fleet control via reviewed playbooks | `config_cache_reload` and `ha_status` only — cannot stop/restart/reconfigure the server, cannot run arbitrary `zabbix_server` flags |
+| Escalates to | `ansible` user, running `ansible`/`ansible-playbook`/`ansible-inventory` | **Nothing — no sudo at all** |
+| Extra group | `ansible` (read `/opt/ansible`) | `zabbix` (read `/var/log/zabbix/zabbix_server.log`, mode `0640 zabbix:zabbix` — no sudo needed for this) |
+| Grants | Effectively full fleet control via reviewed playbooks | Read-only: `zabbix_server.log` via group membership only |
+
+**2026-09-23:** this used to also grant `claude` root escalation for two fixed, read-only
+`zabbix_server -R config_cache_reload`/`-R ha_status` commands (`zabbix_server.conf` is
+`0600 root:root`, so even a read-only `-R` call needs root to open it). Removed per policy:
+`claude` never gets a root or `lfoss` escalation path anywhere, even a narrowly-scoped one — the
+only escalation path anywhere for `claude` is `cockpit` → `ansible`. Re-running
+`claude-user-zabbix.yml` actively strips this grant from any host it was previously applied to.
 
 Bootstrap: same shape as cockpit's steps 3–5 above, run from cockpit as the `ansible`
 user (which already manages zabbix.home.lan, like every other inventory host):
@@ -202,18 +209,22 @@ Host zabbix
     ControlPersist 10m
 ```
 
-Operating pattern — direct SSH, no `ansible`/`sudo -u ansible` layer, since this identity
-talks to the Zabbix server itself rather than through Ansible:
+Operating pattern — direct SSH, read-only, no sudo of any kind:
 
 ```bash
 ssh zabbix 'tail -n 100 /var/log/zabbix/zabbix_server.log'
-ssh zabbix 'sudo -n -H /usr/sbin/zabbix_server -c /etc/zabbix/zabbix_server.conf -R config_cache_reload'
 ```
 
-If widening this beyond the two `-R` subcommands ever seems useful, add the new fixed
-command to `claude_sudo_commands` in the playbook and re-run it — do not hand-edit
-`/etc/sudoers.d/claude` on the host, the same "managed by this playbook" rule from
-cockpit applies here too.
+Editing `zabbix_server.conf` or reloading its config cache is `ansible`'s job now, not
+`claude`'s — see `playbooks/manage-zabbix-server-conf.yml`, run from cockpit as `ansible`
+the same way every other fleet change is made:
+
+```bash
+sudo -iu ansible
+cd /opt/ansible
+ansible-playbook playbooks/manage-zabbix-server-conf.yml --check --diff \
+  -e '{"zabbix_server_conf_settings": [{"key": "SomeKey", "value": "SomeValue"}]}'
+```
 
 ## Variables
 

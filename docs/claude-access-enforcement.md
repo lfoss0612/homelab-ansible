@@ -24,9 +24,13 @@ Defaults:claude !requiretty
 - No other escalation paths
 
 **pbs.home.lan, zabbix.home.lan:**
-- Host-specific sudoers via `claude-user-*.yml` playbooks
-- Escalation is to `root` only for specific diagnostic commands (zabbix_server -R, config cache reload)
-- Read access via group membership (zabbix, adm, systemd-journal)
+- No sudo/escalation of any kind on either host — `claude` cannot become `root`, `ansible`, or
+  anyone else here
+- Read access only, via group membership (zabbix, adm, systemd-journal)
+- zabbix.home.lan previously (until 2026-09-23) also granted root escalation for two fixed
+  `zabbix_server -R` diagnostic commands; removed per this document's own Goal above (no root
+  path anywhere, not even a narrowly-scoped one). Editing `zabbix_server.conf` and reloading its
+  config cache is now `ansible`'s job — see `playbooks/manage-zabbix-server-conf.yml`.
 
 ### 3. SSH Key Restrictions (Added) ✓
 SSH supports runtime restrictions in `authorized_keys`:
@@ -86,7 +90,14 @@ ssh cockpit -u claude 'sudo -u ansible whoami'  # Should return 'ansible'
 ## Future Enhancements
 
 1. **Automated access audit**: Add a playbook that verifies all constraints monthly
-2. **SSH session logging**: Enable SSH session recording for compliance
-3. **Baseline SSH restrictions on all accounts**: Apply `no-port-forwarding,no-X11-forwarding` to all SSH keys fleet-wide
-4. **Host-specific SSH restrictions**: Tighten claudeon backup/diagnostic hosts with additional options
+2. ~~**SSH session logging**: Enable SSH session recording for compliance~~ **Done 2026-09-23**,
+   server-side rather than client-side (a client-side wrapper and a client-side `LocalCommand`
+   were both tried and abandoned first — see `homelab-vault`
+   `Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md`). `playbooks/deploy-claude-ssh-restrictions.yml`
+   sets `LogLevel VERBOSE` on cockpit's sshd, which logs every login attempt server-side and can't
+   be bypassed by client behavior. Not yet extended to `zabbix.home.lan`.
+3. **Baseline SSH restrictions on all accounts**: Apply `no-port-forwarding,no-X11-forwarding` to all SSH keys fleet-wide.
+   **Still deliberately scoped to `claude` only** — see the Goal above; do not widen this to other
+   accounts without an explicit decision to do so.
+4. **Host-specific SSH restrictions**: Tighten claude on backup/diagnostic hosts with additional options
 

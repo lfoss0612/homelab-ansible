@@ -1,0 +1,75 @@
+---
+# Deploy the claude SSH audit/restriction sshd config
+#
+# Replaces the abandoned global-ssh-wrapper and client-side LocalCommand approaches (see
+# homelab-vault Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md) with a server-side
+# sshd_config.d drop-in. This is the actual audit trail: LogLevel VERBOSE logs key fingerprints
+# on every accepted/failed login for all users (can't be bypassed by any client behavior, unlike
+# the two approaches this replaces), and a `Match User claude` block enforces publickey-only auth
+# and refuses all forwarding for that account specifically.
+#
+# Only claude_ssh_restricted_users (claude today; openclaw has no SSH login path on any host
+# yet) get the Match-block restrictions. Every other account (ansible, lfoss, root, ...) is
+# untouched -- LogLevel VERBOSE logs everyone's login attempts (that's inherent to sshd, and
+# desired: a real audit trail), but auth/forwarding behavior only changes for the listed users.
+#
+# Codifies a config first applied by hand on cockpit on 2026-09-22/23 during incident recovery --
+# see the incident note above for why (this repo's own rule is "never by hand on the host").
+#
+# Usage:
+#   ansible-playbook playbooks/deploy-claude-ssh-restrictions.yml --check --diff
+#   ansible-playbook playbooks/deploy-claude-ssh-restrictions.yml
+
+- name: Deploy claude/openclaw SSH restrictions and audit logging
+  hosts: "{{ claude_ssh_restrictions_hosts | default('cockpit.home.lan') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    sshd_dropin_path: /etc/ssh/sshd_config.d/10-claude-restrictions.conf
+    # openclaw has no authorized_key / SSH login path on any host today (see the common role --
+    # it only provisions one for claude), so there's nothing to restrict yet. Add it here once
+    # openclaw actually gains SSH access somewhere; until then a Match block for it would be
+    # untested and unverifiable.
+    claude_ssh_restricted_users:
+      - claude
+
+  tasks:
+    - name: Render claude/openclaw sshd restrictions drop-in
+      copy:
+        dest: "{{ sshd_dropin_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          # Managed by Ansible -- playbooks/deploy-claude-ssh-restrictions.yml. Do not edit on
+          # the host; this file is fully regenerated on every run. See homelab-vault
+          # Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md for why this exists and
+          # what it replaces.
+
+          # Server-side audit trail: logs key fingerprints on every accepted/failed login, for
+          # every account. Can't be bypassed by the client -- unlike the wrapper/LocalCommand
+          # approaches this replaces, which both turned out to be evadable or unsafe.
+          LogLevel VERBOSE
+
+          {% for user in claude_ssh_restricted_users %}
+          Match User {{ user }}
+              AuthenticationMethods publickey
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              X11Forwarding no
+              AllowAgentForwarding no
+              AllowTcpForwarding no
+
+          {% endfor %}
+      notify: restart ssh
+      tags: [claude-ssh-restrictions]
+
+  handlers:
+    # NOT reload: cockpit hits a pre-existing systemd socket-activation bug on `reload`
+    # ("fatal: Cannot bind any address"), unrelated to this config's content. `restart` avoids it.
+    - name: restart ssh
+      systemd:
+        name: ssh
+        state: restarted
