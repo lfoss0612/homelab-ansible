@@ -1,9 +1,13 @@
 #!/bin/bash
 # SSH Access Wrapper and Logger
-# Logs all SSH connections for audit trail
+# Logs SSH connections made by the claude/openclaw accounts for audit trail.
 #
-# Install on control nodes (cockpit, desktop VM) to track access
+# Install on control nodes (cockpit, desktop VM) to track claude/openclaw access
 # Replaces /usr/bin/ssh or wraps it via PATH modification
+#
+# This replaces /usr/bin/ssh system-wide, so it runs for every account on the host --
+# ansible, lfoss, root, and anyone else must pass straight through with zero logging,
+# zero JSON audit writes, and zero Zabbix sends. Only claude/openclaw are logged.
 #
 # Logs to:
 # - /var/log/ssh-access.log (human-readable)
@@ -16,8 +20,17 @@ LOG_FILE="/var/log/ssh-access.log"
 AUDIT_DIR="/var/log/ssh-audit"
 MAX_LOG_SIZE=$((100 * 1024 * 1024))  # 100MB log rotation
 
-# Ensure audit directory exists
-mkdir -p "$AUDIT_DIR"
+# Only these accounts are logged -- everyone else on the host is untouched.
+LOGGED_USERS=("claude" "openclaw")
+
+is_logged_user() {
+  local candidate="$1"
+  local logged
+  for logged in "${LOGGED_USERS[@]}"; do
+    [[ "$candidate" == "$logged" ]] && return 0
+  done
+  return 1
+}
 
 # Function to log SSH connection
 log_ssh_access() {
@@ -26,6 +39,9 @@ log_ssh_access() {
   local host=""
   local port="22"
   local command=""
+
+  # Ensure audit directory exists (lazily -- only for accounts we actually log)
+  mkdir -p "$AUDIT_DIR" 2>/dev/null || true
 
   # Parse SSH arguments to extract target and command
   while [[ $# -gt 0 ]]; do
@@ -99,8 +115,10 @@ send_to_zabbix() {
   fi
 }
 
-# Log this access
-log_ssh_access "$@"
+# Log this access -- claude/openclaw only. Every other account passes through untouched.
+if is_logged_user "$(whoami)"; then
+  log_ssh_access "$@"
+fi
 
 # Call original SSH binary
 if [[ -f "$SSH_BIN" ]]; then

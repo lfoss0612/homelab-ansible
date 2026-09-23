@@ -1,7 +1,9 @@
 ---
 # Deploy SSH Access Logging Wrapper
 #
-# Installs SSH wrapper on control nodes (cockpit, desktop VM) to log all access
+# Installs SSH wrapper on control nodes (cockpit, desktop VM) to log claude/openclaw
+# access. Every other account on the host passes through untouched -- see the
+# LOGGED_USERS allowlist in files/ssh-access-wrapper.sh.
 # Logs to /var/log/ssh-access.log and sends to Zabbix
 #
 # Usage:
@@ -123,7 +125,10 @@
           Log file: {{ log_file }}
           Audit directory: {{ log_dir }}
 
-          All SSH connections will now be logged for audit trail.
+          SSH connections from the claude/openclaw accounts will now be logged for audit
+          trail. Every other account on this host (ansible, lfoss, root, ...) passes
+          through the wrapper untouched -- no logging, no JSON audit writes, no Zabbix
+          sends. See files/ssh-access-wrapper.sh's LOGGED_USERS allowlist.
       tags: [ssh-wrapper, audit]
 
     - name: Ensure log file exists and has correct permissions

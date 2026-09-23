@@ -1,13 +1,21 @@
 # Claude Code Access Control: Implementation Summary
 
-Complete implementation of Claude Code access control across homelab infrastructure with a 7-layer security model.
+Design and implementation plan for Claude Code access control across homelab infrastructure with a
+7-layer security model.
 
-## Completed Issues (All 6)
+**Status (2026-09-23, corrected):** the six items below describe playbooks and scripts written for
+this model, not a deployed system. Nothing has actually been run against a live host yet. The
+original version of this document claimed "All 6 issues complete and deployed" -- that was
+inaccurate; see `homelab-vault/TODO.md` → "Ansible — Claude access control deployment" for the real
+outstanding rollout steps, and `docs/claude-access.md` for what is actually running today (`claude`
+on `cockpit` + the `zabbix.home.lan` exception only).
 
-### Issue #1: Git Hook Security Validation ✓
-**Status:** Complete
+## Designed Issues (0 of 6 actually deployed)
 
-Implemented pre-commit and pre-push git hooks across three repositories:
+### Issue #1: Git Hook Security Validation
+**Status:** Script written, not confirmed installed anywhere
+
+Hook scripts written for pre-commit and pre-push checks across three repositories:
 - `homelab-ansible`
 - `homelab-gitops`
 - `homelab-vault`
@@ -22,10 +30,14 @@ Implemented pre-commit and pre-push git hooks across three repositories:
 
 **Hook Location:** `~/.claude/git-hooks/pre-commit-security.sh`
 
-### Issue #2: SSH Wrapper Deployment ✓
-**Status:** Complete with recovery guide
+### Issue #2: SSH Wrapper Deployment
+**Status:** Written, not deployed to cockpit/desktop yet
 
-Deployed SSH access logging wrapper on control nodes (cockpit, desktop) to track all SSH connections for audit trail.
+SSH access logging wrapper written for control nodes (cockpit, desktop) to track `claude`/`openclaw`
+SSH connections for audit trail. Every other account (`ansible`, `lfoss`, `root`, ...) passes
+through untouched -- the wrapper replaces `/usr/bin/ssh` system-wide, so it filters by invoking
+user internally (`LOGGED_USERS` allowlist in the script; an earlier draft was missing this check
+and logged every account).
 
 **Files Created:**
 - `playbooks/deploy-ssh-access-logging.yml` - Deployment playbook
@@ -33,7 +45,7 @@ Deployed SSH access logging wrapper on control nodes (cockpit, desktop) to track
 - `docs/ssh-wrapper-recovery.md` - Recovery guide for failed deployments
 
 **Features:**
-- Logs all SSH connections to `/var/log/ssh-access.log`
+- Logs `claude`/`openclaw` SSH connections to `/var/log/ssh-access.log`
 - JSON audit logs in `/var/log/ssh-audit/`
 - Automatic log rotation (100MB)
 - Silent error handling (doesn't break SSH if logs fail)
@@ -46,10 +58,10 @@ ansible-playbook playbooks/deploy-ssh-access-logging.yml --check --diff
 ansible-playbook playbooks/deploy-ssh-access-logging.yml
 ```
 
-### Issue #3: Zabbix Items Creation ✓
-**Status:** Complete
+### Issue #3: Zabbix Items Creation
+**Status:** Playbook written, items not created in Zabbix yet
 
-Implemented playbook to create Zabbix trapper items for receiving audit results.
+Playbook written to create Zabbix trapper items for receiving audit results.
 
 **Files Created:**
 - `playbooks/setup-claude-audit-zabbix-items.yml`
@@ -66,10 +78,11 @@ ansible-playbook playbooks/setup-claude-audit-zabbix-items.yml \
   -e zabbix_api_cred=<password>
 ```
 
-### Issue #4: Audit Scheduling ✓
-**Status:** Complete
+### Issue #4: Audit Scheduling
+**Status:** Playbook written, timer not installed yet
 
-Implemented systemd timer for automated weekly audits.
+Playbook written for a systemd timer to run automated weekly audits. Depends on Issues #2 and #3
+above (the audit has nothing to log to or receive results from until those are deployed).
 
 **Files Created:**
 - `playbooks/setup-claude-audit-timer.yml`
@@ -93,20 +106,26 @@ systemctl start claude-access-audit.service
 journalctl -u claude-access-audit.service -f
 ```
 
-### Issue #5: Git Hook Grep Warning ✓
-**Status:** Complete
+### Issue #5: Git Hook Grep Warning
+**Status:** Claimed fixed, not independently verifiable
 
-Fixed grep pattern escaping in pre-commit hook to eliminate false warnings.
+`grep -F` (literal string matching) is intended to eliminate false `grep: unrecognized option`
+warnings in the pre-commit hook. The hook source lives only at
+`~/.claude/git-hooks/pre-commit-security.sh` on the local workstation, not in any repo, so this
+can't be confirmed from a repo checkout -- verify the local script actually uses `grep -F` before
+relying on this.
 
 **Changes:**
 - Replaced regex patterns with grep -F (literal string matching)
 - Certificate patterns no longer interpreted as grep options
 - Cleaner output without warnings
 
-### Issue #6: Git Hooks Verification ✓
-**Status:** Complete
+### Issue #6: Git Hooks Verification
+**Status:** Not verified
 
-Verified pre-commit hooks are installed and working across all repositories.
+No confirmed record of the commands below actually being run against real local checkouts of all
+three repos. A fresh clone of `homelab-vault` has no `.git/hooks/pre-commit`/`pre-push` installed
+(only git's default `.sample` files) -- run this checklist for real in each repo before trusting it.
 
 **Verification:**
 ```bash
@@ -156,7 +175,8 @@ git add test.yml  # Should be blocked
 
 ### Layer 6: SSH Access Logging
 - **Wrapper:** `/usr/local/bin/ssh-wrapper`
-- **Logs:** `/var/log/ssh-access.log` + JSON audit directory
+- **Logs:** `/var/log/ssh-access.log` + JSON audit directory -- `claude`/`openclaw` only, every
+  other account passes through untouched (`LOGGED_USERS` allowlist in the script)
 - **Hosts:** cockpit, desktop
 
 ### Layer 7: Audit & Monitoring
@@ -181,15 +201,15 @@ git add test.yml  # Should be blocked
 
 ## Deployment Checklist
 
-- [x] Claude user exists on all hosts (via common role)
-- [x] SSH key restrictions enforced (no-* options)
-- [x] Sudoers whitelisting configured per host
-- [x] Git hooks installed in all repos
-- [x] SSH wrapper deployed on control nodes
-- [x] Zabbix items created for monitoring
-- [x] Audit timer scheduled (Monday 2 AM UTC)
-- [x] Recovery documentation complete
-- [x] All tests passing
+- [x] Claude user exists on cockpit + zabbix.home.lan exception (via common role / claude-user-zabbix.yml)
+- [x] SSH key restrictions enforced for `claude` (no-* options)
+- [x] Sudoers whitelisting configured for `claude` per host
+- [ ] Git hooks actually installed and tested in all 3 repos' local checkouts
+- [ ] SSH wrapper deployed on control nodes (script fixed 2026-09-23 to filter by user; still not run)
+- [ ] Zabbix items created for monitoring
+- [ ] Audit timer scheduled (Monday 2 AM UTC)
+- [x] Recovery documentation written
+- [ ] Any of the above actually tested end-to-end
 
 ## Testing & Verification
 
@@ -217,9 +237,9 @@ ssh cockpit 'systemctl status claude-access-audit.timer'
 - Dashboard shows compliance status
 
 ### Journalctl Logging
-- All SSH connections logged
-- Audit timer events logged
-- Systemd timer status queryable
+- `claude`/`openclaw` SSH connections logged (once Issue #2 is deployed) -- every other account untouched
+- Audit timer events logged (once Issue #4 is deployed)
+- Systemd timer status queryable (once Issue #4 is deployed)
 
 ### Ansible Automation
 - Common role provisions claude user fleet-wide
@@ -253,8 +273,8 @@ ssh cockpit 'systemctl status claude-access-audit.timer'
 
 ---
 
-**Implementation Date:** 2026-09-22  
-**Status:** All 6 issues complete and deployed  
-**Security Layers:** 7 active  
-**Repos Protected:** 3 (ansible, gitops, vault)  
-**Hosts Monitored:** All 14 in inventory + optional hosts
+**Design Date:** 2026-09-22 · **Corrected:** 2026-09-23  
+**Status:** 7 layers designed, 0 confirmed deployed to a live host -- see Deployment Checklist above  
+**Security Layers:** 7 designed, scoped to `claude`/`openclaw` only  
+**Repos Targeted:** 3 (ansible, gitops, vault) -- hooks not yet confirmed installed in any  
+**Hosts Monitored:** none yet (audit playbook untested against live infrastructure)
