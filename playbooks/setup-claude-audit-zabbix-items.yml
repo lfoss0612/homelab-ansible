@@ -1,0 +1,144 @@
+---
+# Create Zabbix Trapper Items for Claude Access Audit
+#
+# Creates items to receive audit results from audit-claude-access.yml playbook
+# Requires Zabbix API access and community.zabbix collection
+#
+# Usage:
+#   ansible-playbook playbooks/setup-claude-audit-zabbix-items.yml \
+#     -e zabbix_api_user=Admin -e zabbix_api_cred=<zabbix_password>
+#
+# Items created:
+#   - homelab.claude.access.audit (text: PASSED/FAILED)
+#   - homelab.claude.access.audit.violations (numeric: count)
+#   - homelab.claude.access.audit.ssh_restrictions (numeric: 1/0)
+#   - homelab.claude.access.audit.sudoers (numeric: 1/0)
+
+- name: Setup Zabbix Items for Claude Access Audit
+  hosts: localhost
+  gather_facts: false
+  vars:
+    zabbix_server_url: "https://zabbix.home.lan"
+    zabbix_host: "{{ zabbix_host | default('cockpit.home.lan') }}"
+    # Credentials (set via environment or -e flag)
+    zabbix_api_user: "{{ zabbix_api_user | default('Admin') }}"
+    zabbix_api_cred: "{{ zabbix_api_cred | default(lookup('env', 'ZABBIX_PASSWORD')) }}"
+
+  tasks:
+    - name: Validate Zabbix credentials
+      assert:
+        that:
+          - zabbix_api_cred | length > 0
+        fail_msg: |
+          Zabbix credentials required. Set via:
+            - Environment: export ZABBIX_PASSWORD=<cred>
+            - CLI flag: -e zabbix_api_cred=<cred>
+      tags: [always]
+
+    - name: Authenticate to Zabbix API
+      community.zabbix.zabbix_user:
+        server_url: "{{ zabbix_server_url }}"
+        login_user: "{{ zabbix_api_user }}"
+        login_password: "{{ zabbix_api_cred }}"
+        username: "{{ zabbix_api_user }}"
+        validate_certs: false
+        state: present
+      register: zabbix_auth
+      tags: [zabbix, items]
+
+    - name: Get host ID for {{ zabbix_host }}
+      community.zabbix.zabbix_host_info:
+        server_url: "{{ zabbix_server_url }}"
+        login_user: "{{ zabbix_api_user }}"
+        login_password: "{{ zabbix_api_cred }}"
+        validate_certs: false
+        host_name: "{{ zabbix_host }}"
+      register: host_info
+      tags: [zabbix, items]
+
+    - name: Set host ID fact
+      set_fact:
+        zabbix_hostid: "{{ host_info.zabbix_host[0].hostid }}"
+      when: host_info.zabbix_host | length > 0
+      tags: [zabbix, items]
+
+    - name: Validate host found
+      assert:
+        that:
+          - zabbix_hostid is defined
+        fail_msg: "Host '{{ zabbix_host }}' not found in Zabbix"
+      tags: [zabbix, items]
+
+    - name: Create Claude Access Audit Status item
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_server_url }}"
+        login_user: "{{ zabbix_api_user }}"
+        login_password: "{{ zabbix_api_cred }}"
+        validate_certs: false
+        name: "Claude Access Audit Status"
+        key: "homelab.claude.access.audit"
+        host_name: "{{ zabbix_host }}"
+        type: trapper
+        value_type: text
+        description: "Overall status of Claude access audit (PASSED/FAILED)"
+        state: present
+      tags: [zabbix, items]
+
+    - name: Create Claude Access Audit Violations item
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_server_url }}"
+        login_user: "{{ zabbix_api_user }}"
+        login_password: "{{ zabbix_api_cred }}"
+        validate_certs: false
+        name: "Claude Access Audit Violations"
+        key: "homelab.claude.access.audit.violations"
+        host_name: "{{ zabbix_host }}"
+        type: trapper
+        value_type: numeric
+        description: "Number of access control violations found in audit"
+        state: present
+      tags: [zabbix, items]
+
+    - name: Create Claude SSH Restrictions Status item
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_server_url }}"
+        login_user: "{{ zabbix_api_user }}"
+        login_password: "{{ zabbix_api_cred }}"
+        validate_certs: false
+        name: "Claude SSH Key Restrictions Status"
+        key: "homelab.claude.access.audit.ssh_restrictions"
+        host_name: "{{ zabbix_host }}"
+        type: trapper
+        value_type: numeric
+        description: "SSH key restrictions validation (1=OK, 0=FAILED)"
+        state: present
+      tags: [zabbix, items]
+
+    - name: Create Claude Sudoers Status item
+      community.zabbix.zabbix_item:
+        server_url: "{{ zabbix_server_url }}"
+        login_user: "{{ zabbix_api_user }}"
+        login_password: "{{ zabbix_api_cred }}"
+        validate_certs: false
+        name: "Claude Sudoers Configuration Status"
+        key: "homelab.claude.access.audit.sudoers"
+        host_name: "{{ zabbix_host }}"
+        type: trapper
+        value_type: numeric
+        description: "Sudoers rules validation (1=OK, 0=FAILED)"
+        state: present
+      tags: [zabbix, items]
+
+    - name: Report items created
+      debug:
+        msg: |
+          ✓ Zabbix items created successfully!
+
+          Items created:
+            - homelab.claude.access.audit (text)
+            - homelab.claude.access.audit.violations (numeric)
+            - homelab.claude.access.audit.ssh_restrictions (1/0)
+            - homelab.claude.access.audit.sudoers (1/0)
+
+          The audit playbook can now send results to Zabbix.
+      tags: [zabbix, items]
