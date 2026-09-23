@@ -30,32 +30,36 @@ Hook scripts written for pre-commit and pre-push checks across three repositorie
 
 **Hook Location:** `~/.claude/git-hooks/pre-commit-security.sh`
 
-### Issue #2: SSH Wrapper Deployment
-**Status:** Written, not deployed to cockpit/desktop yet
+### Issue #2: SSH Access Logging
+**Status:** Deployed on cockpit (2026-09-23), codified into Ansible same day; not yet on zabbix
 
-SSH access logging wrapper written for control nodes (cockpit, desktop) to track `claude`/`openclaw`
-SSH connections for audit trail. Every other account (`ansible`, `lfoss`, `root`, ...) passes
-through untouched -- the wrapper replaces `/usr/bin/ssh` system-wide, so it filters by invoking
-user internally (`LOGGED_USERS` allowlist in the script; an earlier draft was missing this check
-and logged every account).
+**Superseded design, abandoned in production:** the original plan replaced `/usr/bin/ssh`
+system-wide on control nodes with a logging wrapper. Deployed to `desktop`, it broke `lfoss`'s own
+interactive SSH outright (it had no per-account filter and died under `set -e` writing to
+root-owned log paths before ever calling the real `ssh`). A client-side replacement
+(`ssh_config`'s `Match user claude` + a `LocalCommand` script) was tried next and also abandoned
+-- it silently stopped logging under `ControlPersist` connection reuse, and client-side logging
+is the wrong layer regardless (it can always be evaded by client behavior). Full writeup:
+`homelab-vault` `Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md`.
 
-**Files Created:**
-- `playbooks/deploy-ssh-access-logging.yml` - Deployment playbook
-- `files/ssh-access-wrapper.sh` - Wrapper script with error handling
-- `docs/ssh-wrapper-recovery.md` - Recovery guide for failed deployments
+**Current design:** server-side, via `playbooks/deploy-claude-ssh-restrictions.yml`, which
+templates `/etc/ssh/sshd_config.d/10-claude-restrictions.conf` on `cockpit.home.lan`:
+- `LogLevel VERBOSE` -- logs key fingerprints on every accepted/failed login, for all users. This
+  is the actual audit trail: server-side, can't be bypassed by any client.
+- `Match User claude` -- publickey-only auth, no forwarding of any kind. Scoped to `claude` only
+  (`openclaw` has no SSH login path on any host yet, so there's nothing to restrict for it).
+- Validated with `sshd -t` before applying; restarts via `systemctl restart ssh`, not `reload`
+  (`reload` hits a pre-existing socket-activation bug on cockpit).
 
-**Features:**
-- Logs `claude`/`openclaw` SSH connections to `/var/log/ssh-access.log`
-- JSON audit logs in `/var/log/ssh-audit/`
-- Automatic log rotation (100MB)
-- Silent error handling (doesn't break SSH if logs fail)
-- Pre-deployment syntax validation
-- Original SSH binary backup to `/usr/bin/ssh.real`
+**Files:**
+- `playbooks/deploy-claude-ssh-restrictions.yml` - the current playbook
+- `homelab-vault/Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md` - the incident and why
+  the two earlier designs were abandoned
 
-**Deploy:**
+**Deploy (already applied by hand on cockpit; this makes it reviewable/rebuild-safe):**
 ```bash
-ansible-playbook playbooks/deploy-ssh-access-logging.yml --check --diff
-ansible-playbook playbooks/deploy-ssh-access-logging.yml
+ansible-playbook playbooks/deploy-claude-ssh-restrictions.yml --check --diff
+ansible-playbook playbooks/deploy-claude-ssh-restrictions.yml
 ```
 
 ### Issue #3: Zabbix Items Creation
@@ -174,10 +178,15 @@ git add test.yml  # Should be blocked
 - **Zabbix:** Specific diagnostic commands only
 
 ### Layer 6: SSH Access Logging
-- **Wrapper:** `/usr/local/bin/ssh-wrapper`
-- **Logs:** `/var/log/ssh-access.log` + JSON audit directory -- `claude`/`openclaw` only, every
-  other account passes through untouched (`LOGGED_USERS` allowlist in the script)
-- **Hosts:** cockpit, desktop
+- **Mechanism:** server-side, `/etc/ssh/sshd_config.d/10-claude-restrictions.conf`
+  (`playbooks/deploy-claude-ssh-restrictions.yml`)
+- **Logs:** `LogLevel VERBOSE` (sshd's own auth log, all users) + `Match User claude`
+  restrictions (publickey-only, no forwarding) -- scoped to `claude` only, every other account
+  untouched
+- **Hosts:** cockpit deployed; zabbix not yet extended
+- Replaces an earlier global-`ssh`-wrapper design that broke `desktop`'s own SSH and a
+  client-side `LocalCommand` design that silently stopped logging under `ControlPersist` --
+  see `homelab-vault` `Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md`
 
 ### Layer 7: Audit & Monitoring
 - **Playbook:** `playbooks/audit-claude-access.yml`
@@ -192,10 +201,8 @@ git add test.yml  # Should be blocked
 | `playbooks/audit-claude-access.yml` | Validates access controls fleet-wide |
 | `playbooks/setup-claude-audit-zabbix-items.yml` | Creates Zabbix trapper items |
 | `playbooks/setup-claude-audit-timer.yml` | Schedules weekly audits |
-| `playbooks/deploy-ssh-access-logging.yml` | Deploys SSH wrapper |
-| `files/ssh-access-wrapper.sh` | SSH logging wrapper script |
+| `playbooks/deploy-claude-ssh-restrictions.yml` | Deploys claude SSH audit logging + restrictions (sshd-side) |
 | `docs/claude-access.md` | Full access runbook |
-| `docs/ssh-wrapper-recovery.md` | Recovery guide |
 | `~/.claude/hooks/access-guard.py` | Desktop command validator |
 | `~/.claude/git-hooks/pre-commit-security.sh` | Git pre-commit security checks |
 
@@ -205,7 +212,7 @@ git add test.yml  # Should be blocked
 - [x] SSH key restrictions enforced for `claude` (no-* options)
 - [x] Sudoers whitelisting configured for `claude` per host
 - [ ] Git hooks actually installed and tested in all 3 repos' local checkouts
-- [ ] SSH wrapper deployed on control nodes (script fixed 2026-09-23 to filter by user; still not run)
+- [x] SSH access restrictions/logging deployed on cockpit (2026-09-23, sshd-side); [ ] not yet on zabbix
 - [ ] Zabbix items created for monitoring
 - [ ] Audit timer scheduled (Monday 2 AM UTC)
 - [x] Recovery documentation written
@@ -219,8 +226,10 @@ cd ~/projects/homelab-ansible
 echo "password=\"secret\"" > test.py
 git add test.py  # Should be blocked
 
-# Verify SSH wrapper
-ssh cockpit 'tail /var/log/ssh-access.log'
+# Verify SSH restrictions/logging (sshd-side)
+ssh cockpit 'sudo tail /var/log/auth.log'   # LogLevel VERBOSE entries
+ssh claude@cockpit whoami                    # should still work, key-only
+ssh -X claude@cockpit                        # should refuse: X11Forwarding no
 
 # Run manual audit
 ansible-playbook playbooks/audit-claude-access.yml --check
@@ -251,8 +260,10 @@ ssh cockpit 'systemctl status claude-access-audit.timer'
 1. **Mobile Claude:** Desktop hook unavailable (file system access)
    - Mitigated by: Git hooks + server-side audit (6 other layers)
 
-2. **SSH Wrapper Recovery:** Requires console access if SSH breaks
-   - Mitigated by: Recovery guide + pre-deployment validation
+2. **sshd config errors:** could lock out SSH if a bad `Match` block were applied
+   - Mitigated by: `sshd -t` validation before every apply (the `copy` task's `validate:`), and
+     the config only restricts `claude`, never `ansible`/`lfoss`/`root` -- a mistake here can't
+     lock out the accounts that would need to fix it
 
 3. **Timer Scope:** Runs on cockpit, audits all hosts
    - Acceptable: Cockpit is central control node
@@ -267,7 +278,7 @@ ssh cockpit 'systemctl status claude-access-audit.timer'
 ## Support References
 
 - **Claude Access Runbook:** `docs/claude-access.md`
-- **SSH Wrapper Recovery:** `docs/ssh-wrapper-recovery.md`
+- **SSH Restriction/Logging Incident & Design:** `homelab-vault` `Incidents/2026-09-23-ssh-wrapper-broke-desktop-access.md`
 - **Ansible Configuration:** `docs/execution-model.md`
 - **Main README:** `README.md`
 
