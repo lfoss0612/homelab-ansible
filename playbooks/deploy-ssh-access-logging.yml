@@ -23,6 +23,18 @@
     log_file: "/var/log/ssh-access.log"
 
   pre_tasks:
+    - name: Verify SSH binary exists and is executable
+      stat:
+        path: "{{ ssh_bin }}"
+      register: ssh_bin_status
+      tags: [ssh-wrapper, audit, verify]
+
+    - name: Verify SSH is working before deployment
+      command: "{{ ssh_bin }} -V"
+      register: ssh_version
+      changed_when: false
+      tags: [ssh-wrapper, audit, verify]
+
     - name: Check if SSH wrapper already installed
       stat:
         path: "{{ ssh_bin_real }}"
@@ -34,6 +46,20 @@
         msg: "SSH wrapper appears to be already installed. Proceeding with update..."
       when: ssh_real_status.stat.exists
       tags: [ssh-wrapper, audit]
+
+    - name: Safeguard check - validate wrapper script will work
+      shell: |
+        # Test wrapper script syntax before deployment
+        bash -n "{{ ssh_wrapper_src }}" && echo "PASS" || echo "FAIL"
+      register: wrapper_syntax
+      changed_when: false
+      tags: [ssh-wrapper, audit, safety]
+
+    - name: Fail if wrapper has syntax errors
+      fail:
+        msg: "SSH wrapper script has syntax errors. Aborting deployment."
+      when: "'FAIL' in wrapper_syntax.stdout"
+      tags: [ssh-wrapper, audit, safety]
 
   tasks:
     - name: Create log directories
