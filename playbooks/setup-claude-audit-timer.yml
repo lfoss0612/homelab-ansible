@@ -1,0 +1,179 @@
+---
+# Setup Systemd Timer for Weekly Claude Access Audits
+#
+# Creates a systemd timer that runs audit-claude-access.yml weekly
+# Logs results to Zabbix and generates alerts on violations
+#
+# Usage:
+#   ansible-playbook playbooks/setup-claude-audit-timer.yml
+#   ansible-playbook playbooks/setup-claude-audit-timer.yml -l cockpit.home.lan
+#
+# Timer runs every Monday at 2 AM UTC
+# Results sent to Zabbix automatically
+
+- name: Setup Claude Access Audit Timer
+  hosts: "{{ audit_timer_hosts | default('openclaw') }}"
+  become: true
+  gather_facts: true
+  tags: [audit, timer, claude]
+
+  vars:
+    audit_script_dir: /opt/ansible/playbooks
+    audit_playbook: "{{ audit_script_dir }}/audit-claude-access.yml"
+    timer_name: claude-access-audit
+    timer_description: "Weekly Claude Code Access Control Audit"
+    audit_schedule: "Mon *-*-* 02:00:00"  # Every Monday at 2 AM UTC
+
+  tasks:
+    - name: Validate audit playbook exists on control node
+      stat:
+        path: "{{ audit_playbook }}"
+      register: playbook_check
+      tags: [audit, timer, validate]
+
+    - name: Fail if audit playbook missing
+      fail:
+        msg: "Audit playbook not found at {{ audit_playbook }}"
+      when: not playbook_check.stat.exists
+      tags: [audit, timer, validate]
+
+    - name: Create systemd service for audit
+      copy:
+        dest: "/etc/systemd/system/{{ timer_name }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Claude Access Audit Service
+          Wants={{ timer_name }}.timer
+          Documentation=file:///opt/ansible/docs/claude-access.md
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/bash -c 'cd /opt/ansible && sudo -n -u ansible /usr/bin/ansible-playbook -i inventory.ini playbooks/audit-claude-access.yml -e audit_hosts=all'
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=claude-audit
+          # Run with minimal permissions
+          User=ansible
+          Group=ansible
+          TimeoutStartSec=3600
+          # Don't fail if Zabbix is down
+          SuccessExitStatus=0
+          SuccessExitStatus=1
+
+      register: service_created
+      tags: [audit, timer, service]
+
+    - name: Create systemd timer for weekly audits
+      copy:
+        dest: "/etc/systemd/system/{{ timer_name }}.timer"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Weekly Claude Access Audit Timer
+          Documentation=file:///opt/ansible/docs/claude-access.md
+          Requires={{ timer_name }}.service
+
+          [Timer]
+          # Run every Monday at 2 AM UTC
+          OnCalendar={{ audit_schedule }}
+          Persistent=true
+          AccuracySec=1min
+
+          # Notification on timer events
+          OnBootSec=5min
+          OnUnitActiveSec=1w
+
+          [Install]
+          WantedBy=timers.target
+
+      register: timer_created
+      tags: [audit, timer]
+
+    - name: Reload systemd daemon if units changed
+      systemd:
+        daemon_reload: true
+      when: service_created.changed or timer_created.changed
+      tags: [audit, timer, systemd]
+
+    - name: Enable and start audit timer
+      systemd:
+        name: "{{ timer_name }}.timer"
+        enabled: true
+        state: started
+      register: timer_enabled
+      tags: [audit, timer, systemd]
+
+    - name: Check timer status
+      shell: |
+        systemctl status "{{ timer_name }}.timer" || true
+      register: timer_status
+      changed_when: false
+      tags: [audit, timer, status]
+
+    - name: Check next scheduled run
+      shell: |
+        systemctl list-timers "{{ timer_name }}.timer" --no-pager || true
+      register: next_run
+      changed_when: false
+      tags: [audit, timer, status]
+
+    - name: Report timer setup complete
+      debug:
+        msg: |
+          ✓ Claude Access Audit Timer Configured
+
+          Service: {{ timer_name }}.service
+          Timer: {{ timer_name }}.timer
+          Schedule: {{ audit_schedule }} (Monday 2 AM UTC)
+          Playbook: {{ audit_playbook }}
+
+          Timer Status:
+          {{ timer_status.stdout }}
+
+          Next Scheduled Run:
+          {{ next_run.stdout }}
+
+          Manual trigger:
+          systemctl start {{ timer_name }}.service
+
+          View audit logs:
+          journalctl -u {{ timer_name }}.service -f
+      tags: [audit, timer, report]
+
+  post_tasks:
+    - name: Setup log rotation for audit output
+      copy:
+        dest: /etc/logrotate.d/claude-audit
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Rotate Claude audit logs weekly
+          /var/log/claude-audit.log {
+              weekly
+              rotate 4
+              compress
+              delaycompress
+              notifempty
+              create 0640 root root
+              sharedscripts
+          }
+      tags: [audit, logging]
+
+    - name: Note optional Zabbix webhook integration
+      debug:
+        msg: |
+          OPTIONAL: Configure Zabbix webhook to send alerts on audit violations
+
+          Create a Zabbix media type that POST's to your webhook:
+          - Media Type: Webhook
+          - Script: Send JSON payload with violation details
+          - Trigger: homelab.claude.access.audit.violations > 0
+
+          Then configure a user/group to receive media on that type.
+      tags: [audit, timer, zabbix]
