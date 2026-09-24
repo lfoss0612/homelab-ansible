@@ -154,7 +154,7 @@
           {
             "blanket_escalation": "ALL=(ALL)" in claude_sudoers.stdout,
             "unrestricted_shell": ("/bin/bash" in claude_sudoers.stdout or "/bin/sh" in claude_sudoers.stdout) and "NOPASSWD" in claude_sudoers.stdout,
-            "unauthorized_escalation": "ALL=(root) NOPASSWD" in claude_sudoers.stdout and inventory_hostname != "zabbix.home.lan"
+            "unauthorized_escalation": "ALL=(root) NOPASSWD" in claude_sudoers.stdout
           } | from_json
       when: claude_sudoers.stdout != "FILE_NOT_FOUND"
       tags: [audit, claude, sudoers]
@@ -163,17 +163,16 @@
       set_fact:
         audit_results: "{{ audit_results | combine(
           {
-            'checks': audit_results.checks | combine({'sudoers_ok': not (sudoers_violations.blanket_nopasswd or sudoers_violations.unrestricted_shell)}),
+            'checks': audit_results.checks | combine({'sudoers_ok': not (sudoers_violations.blanket_escalation or sudoers_violations.unrestricted_shell)}),
             'violations': audit_results.violations + (
-              (['Blanket NOPASSWD rule found'] if sudoers_violations.blanket_nopasswd else []) +
+              (['Blanket NOPASSWD rule found'] if sudoers_violations.blanket_escalation else []) +
               (['Unrestricted shell escalation found'] if sudoers_violations.unrestricted_shell else []) +
               (['Unauthorized root escalation'] if sudoers_violations.unauthorized_escalation else [])
             )
           },
           recursive=True
         ) }}"
-        audit_status: FAILED
-      when: sudoers_violations is defined and (sudoers_violations.blanket_nopasswd or sudoers_violations.unrestricted_shell or sudoers_violations.unauthorized_escalation)
+      when: sudoers_violations is defined and (sudoers_violations.blanket_escalation or sudoers_violations.unrestricted_shell or sudoers_violations.unauthorized_escalation)
       tags: [audit, claude, sudoers]
 
     - name: Update final status if violations found
