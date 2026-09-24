@@ -10,7 +10,7 @@ openclaw_node_min_version: "22.22.3"
 # ansible escalation, claude-user-pbs.yml for backup directory access).
 # See docs/claude-access-enforcement.md for the access model and audit procedures.
 claude_user: claude
-claude_pubkey_path: "{{ playbook_dir }}/../../keys/claude_ed25519.pub"
+claude_pubkey_path: "{{ playbook_dir }}/../keys/claude_ed25519.pub"
 # SSH key restrictions to prevent escalation and unauthorized access:
 # no-port-forwarding = disable SSH port tunneling
 # no-X11-forwarding = disable X11 display forwarding
