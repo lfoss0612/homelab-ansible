@@ -157,11 +157,20 @@
       when: claude_sudoers.stdout != "FILE_NOT_FOUND"
       tags: [audit, claude, sudoers]
 
+    - name: Default sudoers_violations when no sudoers file exists (nothing to violate)
+      set_fact:
+        sudoers_violations: "{{ {'blanket_escalation': false, 'unrestricted_shell': false, 'unauthorized_escalation': false} }}"
+      when: claude_sudoers.stdout == "FILE_NOT_FOUND"
+      tags: [audit, claude, sudoers]
+
     - name: Report sudoers violations
       set_fact:
         audit_results: "{{ audit_results | combine(
           {
-            'checks': audit_results.checks | combine({'sudoers_ok': not (sudoers_violations.blanket_escalation or sudoers_violations.unrestricted_shell)}),
+            'checks': audit_results.checks | combine({
+              'sudoers_ok': not (sudoers_violations.blanket_escalation or sudoers_violations.unrestricted_shell or sudoers_violations.unauthorized_escalation),
+              'no_unauthorized_escalation': not sudoers_violations.unauthorized_escalation
+            }),
             'violations': audit_results.violations + (
               (['Blanket NOPASSWD rule found'] if sudoers_violations.blanket_escalation else []) +
               (['Unrestricted shell escalation found'] if sudoers_violations.unrestricted_shell else []) +
@@ -170,7 +179,7 @@
           },
           recursive=True
         ) }}"
-      when: sudoers_violations is defined and (sudoers_violations.blanket_escalation or sudoers_violations.unrestricted_shell or sudoers_violations.unauthorized_escalation)
+      when: sudoers_violations is defined
       tags: [audit, claude, sudoers]
 
     - name: Update final status if violations found
