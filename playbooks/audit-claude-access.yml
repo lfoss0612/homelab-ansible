@@ -117,14 +117,13 @@
 
     - name: Validate SSH key restrictions
       set_fact:
-        ssh_check: |
-          {
-            "has_from_restriction": "from=" in claude_ssh_keys.stdout,
-            "no_port_forwarding": "no-port-forwarding" in claude_ssh_keys.stdout,
-            "no_x11_forwarding": "no-X11-forwarding" in claude_ssh_keys.stdout,
-            "no_agent_forwarding": "no-agent-forwarding" in claude_ssh_keys.stdout,
-            "no_user_rc": "no-user-rc" in claude_ssh_keys.stdout
-          } | from_json
+        ssh_check: "{{ {
+            'has_from_restriction': 'from=' in claude_ssh_keys.stdout,
+            'no_port_forwarding': 'no-port-forwarding' in claude_ssh_keys.stdout,
+            'no_x11_forwarding': 'no-X11-forwarding' in claude_ssh_keys.stdout,
+            'no_agent_forwarding': 'no-agent-forwarding' in claude_ssh_keys.stdout,
+            'no_user_rc': 'no-user-rc' in claude_ssh_keys.stdout
+          } }}"
       when: claude_ssh_keys.stdout != "FILE_NOT_FOUND"
       tags: [audit, claude, ssh]
 
@@ -150,12 +149,11 @@
 
     - name: Validate sudoers rules (detect blanket/unrestricted escalation)
       set_fact:
-        sudoers_violations: |
-          {
-            "blanket_escalation": "ALL=(ALL)" in claude_sudoers.stdout,
-            "unrestricted_shell": ("/bin/bash" in claude_sudoers.stdout or "/bin/sh" in claude_sudoers.stdout) and "NOPASSWD" in claude_sudoers.stdout,
-            "unauthorized_escalation": "ALL=(root) NOPASSWD" in claude_sudoers.stdout
-          } | from_json
+        sudoers_violations: "{{ {
+            'blanket_escalation': 'ALL=(ALL)' in claude_sudoers.stdout,
+            'unrestricted_shell': ('/bin/bash' in claude_sudoers.stdout or '/bin/sh' in claude_sudoers.stdout) and 'NOPASSWD' in claude_sudoers.stdout,
+            'unauthorized_escalation': 'ALL=(root) NOPASSWD' in claude_sudoers.stdout
+          } }}"
       when: claude_sudoers.stdout != "FILE_NOT_FOUND"
       tags: [audit, claude, sudoers]
 
