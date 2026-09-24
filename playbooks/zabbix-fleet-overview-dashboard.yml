@@ -1,0 +1,217 @@
+---
+# Build the "Fleet Overview" Zabbix dashboard.
+#
+# The "is anything on fire" dashboard from TODO.md's Zabbix dashboards and
+# maps candidate list: host availability (ICMP + agent), CPU/mem/root-disk %
+# as a heatmap-style table across the fleet, and current problems.
+#
+# Unlike Patch/Update Status and the other recent dashboard playbooks, this
+# one creates NO new items -- system.cpu.util, vm.memory.utilization and
+# vfs.fs.dependent.size[/,pused] already collect fleet-wide from the standard
+# "Linux by Zabbix agent" template. Verified live before writing this: all 14
+# "Linux servers" hosts carry identically-named CPU/mem items; the 3 k8s
+# nodes (DaemonSet-agent, no host "/" mount -- see TODO.md's "OS updates:
+# pending package count" writeup for the same class of gap) show "No data" in
+# the Disk column rather than a wrong value, same tradeoff already accepted
+# in playbooks/os-update-status-zabbix-setup.yml.
+#
+# Thresholds (80% amber, 95% red) match the capacity language already used in
+# homelab-vault/TODO.md's "Capacity alerts currently open" entry -- pve
+# 95.8%/pve-ai 94.9% flagged as wanting a real look, omv 84.7%/openclaw
+# 81.1% called "ordinary warnings".
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-fleet-overview-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-fleet-overview-dashboard.yml
+#
+# Idempotent: looks up the dashboard by name and updates its pages in place if
+# it already exists, same pattern as every other playbook in this file's
+# zabbix-*-dashboard.yml family.
+
+- name: Build the Fleet Overview dashboard
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "Fleet Overview"
+    linux_group_name: "Linux servers"
+
+    cpu_item_name: "CPU utilization"
+    mem_item_name: "Memory utilization"
+    disk_item_name: "FS [/]: Space: Used, in %"
+
+  tasks:
+    - name: Resolve the Linux servers host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ linux_group_name }}"]
+          id: 1
+      register: group_lookup
+      check_mode: false
+      failed_when: >-
+        group_lookup.json.error is defined
+        or (group_lookup.json.result | default([]) | length) != 1
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Fleet overview"
+            widgets:
+              # --- Row 1: current problems, whole fleet -------------------
+              - type: problems
+                name: "Open problems"
+                x: 0
+                y: 0
+                width: 72
+                height: 8
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 0, name: "show", value: "1"}
+                  - {type: 1, name: "reference", value: "FOVPB"}
+
+              # --- Row 2: per-host heatmap ---------------------------------
+              - type: tophosts
+                name: "CPU / memory / disk by host"
+                x: 0
+                y: 8
+                width: 72
+                height: 17
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 1, name: "columns.0.name", value: "Host"}
+                  - {type: 0, name: "columns.0.data", value: "2"}
+
+                  - {type: 1, name: "columns.1.name", value: "CPU %"}
+                  - {type: 0, name: "columns.1.data", value: "1"}
+                  - {type: 1, name: "columns.1.item", value: "{{ cpu_item_name }}"}
+                  - {type: 0, name: "columns.1.decimal_places", value: "1"}
+                  - {type: 1, name: "columns.1.base_color", value: "4CAF50"}
+                  - {type: 1, name: "columnsthresholds.1.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.0", value: "80"}
+                  - {type: 1, name: "columnsthresholds.1.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.1", value: "95"}
+
+                  - {type: 1, name: "columns.2.name", value: "Memory %"}
+                  - {type: 0, name: "columns.2.data", value: "1"}
+                  - {type: 1, name: "columns.2.item", value: "{{ mem_item_name }}"}
+                  - {type: 0, name: "columns.2.decimal_places", value: "1"}
+                  - {type: 1, name: "columns.2.base_color", value: "4CAF50"}
+                  - {type: 1, name: "columnsthresholds.2.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.2.threshold.0", value: "80"}
+                  - {type: 1, name: "columnsthresholds.2.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.2.threshold.1", value: "95"}
+
+                  # No data on the 3 k8s nodes -- see header comment.
+                  - {type: 1, name: "columns.3.name", value: "Disk (/) %"}
+                  - {type: 0, name: "columns.3.data", value: "1"}
+                  - {type: 1, name: "columns.3.item", value: "{{ disk_item_name }}"}
+                  - {type: 0, name: "columns.3.decimal_places", value: "1"}
+                  - {type: 1, name: "columns.3.base_color", value: "4CAF50"}
+                  - {type: 1, name: "columnsthresholds.3.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.3.threshold.0", value: "80"}
+                  - {type: 1, name: "columnsthresholds.3.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.3.threshold.1", value: "95"}
+
+                  - {type: 0, name: "column", value: "1"}
+                  # Default host limit is 10, which would silently truncate
+                  # this 14-host fleet.
+                  - {type: 0, name: "count", value: "50"}
+                  - {type: 1, name: "reference", value: "FOVTH"}
+
+              # --- Row 3: availability, the precondition for the above -----
+              - type: hostavail
+                name: "Fleet agent availability"
+                x: 0
+                y: 25
+                width: 72
+                height: 3
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 0, name: "interface_type.0", value: "1"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            # dashboard.create defaults to private:1 with zero shares -- every
+            # dashboard built by this family of playbooks hit this once
+            # already (see TODO.md). Explicit here so a from-scratch run
+            # doesn't repeat it.
+            private: 0
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}
