@@ -1,0 +1,228 @@
+---
+# Build the "Host Detail" Zabbix dashboard - one filterable dashboard
+# (host-group/host selector) instead of hand-building one per host, per
+# TODO.md's "Zabbix - dashboards and maps" candidate list.
+#
+# MECHANISM: each "item" widget below carries `dynamic: 1`. Setting that on
+# any widget makes Zabbix show a Host selector in the dashboard's own top
+# navigation bar; picking a host there re-targets every dynamic widget on the
+# page to the SAME-NAMED item on that host, live, no per-host config needed.
+# This has been in Zabbix since long before 7.4 and needs no per-host setup
+# beyond the item already existing.
+#
+# SCOPED TO THREE METRICS, DELIBERATELY, NOT FIVE: the TODO candidate also
+# asked for disk I/O and network throughput. Checked live across a sample of
+# hosts before writing this (pve.home.lan, pbs.home.lan, cockpit.home.lan,
+# openclaw.home.lan, zabbix.home.lan) -- dynamic re-targeting matches by
+# ITEM NAME, and "CPU utilization" / "Memory utilization" / "FS [/]: Space:
+# Used, in %" are identical strings on every host (same template, no
+# per-host token in the name). Disk I/O and network items are not: Zabbix's
+# own LLD bakes the real device/interface name into the item name itself
+# ("nvme0n1: Disk read rate" vs "sda: Disk read rate" vs "sde: ..."; "Interface
+# vmbr0: Bits received" vs "Interface enp7s0: ..." vs "Interface ens18: ...")
+# -- confirmed these differ per host across this fleet (Proxmox hosts alone
+# have 5+ block devices and 30+ interfaces including VM taps; VMs/LXCs have
+# one of each, but not the same name as each other). A dynamic widget bound
+# to one host's device/interface name shows "No data" on any host that
+# doesn't happen to share that exact name. Rather than ship widgets that
+# silently go blank for most of the fleet -- the same "looks fine via the
+# API, wrong in the UI" trap TODO.md already documents once for the
+# private:1 dashboards -- this only covers the three metrics that are
+# actually template-consistent. Disk I/O / network-by-interface stay a real,
+# open gap; they need either per-host graphs or an SVG-graph item-pattern
+# dataset (untested here, no existing example in this repo to copy from).
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-host-detail-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-host-detail-dashboard.yml
+#
+# Idempotent: looks up the dashboard by name and updates its pages in place
+# if it already exists, same pattern as every other playbook in this file's
+# zabbix-*-dashboard.yml family.
+
+- name: Build the Host Detail dashboard
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "Host Detail"
+    linux_group_name: "Linux servers"
+
+    # Any host in the group works as the reference -- dynamic re-targeting
+    # switches to whichever host is picked in the UI. cockpit.home.lan
+    # carries all three items (unlike the 3 k8s nodes, which lack the
+    # disk-space item -- see zabbix-fleet-overview-dashboard.yml's header).
+    reference_host: "cockpit.home.lan"
+    cpu_item_name: "CPU utilization"
+    mem_item_name: "Memory utilization"
+    disk_item_name: "FS [/]: Space: Used, in %"
+
+  tasks:
+    - name: Resolve the Linux servers host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ linux_group_name }}"]
+          id: 1
+      register: group_lookup
+      check_mode: false
+      failed_when: >-
+        group_lookup.json.error is defined
+        or (group_lookup.json.result | default([]) | length) != 1
+
+    - name: Resolve the reference host's CPU/memory/disk items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "name"]
+            host: "{{ reference_host }}"
+            filter:
+              name: ["{{ cpu_item_name }}", "{{ mem_item_name }}", "{{ disk_item_name }}"]
+          id: 1
+      register: ref_items
+      check_mode: false
+      failed_when: >-
+        ref_items.json.error is defined
+        or (ref_items.json.result | default([]) | length) != 3
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Host detail"
+            widgets:
+              - type: item
+                name: "CPU utilization"
+                x: 0
+                y: 0
+                width: 24
+                height: 8
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ref_items.json.result | selectattr('name', 'equalto', cpu_item_name) | map(attribute='itemid') | first }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "{HOST.NAME}: CPU"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+                  - {type: 0, name: "dynamic", value: "1"}
+
+              - type: item
+                name: "Memory utilization"
+                x: 24
+                y: 0
+                width: 24
+                height: 8
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ref_items.json.result | selectattr('name', 'equalto', mem_item_name) | map(attribute='itemid') | first }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "{HOST.NAME}: Memory"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+                  - {type: 0, name: "dynamic", value: "1"}
+
+              - type: item
+                name: "Disk (/) usage"
+                x: 48
+                y: 0
+                width: 24
+                height: 8
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ ref_items.json.result | selectattr('name', 'equalto', disk_item_name) | map(attribute='itemid') | first }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "{HOST.NAME}: Disk (/)"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+                  - {type: 0, name: "dynamic", value: "1"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            # dashboard.create defaults to private:1 with zero shares -- see
+            # TODO.md's "invisible to the user" writeup. Explicit here so a
+            # from-scratch run doesn't repeat it.
+            private: 0
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}

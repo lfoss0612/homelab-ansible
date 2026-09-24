@@ -1,0 +1,198 @@
+---
+# Build the "Storage & Capacity" Zabbix dashboard, per TODO.md's "Zabbix -
+# dashboards and maps" candidate list: disk space across the fleet, not just
+# the root filesystem zabbix-fleet-overview-dashboard.yml already covers.
+#
+# NOTHING NEW TO COLLECT: every column below is an existing
+# vfs.fs.dependent.size[...,pused] item from the standard "Linux by Zabbix
+# agent" template's filesystem discovery. This play only builds the
+# dashboard.
+#
+# THREE COLUMNS, NOT "ALL MOUNTS": mount points are genuinely per-host
+# (checked live: pve/pve-ai/pve-router share "/var/lib/vz" and "/vm_pool";
+# pbs alone has the "/mnt/datastore" family; everything else only has "/").
+# Zabbix's tophosts widget takes one exact item name per column, not a
+# pattern that fans out into one column per matched item -- so this can't be
+# "every mount, every host" in one grid without inventing per-host special
+# cases. Picked the three mounts that are actually load-bearing across this
+# fleet's real capacity story (root disk everywhere; "/var/lib/vz", the
+# Proxmox VM/container storage repeatedly flagged in TODO.md's Hardware
+# section; "/mnt/datastore", pbs's backup target, same section). Hosts
+# without a given mount show "No data" for that column rather than a
+# misleading 0 -- same tradeoff zabbix-fleet-overview-dashboard.yml already
+# accepted for the k8s nodes' disk column.
+#
+# SNAPSHOT, NOT A TREND LINE: this is current %used per host, like every
+# other tophosts-based dashboard in this family (Fleet Overview, Patch
+# Status, Agent Versions) -- not a historical graph. A real trend-over-time
+# view would need an SVG graph widget, which has no working example anywhere
+# in this repo to copy field-encoding from (unlike tophosts/item/problems/
+# hostavail, all proven live by the other zabbix-*-dashboard.yml playbooks).
+# Left as an open gap rather than guessed at blind.
+#
+# "Sorted by days-to-full" from the TODO wording is N/A right now: checked
+# live, no trigger anywhere in this Zabbix instance uses the timeleft()
+# trend-prediction function, so there is no prediction to sort by yet.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-storage-capacity-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-storage-capacity-dashboard.yml
+
+- name: Build the Storage and Capacity dashboard
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "Storage & Capacity"
+    linux_group_name: "Linux servers"
+
+    root_item_name: "FS [/]: Space: Used, in %"
+    vz_item_name: "FS [/var/lib/vz]: Space: Used, in %"
+    datastore_item_name: "FS [/mnt/datastore]: Space: Used, in %"
+
+  tasks:
+    - name: Resolve the Linux servers host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ linux_group_name }}"]
+          id: 1
+      register: group_lookup
+      check_mode: false
+      failed_when: >-
+        group_lookup.json.error is defined
+        or (group_lookup.json.result | default([]) | length) != 1
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Storage & capacity"
+            widgets:
+              - type: tophosts
+                name: "Disk usage by host and mount"
+                x: 0
+                y: 0
+                width: 72
+                height: 26
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 1, name: "columns.0.name", value: "Host"}
+                  - {type: 0, name: "columns.0.data", value: "2"}
+
+                  - {type: 1, name: "columns.1.name", value: "/ %"}
+                  - {type: 0, name: "columns.1.data", value: "1"}
+                  - {type: 1, name: "columns.1.item", value: "{{ root_item_name }}"}
+                  - {type: 0, name: "columns.1.decimal_places", value: "1"}
+                  - {type: 1, name: "columns.1.base_color", value: "4CAF50"}
+                  - {type: 1, name: "columnsthresholds.1.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.0", value: "80"}
+                  - {type: 1, name: "columnsthresholds.1.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.1.threshold.1", value: "95"}
+
+                  - {type: 1, name: "columns.2.name", value: "/var/lib/vz %"}
+                  - {type: 0, name: "columns.2.data", value: "1"}
+                  - {type: 1, name: "columns.2.item", value: "{{ vz_item_name }}"}
+                  - {type: 0, name: "columns.2.decimal_places", value: "1"}
+                  - {type: 1, name: "columns.2.base_color", value: "4CAF50"}
+                  - {type: 1, name: "columnsthresholds.2.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.2.threshold.0", value: "80"}
+                  - {type: 1, name: "columnsthresholds.2.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.2.threshold.1", value: "95"}
+
+                  - {type: 1, name: "columns.3.name", value: "/mnt/datastore %"}
+                  - {type: 0, name: "columns.3.data", value: "1"}
+                  - {type: 1, name: "columns.3.item", value: "{{ datastore_item_name }}"}
+                  - {type: 0, name: "columns.3.decimal_places", value: "1"}
+                  - {type: 1, name: "columns.3.base_color", value: "4CAF50"}
+                  - {type: 1, name: "columnsthresholds.3.color.0", value: "FF9800"}
+                  - {type: 1, name: "columnsthresholds.3.threshold.0", value: "80"}
+                  - {type: 1, name: "columnsthresholds.3.color.1", value: "F44336"}
+                  - {type: 1, name: "columnsthresholds.3.threshold.1", value: "95"}
+
+                  - {type: 0, name: "column", value: "1"}
+                  # Default host limit is 10, which would silently truncate
+                  # this 14-host fleet.
+                  - {type: 0, name: "count", value: "50"}
+                  - {type: 1, name: "reference", value: "STORCAP"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            private: 0
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}
