@@ -1,0 +1,211 @@
+---
+# Build the "Network / OPNsense" Zabbix dashboard, per TODO.md's "Zabbix -
+# dashboards and maps" candidate list. Own dashboard rather than folding
+# into Fleet Overview because OPNsense is API-managed (Firewalls group, not
+# Linux servers) and not part of the general host fleet.
+#
+# WAN THROUGHPUT ONLY -- NOT the full candidate list. TODO.md's wording
+# also asked for "firewall state-table utilization" and "DHCP lease count if
+# polled". Checked live before writing this: opnsense.home.lan's item list
+# (agent-based, not the OPNsense REST API) has per-interface net.if.in/out
+# for every NIC/VLAN/VPN interface, but nothing for pf's state table or the
+# DHCP lease count -- no plumbing exists for either yet. WAN throughput is
+# the one candidate metric that's already collected with zero new work, so
+# it's what this play builds; the other two stay open (would need either a
+# UserParameter shelling out to `pfctl -s info`/`pfctl -s state` for the
+# state table, or the OPNsense REST API's dhcp leases endpoint, same
+# REST-API mechanism already scaffolded for the Ansible-management item in
+# TODO.md's Network section).
+#
+# WAN INTERFACE IS vtnet1 (ETH3_WAN): confirmed against
+# homelab-vault/Network/OPNsense/interfaces.md, not guessed -- OPNsense
+# interface names (igc0/1/2, vtnet0/1) don't self-describe their role.
+#
+# NOTHING NEW TO COLLECT for the throughput tiles: net.if.in[vtnet1] /
+# net.if.out[vtnet1] already exist and are already polled. This play only
+# builds the dashboard.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-network-opnsense-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-network-opnsense-dashboard.yml
+
+- name: Build the Network / OPNsense dashboard
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+
+    dashboard_name: "Network / OPNsense"
+    firewall_group_name: "Firewalls"
+    opnsense_host: "opnsense.home.lan"
+    wan_in_key: "net.if.in[vtnet1]"
+    wan_out_key: "net.if.out[vtnet1]"
+
+  tasks:
+    - name: Resolve the Firewalls host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ firewall_group_name }}"]
+          id: 1
+      register: group_lookup
+      check_mode: false
+      failed_when: >-
+        group_lookup.json.error is defined
+        or (group_lookup.json.result | default([]) | length) != 1
+
+    - name: Resolve the WAN throughput items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_"]
+            host: "{{ opnsense_host }}"
+            filter:
+              key_: ["{{ wan_in_key }}", "{{ wan_out_key }}"]
+          id: 1
+      register: wan_items
+      check_mode: false
+      failed_when: >-
+        wan_items.json.error is defined
+        or (wan_items.json.result | default([]) | length) != 2
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: dash_lookup
+      check_mode: false
+      failed_when: dash_lookup.json.error is defined
+
+    - name: Compose the dashboard page
+      ansible.builtin.set_fact:
+        dashboard_pages:
+          - name: "Network / OPNsense"
+            widgets:
+              - type: item
+                name: "WAN inbound (vtnet1)"
+                x: 0
+                y: 0
+                width: 24
+                height: 8
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ wan_items.json.result | selectattr('key_', 'equalto', wan_in_key) | map(attribute='itemid') | first }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "WAN inbound"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+
+              - type: item
+                name: "WAN outbound (vtnet1)"
+                x: 24
+                y: 0
+                width: 24
+                height: 8
+                fields:
+                  - {type: 4, name: "itemid.0", value: "{{ wan_items.json.result | selectattr('key_', 'equalto', wan_out_key) | map(attribute='itemid') | first }}"}
+                  - {type: 0, name: "show.0", value: "1"}
+                  - {type: 0, name: "show.1", value: "2"}
+                  - {type: 1, name: "description", value: "WAN outbound"}
+                  - {type: 0, name: "value_size", value: "30"}
+                  - {type: 0, name: "desc_v_pos", value: "0"}
+
+              - type: problems
+                name: "OPNsense problems"
+                x: 48
+                y: 0
+                width: 24
+                height: 8
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 0, name: "show", value: "1"}
+
+              - type: hostavail
+                name: "OPNsense agent availability"
+                x: 0
+                y: 8
+                width: 72
+                height: 3
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ group_lookup.json.result[0].groupid }}"}
+                  - {type: 0, name: "interface_type.0", value: "1"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            private: 0
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_create
+      when: dash_lookup.json.result | length == 0
+      failed_when: dash_create.json.error is defined
+      changed_when: dash_create.json.result is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ dashboard_pages }}"
+          id: 1
+      register: dash_update
+      when: dash_lookup.json.result | length > 0
+      failed_when: dash_update.json.error is defined
+      changed_when: dash_update.json.result is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ zabbix_url }}/zabbix.php?action=dashboard.view&dashboardid={{
+            dash_create.json.result.dashboardids[0]
+            if (dash_lookup.json.result | length == 0) and (dash_create.json is defined)
+            else dash_lookup.json.result[0].dashboardid | default('?')
+          }}
