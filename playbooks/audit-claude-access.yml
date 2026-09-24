@@ -98,7 +98,7 @@
     - name: Report claude user status
       set_fact:
         audit_results: "{{ audit_results | combine(
-          {'checks': audit_results.checks | combine({'claude_user_exists': claude_user_result.ansible_facts.getent_passwd.claude is defined})}},
+          {'checks': audit_results.checks | combine({'claude_user_exists': claude_user_result.ansible_facts.getent_passwd.claude is defined})},
           recursive=True
         ) }}"
       when: claude_user_result is defined
@@ -131,7 +131,7 @@
     - name: Report SSH restriction status
       set_fact:
         audit_results: "{{ audit_results | combine(
-          {'checks': audit_results.checks | combine({'ssh_restrictions_ok': ssh_check.no_port_forwarding and ssh_check.no_x11_forwarding and ssh_check.no_agent_forwarding and ssh_check.no_user_rc})}},
+          {'checks': audit_results.checks | combine({'ssh_restrictions_ok': ssh_check.no_port_forwarding and ssh_check.no_x11_forwarding and ssh_check.no_agent_forwarding and ssh_check.no_user_rc})},
           recursive=True
         ) }}"
       when: ssh_check is defined
