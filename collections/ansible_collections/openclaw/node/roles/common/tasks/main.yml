@@ -53,6 +53,7 @@
     create_home: true
     comment: "Claude Code automation identity"
     password_lock: true
+  tags: privileges
 
 - name: Ensure claude .ssh directory exists
   ansible.builtin.file:
@@ -61,6 +62,7 @@
     owner: "{{ claude_user }}"
     group: "{{ claude_user }}"
     mode: "0700"
+  tags: privileges
 
 - name: Install authorized key for claude (if key exists)
   ansible.posix.authorized_key:
@@ -70,6 +72,7 @@
     key_options: "{{ claude_ssh_key_options }}"
     exclusive: true
   ignore_errors: true
+  tags: privileges
 
 # The read half of the read plane. Group membership, not sudo: it confers log
 # visibility and no ability to change anything. Intersected with the real group
