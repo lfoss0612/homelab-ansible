@@ -77,7 +77,7 @@
           jsonrpc: "2.0"
           method: item.get
           params:
-            output: ["itemid", "key_"]
+            output: ["itemid", "name", "key_"]
             host: "{{ opnsense_host }}"
             filter:
               key_: ["{{ wan_in_key }}", "{{ wan_out_key }}"]
@@ -112,33 +112,25 @@
         dashboard_pages:
           - name: "Network / OPNsense"
             widgets:
-              - type: item
-                name: "WAN inbound (vtnet1)"
+              # ds.N.hosts/items/color: same svggraph item-list dataset
+              # fields as the already-live "Pod phases over time" /
+              # "PV capacity, total, over time" graphs in
+              # zabbix-kubernetes-dashboard.yml -- copied from a proven
+              # working example rather than guessed.
+              - type: svggraph
+                name: "WAN throughput (vtnet1)"
                 x: 0
                 y: 0
-                width: 24
+                width: 48
                 height: 8
                 fields:
-                  - {type: 4, name: "itemid.0", value: "{{ wan_items.json.result | selectattr('key_', 'equalto', wan_in_key) | map(attribute='itemid') | first }}"}
-                  - {type: 0, name: "show.0", value: "1"}
-                  - {type: 0, name: "show.1", value: "2"}
-                  - {type: 1, name: "description", value: "WAN inbound"}
-                  - {type: 0, name: "value_size", value: "30"}
-                  - {type: 0, name: "desc_v_pos", value: "0"}
-
-              - type: item
-                name: "WAN outbound (vtnet1)"
-                x: 24
-                y: 0
-                width: 24
-                height: 8
-                fields:
-                  - {type: 4, name: "itemid.0", value: "{{ wan_items.json.result | selectattr('key_', 'equalto', wan_out_key) | map(attribute='itemid') | first }}"}
-                  - {type: 0, name: "show.0", value: "1"}
-                  - {type: 0, name: "show.1", value: "2"}
-                  - {type: 1, name: "description", value: "WAN outbound"}
-                  - {type: 0, name: "value_size", value: "30"}
-                  - {type: 0, name: "desc_v_pos", value: "0"}
+                  - {type: 1, name: "ds.0.hosts.0", value: "{{ opnsense_host }}"}
+                  - {type: 1, name: "ds.0.items.0", value: "{{ wan_items.json.result | selectattr('key_', 'equalto', wan_in_key) | map(attribute='name') | first }}"}
+                  - {type: 1, name: "ds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "ds.1.hosts.0", value: "{{ opnsense_host }}"}
+                  - {type: 1, name: "ds.1.items.0", value: "{{ wan_items.json.result | selectattr('key_', 'equalto', wan_out_key) | map(attribute='name') | first }}"}
+                  - {type: 1, name: "ds.1.color", value: "2196F3"}
+                  - {type: 1, name: "lefty_min", value: "0"}
 
               - type: problems
                 name: "OPNsense problems"
