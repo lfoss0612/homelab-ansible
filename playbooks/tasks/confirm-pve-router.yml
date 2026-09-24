@@ -28,9 +28,21 @@
   when:
     - inventory_hostname == 'pve-router.home.lan'
     - not (confirm_pve_router | default(false) | bool)
+  tags: always
 
+# tags: always is load-bearing, not decoration. This file is brought in via a
+# dynamic include_tasks (see the node/gateway plays), and --tags is evaluated
+# against that include statement first -- the include itself being tagged
+# always is not enough on its own, because the include still only re-exposes
+# its *own* tasks to the same --tags filter, unless each one also opts out
+# individually. Without this, any tag-scoped run (e.g. --tags privileges)
+# silently drops this task and pve-router loses its confirm_pve_router
+# backstop entirely -- discovered exactly that way, 2026-09-24, running
+# deploy-openclaw.yml --tags privileges: pve-router proceeded straight into
+# real changes with no confirmation and no warning.
 - name: Skip pve-router unless explicitly confirmed for this run
   ansible.builtin.meta: end_host
   when:
     - inventory_hostname == 'pve-router.home.lan'
     - not (confirm_pve_router | default(false) | bool)
+  tags: always
