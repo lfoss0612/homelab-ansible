@@ -572,6 +572,12 @@
   when:
     - openclaw_resolved_standardize
     - "'systemd-networkd.service' in (ansible_facts.services | default({}))"
+  # ansible.builtin.systemd can't detect whether a reload was a no-op, so it
+  # always reports changed. It genuinely is one here: this task exists only to
+  # push a link's *already-correct* DNS= config to resolved (see the comment
+  # above) -- if the config itself had actually changed, the .network-file
+  # tasks earlier in this role already report that changed on their own.
+  changed_when: false
   tags: dns
 
 - name: Check whether /etc/resolv.conf already points at the resolved stub
