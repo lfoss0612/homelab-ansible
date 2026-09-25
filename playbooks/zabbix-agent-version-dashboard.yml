@@ -46,7 +46,9 @@
 
   vars:
     zabbix_url: "http://10.0.5.9/zabbix"
-    zabbix_api_token: "c4bceeafe968e48fd74a68fda821867cee967eb19a4cea615b2e47f1215ad939"
+    # Vaulted in host_vars/zabbix.home.lan.yml, read via hostvars (see
+    # that file for why this isn't a plain group_vars/vars_files include).
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
 
     dashboard_name: "Zabbix Agent Versions"
     version_item_name: "Version of Zabbix agent running"

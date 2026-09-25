@@ -25,3 +25,31 @@ zbx_mysql_password: !vault |
           33373033646564366134386636396663343263653034616463623465313331326535383436623263
           3762323931383234350a373065346461633535343532393539653531643466633764316566643166
           34333265653337633037656534303338666565336365396164353939613462316437
+
+# --- API token used by ~38 zabbix-*.yml / *-zabbix-*.yml playbooks ------------
+#
+# One token, shared across every playbook in this repo that calls the Zabbix
+# JSON-RPC API from `hosts: localhost`. Those playbooks read it via
+# `hostvars['zabbix.home.lan'].zabbix_api_token` rather than a `vars_files`
+# include or plain group_vars auto-load, because `hosts: localhost` isn't a
+# member of any inventory group this file applies to - hostvars resolves it
+# anyway, since Ansible computes hostvars for every inventory host regardless
+# of what the current play targets. Same reasoning as the openclaw_pin lookup
+# in zabbix-openclaw-version-item.yml (see that file's header comment).
+#
+# Was plaintext, inline, in all ~38 playbooks until 2026-09-24 - moved here
+# after the value got echoed into a Claude session transcript by an unrelated
+# `grep -n` while looking up how to call the Zabbix API. See homelab-vault
+# TODO.md for that incident and the still-open item to build a rotation
+# script; this value should be rotated by that script once it exists, not by
+# hand-editing this block.
+zabbix_api_token: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          62346538646562646663323966353862663666376336313638306466343133383938616233623864
+          3739333735393935356138356131623936306137313863610a643661323761396431633135386137
+          39343735386639653961623638363965383439356137363135376665393863373539646362306430
+          3337363333336261380a386464326361616265636530303165343436623936383436643766353963
+          64323035386239623936383061356437643537376365663663333963366364663861323661626530
+          35623036623536616230303639653265376336393436363931646536656637633666333436393265
+          62383661613231383139633133336465316437636165633734326366646131393266623831393338
+          66343435633262303734
