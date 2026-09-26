@@ -2,7 +2,19 @@
 #
 # Report OS patch status for Zabbix UserParameter items:
 #   os-update-status pending             -> count of packages a dist-upgrade would install
-#   os-update-status reboot [hostfs-prefix] -> 0 = no reboot needed, 1 = needed, 2 = n/a (container)
+#   os-update-status reboot [hostfs-prefix] -> text item: "Reboot needed", a single
+#     space (no reboot needed), or two spaces (n/a, this host is a container -- see
+#     below). Never truly empty stdout -- some Zabbix agent UserParameter paths treat
+#     a zero-byte result as ZBX_NOTSUPPORTED rather than a valid empty string, so both
+#     "blank" states print whitespace instead; the dashboard's Highlights regex still
+#     tells all three states apart, while a browser collapses one or two spaces the
+#     same way, rendering the cell equally blank either way. These are literal display
+#     text rather than a 0/1/2 code plus a Zabbix value map on purpose:
+#     getFormattedValue() in Zabbix's Top Hosts widget (ui/widgets/tophosts/views/
+#     widget.view.php) runs any UINT64/FLOAT item through formatAggregatedHistoryValue()
+#     unconditionally, which appends "(raw value)" after the mapped text no matter what
+#     display mode the column uses -- confirmed against zabbix/zabbix@master 2026-09-26.
+#     A genuine text-type item has no separate raw number for it to append.
 #
 # POSIX /bin/sh on purpose, not bash: this same file has to run two ways --
 # natively via a normal Zabbix agent2 UserParameter on 11 hosts, and invoked as
@@ -42,32 +54,30 @@ case "$action" in
   reboot)
     running=$(uname -r)
     newest=$(ls -1 "${prefix}/boot/vmlinuz-"* 2>/dev/null | sed "s|.*/vmlinuz-||" | sort -V | tail -1)
-    result=0
+    result=" "
 
     if [ -z "$prefix" ]; then
       # Native mode only: an LXC container's uname -r reports the HOST's
       # kernel (same reasoning as above, one shared kernel), which can never
       # match "the newest kernel this guest could boot" -- it isn't the one
-      # booting anything. Reported distinctly (2) rather than folded into
-      # "no reboot needed" (0), which would be a real answer to a different
-      # question. Same false-positive playbooks/os-update.yml already fixed
-      # once for pdm.home.lan.
+      # booting anything. Same false-positive playbooks/os-update.yml already
+      # fixed once for pdm.home.lan.
       virt=$(systemd-detect-virt 2>/dev/null)
       [ -z "$virt" ] && virt=none
       case "$virt" in
         lxc | container-other | systemd-nspawn | docker)
-          echo 2
+          echo "  "
           exit 0
           ;;
       esac
 
       if [ -f /var/run/reboot-required ]; then
-        result=1
+        result="Reboot needed"
       fi
     fi
 
     if [ -n "$newest" ] && [ "$newest" != "$running" ]; then
-      result=1
+      result="Reboot needed"
     fi
 
     echo "$result"
