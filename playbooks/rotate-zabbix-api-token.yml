@@ -1,0 +1,135 @@
+---
+# Rotate the Zabbix API token used by ~38 zabbix-*.yml / *-zabbix-*.yml
+# playbooks, and save the new value to the vault.
+#
+# WHY: see homelab-vault TODO.md -- the token was echoed in full into a
+# Claude session transcript on 2026-09-24. Moving it into Ansible Vault
+# that day (host_vars/zabbix.home.lan.yml) fixed the exposure VECTOR, not
+# the exposed VALUE. This closes that out.
+#
+# WHY THIS CAN'T BE FULLY AUTOMATED LIKE rotate-zabbix-mysql-password.yml:
+# that play could change the MySQL password itself because it has root SSH
+# on the DB host. Minting a Zabbix API token is different -- it's gated by
+# Zabbix's own RBAC, not the OS. `token.create` and `token.get` are both
+# refused to the automation token's role (verified live 2026-09-27, same
+# finding recorded in homelab-vault TODO.md). Zabbix stores only a
+# SHA-256 hash of each token in its `token` MySQL table, and this repo
+# already has root DB access to that table (see the MySQL rotation play
+# above) -- so a raw INSERT there COULD mint a token without ever touching
+# the UI. Deliberately not done: that would bypass a permission boundary
+# Zabbix put there on purpose, and it leaves no audit trail
+# (creator_userid, created_at) of who minted it or why. A human mints the
+# replacement in the Zabbix UI instead (Users -> API tokens -> Create API
+# token, for the SAME user the current token belongs to -- check the
+# existing token's owner in that same list first) and types it into this
+# playbook via a masked prompt.
+#
+# CREDENTIAL HANDLING: same posture as rotate-zabbix-mysql-password.yml.
+# The typed-in token is read via vars_prompt (private: true, terminal echo
+# off) and carries no_log: true on every task that touches it. It is fed
+# to `ansible-vault encrypt_string` via the shell module's `stdin`
+# parameter -- passed straight to the subprocess's stdin, never templated
+# into any command/script text -- so no assumption about the token's
+# character set is needed (unlike the MySQL password, this value is
+# minted by Zabbix, not generated here, so its exact charset isn't
+# controlled by this play). Verified against the live API BEFORE being
+# encrypted, so a mistyped token is caught immediately rather than saved.
+# The encrypt task itself carries no_log: true (its `invocation` would
+# otherwise echo the raw token), which -- exactly like the bug fixed in
+# rotate-zabbix-mysql-password.yml -- means its OWN registered result
+# can't be read back afterward. So it writes the ciphertext to a private
+# temp file instead of a `register`'d stdout, and a separate, non-no_log
+# task reads that file back (ciphertext only, safe) before deleting it.
+#
+# This play does NOT write into the git checkout itself -- cockpit has no
+# push credentials (see repo CLAUDE.md) -- so host_vars/zabbix.home.lan.yml
+# has to be updated, committed and pushed from a checkout that can push,
+# then synced back to cockpit. Paste the printed block in as
+# `zabbix_api_token`.
+#
+# AFTER this play succeeds: go back to the Zabbix UI and disable/delete the
+# OLD token. This play only verifies+vaults the new one -- it does not
+# touch the old one (whether `token.delete` is even permitted to the
+# automation role is unverified; do it by hand in the UI, where you can
+# also confirm which token is which).
+#
+# Usage (interactive -- prompts for the new token, no --check mode since
+# the only real step is a live API call with nothing to preview):
+#   ansible-playbook playbooks/rotate-zabbix-api-token.yml
+
+- name: Rotate the Zabbix API token (vault the new value; minting stays manual)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    vault_password_file: /etc/ansible-vault-password
+
+  vars_prompt:
+    - name: new_zabbix_api_token
+      prompt: "Paste the NEW token just minted in the Zabbix UI (Users -> API tokens)"
+      private: true
+
+  tasks:
+    - name: Refuse an empty token
+      ansible.builtin.assert:
+        that:
+          - new_zabbix_api_token | length > 0
+        fail_msg: "No token entered -- aborting."
+
+    - name: Verify the new token actually authenticates before doing anything else
+      # no_log: true because the Authorization header (carrying the raw
+      # token) would otherwise be echoed back in this task's own
+      # `invocation` at higher verbosity -- which means, same as the bug
+      # fixed in rotate-zabbix-mysql-password.yml, nothing about this
+      # result (not even the safe parts, like the API version) can be read
+      # back afterward. A green "ok" on this task IS the confirmation.
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ new_zabbix_api_token }}"
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: apiinfo.version
+          params: {}
+          id: 1
+      register: verify_check
+      no_log: true
+      failed_when: verify_check.json.error is defined
+
+    - name: Create a private temp file to hold the ciphertext (not the plaintext -- see next task)
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .vaulted
+      register: vault_tmp
+
+    - name: Encrypt the new token for the repo's vault (stdin param -- never templated into command/script text or shown in invocation logs)
+      ansible.builtin.shell:
+        cmd: "ansible-vault encrypt_string --vault-password-file {{ vault_password_file }} --stdin-name zabbix_api_token > {{ vault_tmp.path }}"
+        executable: /bin/bash
+        stdin: "{{ new_zabbix_api_token }}"
+      no_log: true
+      changed_when: false
+
+    - name: Read back the ciphertext (safe -- the file holds no plaintext)
+      ansible.builtin.slurp:
+        src: "{{ vault_tmp.path }}"
+      register: vaulted_token_b64
+
+    - name: Remove the temp file
+      ansible.builtin.file:
+        path: "{{ vault_tmp.path }}"
+        state: absent
+
+    - name: Show the vault-ready block for the new token
+      ansible.builtin.debug:
+        msg: >-
+          Paste this into homelab-ansible/host_vars/zabbix.home.lan.yml
+          (replacing the existing zabbix_api_token block), then commit and
+          push from a checkout with push access, and re-sync cockpit's
+          checkout -- this play does not write to the git repo itself.
+          Once verified working, disable/delete the OLD token in the
+          Zabbix UI:
+          {{ vaulted_token_b64.content | b64decode }}
