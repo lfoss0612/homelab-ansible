@@ -1,0 +1,131 @@
+---
+# Give pve.home.lan active swap via a ZFS zvol.
+#
+# Usage:
+#   ansible-playbook playbooks/add-pve-zfs-swap.yml --check --diff
+#   ansible-playbook playbooks/add-pve-zfs-swap.yml
+#   ansible-playbook playbooks/add-pve-zfs-swap.yml -e pve_zfs_swap_size=32G
+#
+# Background (2026-09-25, homelab-vault TODO.md "pve-ai has had no active
+# swap"): pve's root is ZFS (rpool/ROOT/pve-1), same as pve-ai. Confirmed
+# live: swapon --show and `free -h` both show 0B swap, and there's no
+# /swapfile or swapfile.swap unit at all -- pve never had one provisioned,
+# unlike pve-ai (which has a broken one that fails every boot with
+# "skipping - it appears to have holes").
+#
+# A plain swapfile is NOT the fix here -- that "holes" failure on pve-ai
+# IS what happens when you try to swapon a regular file on ZFS. ZFS's
+# copy-on-write layout means a swapfile's blocks aren't the stable,
+# contiguous extents swapon requires. The supported way to get swap on a
+# ZFS root is a dedicated zvol, formatted as swap in the usual way.
+#
+# Zvol properties follow the OpenZFS FAQ's swap recommendations:
+#   -b <PAGESIZE>       volblocksize matched to the host's memory page size
+#   logbias=throughput  swap I/O is not sequential-write-optimized
+#   sync=always         avoid returning from a write before it's on disk
+#   primarycache=metadata  don't let swapped-out pages double up in ARC
+#   com.sun:auto-snapshot=false  swap contents are never worth snapshotting
+#
+# Sized to match RAM (61Gi) per 2026-09-25 decision -- rpool has 96.5G free,
+# comfortably enough headroom (~32.5G left after) for a full-RAM swap zvol.
+#
+# This playbook only touches pve.home.lan. pve-router is presumed (not yet
+# verified) to have the same issue -- see homelab-vault TODO.md. Re-run with
+# -e pve_zfs_swap_hosts=pve-router.home.lan once that's confirmed, rather
+# than widening the default here.
+
+- name: Provision ZFS zvol swap on pve
+  hosts: "{{ pve_zfs_swap_hosts | default('pve.home.lan') }}"
+  become: true
+  vars:
+    pve_zfs_swap_size: 64G
+    pve_zfs_swap_dataset: rpool/swap
+
+  tasks:
+    - name: Read the host's memory page size
+      ansible.builtin.command: getconf PAGESIZE
+      register: pve_zfs_swap_pagesize
+      changed_when: false
+      check_mode: false
+
+    - name: Check whether the swap zvol already exists
+      ansible.builtin.command: "zfs list -H -o name {{ pve_zfs_swap_dataset }}"
+      register: pve_zfs_swap_zvol_check
+      failed_when: false
+      changed_when: false
+      check_mode: false
+
+    - name: Create the swap zvol
+      ansible.builtin.command: >
+        zfs create -V {{ pve_zfs_swap_size }}
+        -b {{ pve_zfs_swap_pagesize.stdout | trim }}
+        -o logbias=throughput
+        -o sync=always
+        -o primarycache=metadata
+        -o com.sun:auto-snapshot=false
+        {{ pve_zfs_swap_dataset }}
+      when: pve_zfs_swap_zvol_check.rc != 0
+      register: pve_zfs_swap_zvol_create
+
+    - name: Wait for the zvol device node to appear
+      ansible.builtin.wait_for:
+        path: "/dev/zvol/{{ pve_zfs_swap_dataset }}"
+        timeout: 10
+      when: pve_zfs_swap_zvol_create is changed
+      check_mode: false
+
+    - name: Check whether the zvol is already formatted as swap
+      ansible.builtin.command: "blkid -o value -s TYPE /dev/zvol/{{ pve_zfs_swap_dataset }}"
+      register: pve_zfs_swap_blkid
+      failed_when: false
+      changed_when: false
+      check_mode: false
+      when: pve_zfs_swap_zvol_check.rc == 0
+
+    - name: Format the zvol as swap
+      ansible.builtin.command: "mkswap /dev/zvol/{{ pve_zfs_swap_dataset }}"
+      when: >
+        pve_zfs_swap_zvol_create is changed
+        or pve_zfs_swap_blkid.stdout | default('') | trim != 'swap'
+      register: pve_zfs_swap_mkswap
+
+    - name: Check current active swap devices
+      ansible.builtin.command: "swapon --show=NAME --noheadings"
+      register: pve_zfs_swap_active_before
+      changed_when: false
+      check_mode: false
+
+    - name: Add the zvol to /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^/dev/zvol/{{ pve_zfs_swap_dataset | regex_escape }}\\s"
+        line: "/dev/zvol/{{ pve_zfs_swap_dataset }} none swap sw 0 0"
+        state: present
+
+    - name: Activate swap
+      ansible.builtin.command: swapon -a
+      when: "'/dev/zvol/' + pve_zfs_swap_dataset not in pve_zfs_swap_active_before.stdout"
+      register: pve_zfs_swap_on
+
+    - name: Re-check active swap (skipped under --check)
+      when: not ansible_check_mode
+      block:
+        - name: Read swapon output
+          ansible.builtin.command: swapon --show
+          register: pve_zfs_swap_active_after
+          changed_when: false
+
+        - name: Verify the zvol is active
+          ansible.builtin.assert:
+            that: "'/dev/zvol/' + pve_zfs_swap_dataset in pve_zfs_swap_active_after.stdout"
+            fail_msg: >-
+              /dev/zvol/{{ pve_zfs_swap_dataset }} is not showing in
+              `swapon --show` after activation.
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "zvol: {{ 'created' if pve_zfs_swap_zvol_create is changed else 'already existed' }} ({{ pve_zfs_swap_dataset }}, {{ pve_zfs_swap_size }})"
+          - "mkswap: {{ 'ran' if pve_zfs_swap_mkswap is changed else 'skipped, already formatted' }}"
+          - "fstab: {{ '/dev/zvol/' + pve_zfs_swap_dataset + ' none swap sw 0 0' }}"
+          - "swapon: {{ pve_zfs_swap_active_after.stdout_lines | default(['(check mode, not verified)']) }}"
