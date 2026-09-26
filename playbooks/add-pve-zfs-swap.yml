@@ -1,9 +1,11 @@
 ---
-# Give pve.home.lan active swap via a ZFS zvol.
+# Give a Proxmox host (default pve.home.lan) active swap via a ZFS zvol,
+# cleaning up any legacy broken /swapfile setup along the way.
 #
 # Usage:
 #   ansible-playbook playbooks/add-pve-zfs-swap.yml --check --diff
 #   ansible-playbook playbooks/add-pve-zfs-swap.yml
+#   ansible-playbook playbooks/add-pve-zfs-swap.yml -e pve_zfs_swap_hosts=pve-ai.home.lan
 #   ansible-playbook playbooks/add-pve-zfs-swap.yml -e pve_zfs_swap_size=32G
 #
 # Background (2026-09-25, homelab-vault TODO.md "pve-ai has had no active
@@ -29,8 +31,18 @@
 # Sized to match RAM (61Gi) per 2026-09-25 decision -- rpool has 96.5G free,
 # comfortably enough headroom (~32.5G left after) for a full-RAM swap zvol.
 #
-# This playbook only touches pve.home.lan. pve-router is presumed (not yet
-# verified) to have the same issue -- see homelab-vault TODO.md. Re-run with
+# pve-ai (2026-09-26 run) additionally has the legacy broken setup the TODO
+# describes: a 34G /swapfile that has never once actually activated (every
+# boot logs "skipping - it appears to have holes"), a failed swapfile.swap
+# unit, and a /etc/fstab line pointing at it. This playbook removes all
+# three -- deleting the file also reclaims real space from rpool/ROOT,
+# since a ZFS root means that file was never doing anything but sitting
+# there. Safe to leave pve_zfs_swap_remove_legacy_swapfile enabled
+# everywhere: on a host without this legacy leftover (e.g. pve), every
+# cleanup task is a no-op.
+#
+# pve-router is presumed (not yet verified) to have one issue or the other
+# -- see homelab-vault TODO.md. Re-run with
 # -e pve_zfs_swap_hosts=pve-router.home.lan once that's confirmed, rather
 # than widening the default here.
 
@@ -40,8 +52,37 @@
   vars:
     pve_zfs_swap_size: 64G
     pve_zfs_swap_dataset: rpool/swap
+    pve_zfs_swap_remove_legacy_swapfile: true
+    pve_zfs_swap_legacy_swapfile_path: /swapfile
 
   tasks:
+    - name: Remove legacy /swapfile entry from /etc/fstab (broken on ZFS root)
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^{{ pve_zfs_swap_legacy_swapfile_path | regex_escape }}\\s"
+        state: absent
+      when: pve_zfs_swap_remove_legacy_swapfile
+      register: pve_zfs_swap_legacy_fstab_removed
+
+    - name: Reload systemd units after removing the legacy fstab entry
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: pve_zfs_swap_legacy_fstab_removed is changed
+
+    - name: Clear the legacy swapfile.swap unit's failed state
+      ansible.builtin.command: systemctl reset-failed swapfile.swap
+      when: pve_zfs_swap_legacy_fstab_removed is changed
+      register: pve_zfs_swap_legacy_unit_reset
+      changed_when: pve_zfs_swap_legacy_unit_reset.rc == 0
+      failed_when: false
+
+    - name: Remove the legacy broken swapfile
+      ansible.builtin.file:
+        path: "{{ pve_zfs_swap_legacy_swapfile_path }}"
+        state: absent
+      when: pve_zfs_swap_remove_legacy_swapfile
+      register: pve_zfs_swap_legacy_file_removed
+
     - name: Read the host's memory page size
       ansible.builtin.command: getconf PAGESIZE
       register: pve_zfs_swap_pagesize
@@ -140,6 +181,7 @@
     - name: Report
       ansible.builtin.debug:
         msg:
+          - "legacy swapfile: {{ 'removed' if pve_zfs_swap_legacy_file_removed is changed else 'none found' }} ({{ pve_zfs_swap_legacy_swapfile_path }})"
           - "zvol: {{ 'created' if pve_zfs_swap_zvol_create is changed else 'already existed' }} ({{ pve_zfs_swap_dataset }}, {{ pve_zfs_swap_size }})"
           - "mkswap: {{ 'ran' if pve_zfs_swap_mkswap is changed else 'skipped, already formatted' }}"
           - "fstab: {{ '/dev/zvol/' + pve_zfs_swap_dataset + ' none swap sw 0 0' }}"
