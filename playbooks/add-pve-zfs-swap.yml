@@ -89,6 +89,19 @@
         or pve_zfs_swap_blkid.stdout | default('') | trim != 'swap'
       register: pve_zfs_swap_mkswap
 
+    - name: Resolve the zvol's real device node
+      # swapon --show reports the resolved /dev/zdN node, not the
+      # /dev/zvol/<dataset> symlink -- compare against this, not the
+      # symlink path, or the "already active" check never matches and
+      # `swapon -a` (harmlessly) re-runs, plus the final assert fails
+      # even when swap is genuinely active. Verified 2026-09-26: after a
+      # real run, `swapon --show` listed /dev/zd272 for rpool/swap.
+      ansible.builtin.command: "readlink -f /dev/zvol/{{ pve_zfs_swap_dataset }}"
+      register: pve_zfs_swap_realdev
+      changed_when: false
+      check_mode: false
+      when: pve_zfs_swap_zvol_check.rc == 0 or pve_zfs_swap_zvol_create is changed
+
     - name: Check current active swap devices
       ansible.builtin.command: "swapon --show=NAME --noheadings"
       register: pve_zfs_swap_active_before
@@ -104,7 +117,9 @@
 
     - name: Activate swap
       ansible.builtin.command: swapon -a
-      when: "'/dev/zvol/' + pve_zfs_swap_dataset not in pve_zfs_swap_active_before.stdout"
+      when: >
+        pve_zfs_swap_realdev.stdout is not defined
+        or pve_zfs_swap_realdev.stdout | trim not in pve_zfs_swap_active_before.stdout
       register: pve_zfs_swap_on
 
     - name: Re-check active swap (skipped under --check)
@@ -117,10 +132,10 @@
 
         - name: Verify the zvol is active
           ansible.builtin.assert:
-            that: "'/dev/zvol/' + pve_zfs_swap_dataset in pve_zfs_swap_active_after.stdout"
+            that: "pve_zfs_swap_realdev.stdout | trim in pve_zfs_swap_active_after.stdout"
             fail_msg: >-
-              /dev/zvol/{{ pve_zfs_swap_dataset }} is not showing in
-              `swapon --show` after activation.
+              {{ pve_zfs_swap_realdev.stdout | trim }} ({{ pve_zfs_swap_dataset }})
+              is not showing in `swapon --show` after activation.
 
     - name: Report
       ansible.builtin.debug:
