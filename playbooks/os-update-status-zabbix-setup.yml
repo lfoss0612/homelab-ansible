@@ -269,10 +269,17 @@
                  | map(attribute='valuemapid') | list | first }}
           id: 1
       loop: "{{ reboot_items_lookup_final.json.result }}"
+      vars:
+        matching_valuemaps: >-
+          {{ valuemap_lookup_final.json.result
+             | selectattr('hostid', 'equalto', item.hostid) | list }}
+      # The length check is what keeps this safe under --check: a dry run
+      # skips valuemap.create above, so matching_valuemaps is genuinely empty
+      # then (not a real "no value map for this host" state) and this must
+      # skip rather than dereference an empty list with `first`.
       when: >-
-        item.valuemapid != (valuemap_lookup_final.json.result
-          | selectattr('hostid', 'equalto', item.hostid)
-          | map(attribute='valuemapid') | list | first)
+        (matching_valuemaps | length) > 0
+        and item.valuemapid != (matching_valuemaps | map(attribute='valuemapid') | first)
       register: reboot_item_valuemap_update
       failed_when: >-
         reboot_item_valuemap_update.json is defined
