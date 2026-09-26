@@ -1,0 +1,121 @@
+---
+# Stop pvestatd from stalling pve-router's shutdown for 90 seconds.
+#
+# Usage:
+#   ansible-playbook playbooks/fix-pve-router-shutdown.yml --check --diff
+#   ansible-playbook playbooks/fix-pve-router-shutdown.yml
+#
+# Background (2026-09-26 journal review of 30 boots on pve-router): a normal
+# shutdown takes 35-45s, but on 3 boots (2026-04-13, 2026-09-16, 2026-09-26
+# 09:39) it took ~2 minutes and journald logged
+#   pvestatd.service: State 'stop-sigterm' timed out. Killing.
+# Two more boots spent ~11s in the same place.
+#
+# Mechanism, as far as the logs show:
+#   1. pve-guests.service is ordered After=pvestatd.service, so on shutdown
+#      it stops FIRST -- including VM 106 (OPNsense), the gateway.
+#   2. pvestatd is then asked to stop but is mid-poll of storage that lives
+#      behind that gateway: the `template` NFSv4 mount and the PBS
+#      datastores, all on pbs.home.lan ("storage 'template' is not online",
+#      "pbs_pve-router: ... No route to host").
+#   3. The hard NFS mount blocks the process so it ignores SIGTERM until
+#      systemd's 90s TimeoutStopSec expires and SIGKILLs it. pve-cluster
+#      can't unmount /etc/pve meanwhile (pmxcfs logs quorum_initialize
+#      failed every 6s).
+# (The NFS-blocking step is inferred from the messages -- no kernel stack
+# trace was captured.)
+#
+# Two changes, deliberately independent:
+#
+#   A. pvestatd TimeoutStopSec=15s -- caps the worst case if it still hangs.
+#
+#   B. pvestatd-early-stop.service -- a no-op oneshot ordered After=
+#      pve-guests.service. systemd stops units in reverse start order, so
+#      this one stops BEFORE pve-guests, and its ExecStop runs
+#      `pvestatd stop` while the gateway and NFS server are still reachable.
+#      It calls the daemon's own stop command directly rather than
+#      `systemctl stop pvestatd`: that would queue a stop job ordered after
+#      pve-guests' stop, which is ordered after this unit's stop -- a
+#      deadlock. Done as a separate unit instead of a pve-guests drop-in so
+#      the vendor ExecStop lines (vzdump -stop, stopall) aren't copied here
+#      and can't drift on a pve-manager upgrade.
+#
+# NOT changed: the "reboot never came back" cases (2026-09-16 and 2026-09-26
+# 08:11 -- clean journal, then 7-10 min before the next boot). The kernel
+# cmdline has reboot=pci and there is no /dev/watchdog; that is a
+# hardware/firmware question, separate from this fix, and this host runs the
+# router VM for the whole house.
+#
+# To verify after applying: reboot, then
+#   journalctl -b -1 | grep -E "pvestatd|early-stop"
+# and confirm no "stop-sigterm timed out", with pvestatd stopping before the
+# "Stopping pve-guests.service" line ends.
+
+- name: Fix slow pvestatd stop on pve-router shutdown
+  hosts: "{{ pve_router_shutdown_hosts | default('pve-router.home.lan') }}"
+  become: true
+  vars:
+    pvestatd_stop_timeout: 15s
+    pvestatd_early_stop_cmd_timeout: 20
+
+  tasks:
+    - name: Create pvestatd drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/pvestatd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Cap pvestatd stop time
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pvestatd.service.d/10-stop-timeout.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (playbooks/fix-pve-router-shutdown.yml)
+          [Service]
+          TimeoutStopSec={{ pvestatd_stop_timeout }}
+      notify: Reload systemd
+
+    - name: Install pvestatd-early-stop.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pvestatd-early-stop.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (playbooks/fix-pve-router-shutdown.yml)
+          [Unit]
+          Description=Stop pvestatd before guests (and the gateway VM) go down
+          After=pve-guests.service pvestatd.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/true
+          ExecStop=-/usr/bin/timeout {{ pvestatd_early_stop_cmd_timeout }} /usr/bin/pvestatd stop
+          TimeoutStopSec={{ pvestatd_early_stop_cmd_timeout | int + 10 }}
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    # Flush now so the enable below sees the new unit file.
+    - name: Apply unit changes
+      ansible.builtin.meta: flush_handlers
+
+    # ExecStart is /bin/true, so starting it does not touch pvestatd or any
+    # guest; it only records the unit as active so its ExecStop runs at
+    # shutdown.
+    - name: Enable and start pvestatd-early-stop.service
+      ansible.builtin.systemd:
+        name: pvestatd-early-stop.service
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
