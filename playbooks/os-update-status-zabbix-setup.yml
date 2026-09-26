@@ -305,8 +305,14 @@
                   - {type: 1, name: "columns.1.base_color", value: "4CAF50"}
                   # 1+ pending is amber, 100+ (a host missing multiple point
                   # releases, e.g. pve-router at 226 the day this was built)
-                  # is red.
-                  - {type: 1, name: "columnsthresholds.1.color.0", value: "FF9800"}
+                  # is red. FF9800 (Material orange 500) against this widget's
+                  # white cell text is ~2.2:1 contrast -- well under WCAG AA's
+                  # 4.5:1 floor and hard to read, confirmed by the user. D84315
+                  # (Material deep orange 800) is the same amber-warning hue
+                  # family darkened enough to reach ~4.4:1. The widget gives no
+                  # way to set text color separately (see CWidgetFieldColumnsList
+                  # ::toApi in zabbix/zabbix), so a darker fill is the only lever.
+                  - {type: 1, name: "columnsthresholds.1.color.0", value: "D84315"}
                   - {type: 1, name: "columnsthresholds.1.threshold.0", value: "1"}
                   - {type: 1, name: "columnsthresholds.1.color.1", value: "F44336"}
                   - {type: 1, name: "columnsthresholds.1.threshold.1", value: "100"}
@@ -314,14 +320,19 @@
                   - {type: 1, name: "columns.2.name", value: "Reboot required"}
                   - {type: 0, name: "columns.2.data", value: "1"}
                   - {type: 1, name: "columns.2.item", value: "{{ reboot_item_name }}"}
-                  - {type: 1, name: "columns.2.base_color", value: "4CAF50"}
+                  # No base_color: omitting it leaves Zabbix's own default of
+                  # '' (see CWidgetFieldColumnsList's $column_defaults in
+                  # zabbix/zabbix), which the renderer treats as "don't set a
+                  # bgcolor attribute at all" -- i.e. transparent, so the
+                  # single-space "no reboot needed" value blends into the
+                  # dashboard background instead of drawing the eye with a
+                  # color that (by design) means nothing happened.
+                  #
                   # display_value_as=1 (DISPLAY_VALUE_AS_TEXT) is what makes
                   # Highlights (regex over the item's own text) the coloring
                   # mechanism here instead of numeric Thresholds -- required
                   # because the item is text-typed (see os-update-status.sh
-                  # and the item description for why). Base color (green)
-                  # covers the single-space "no reboot needed" value; no
-                  # highlight rule is needed for it.
+                  # and the item description for why).
                   - {type: 0, name: "columns.2.display_value_as", value: "1"}
                   - {type: 1, name: "columns.2.highlights.0.pattern", value: "^Reboot needed$"}
                   - {type: 1, name: "columns.2.highlights.0.color", value: "F44336"}
