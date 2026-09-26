@@ -114,6 +114,9 @@
         name: pvestatd-early-stop.service
         enabled: true
         state: started
+      # Under --check the unit file above was never written, so systemd can't
+      # find it yet. Tolerate that only in check mode; a real run must fail.
+      ignore_errors: "{{ ansible_check_mode }}"
 
   handlers:
     - name: Reload systemd
