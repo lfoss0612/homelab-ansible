@@ -44,6 +44,17 @@
     reboot_item_key: "os.update.reboot.required"
     reboot_item_name: "OS updates: reboot required"
 
+    # Value map so the dashboard shows text instead of the raw 0/1/2 status
+    # code (see os-update-status.sh's comment for what each number means).
+    # newvalue uses a single space rather than "" -- the Zabbix API docs don't
+    # confirm an empty string is accepted for a mapping's newvalue, and a
+    # space renders just as blank in the Top Hosts widget cell.
+    reboot_valuemap_name: "OS update: reboot status"
+    reboot_valuemap_mappings:
+      - {type: 0, value: "0", newvalue: " "}
+      - {type: 0, value: "1", newvalue: "Reboot needed"}
+      - {type: 0, value: "2", newvalue: " "}
+
     # No apt/dpkg reachable from the DaemonSet agent pod on these -- see
     # playbooks/os-update-status-monitor.yml for the full explanation.
     pending_excluded_hosts:
@@ -156,6 +167,117 @@
       register: reboot_item_create
       failed_when: reboot_item_create.json is defined and reboot_item_create.json.error is defined
       changed_when: reboot_item_create.json.result is defined
+
+    - name: Look up existing reboot-status value maps (all 14 hosts)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: valuemap.get
+          params:
+            output: ["valuemapid", "hostid"]
+            hostids: "{{ hosts_lookup.json.result | map(attribute='hostid') | list }}"
+            filter:
+              name: ["{{ reboot_valuemap_name }}"]
+          id: 1
+      register: valuemap_lookup
+      check_mode: false
+      failed_when: valuemap_lookup.json.error is defined
+
+    - name: Create the reboot-status value map on any host that's missing it
+      # Value maps are host-scoped objects in the Zabbix API (not global), so
+      # this needs the same per-host loop as the items above.
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: valuemap.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "{{ reboot_valuemap_name }}"
+            mappings: "{{ reboot_valuemap_mappings }}"
+          id: 1
+      loop: "{{ hosts_lookup.json.result }}"
+      when: item.hostid not in (valuemap_lookup.json.result | map(attribute='hostid') | list)
+      register: valuemap_create
+      failed_when: valuemap_create.json is defined and valuemap_create.json.error is defined
+      changed_when: valuemap_create.json.result is defined
+
+    - name: Look up reboot-status value maps again (definitive, post-create)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: valuemap.get
+          params:
+            output: ["valuemapid", "hostid"]
+            hostids: "{{ hosts_lookup.json.result | map(attribute='hostid') | list }}"
+            filter:
+              name: ["{{ reboot_valuemap_name }}"]
+          id: 1
+      register: valuemap_lookup_final
+      check_mode: false
+      failed_when: valuemap_lookup_final.json.error is defined
+
+    - name: Look up reboot-required items again (definitive, post-create)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "hostid", "valuemapid"]
+            hostids: "{{ hosts_lookup.json.result | map(attribute='hostid') | list }}"
+            filter:
+              key_: ["{{ reboot_item_key }}"]
+          id: 1
+      register: reboot_items_lookup_final
+      check_mode: false
+      failed_when: reboot_items_lookup_final.json.error is defined
+
+    - name: Attach the reboot-status value map to each host's reboot-required item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.update
+          params:
+            itemid: "{{ item.itemid }}"
+            valuemapid: >-
+              {{ valuemap_lookup_final.json.result
+                 | selectattr('hostid', 'equalto', item.hostid)
+                 | map(attribute='valuemapid') | list | first }}
+          id: 1
+      loop: "{{ reboot_items_lookup_final.json.result }}"
+      when: >-
+        item.valuemapid != (valuemap_lookup_final.json.result
+          | selectattr('hostid', 'equalto', item.hostid)
+          | map(attribute='valuemapid') | list | first)
+      register: reboot_item_valuemap_update
+      failed_when: >-
+        reboot_item_valuemap_update.json is defined
+        and reboot_item_valuemap_update.json.error is defined
+      changed_when: reboot_item_valuemap_update.json.result is defined
 
     - name: Look up existing pending-count items (the 11 covered hosts)
       ansible.builtin.uri:
