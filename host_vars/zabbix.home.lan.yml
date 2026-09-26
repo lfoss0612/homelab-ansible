@@ -26,6 +26,27 @@ zbx_mysql_password: !vault |
           3762323931383234350a373065346461633535343532393539653531643466633764316566643166
           34333265653337633037656534303338666565336365396164353939613462316437
 
+# --- Zabbix server's own MySQL DB user (DBUser=zabbix in zabbix_server.conf) --
+#
+# Distinct from zbx_mysql_password above -- that's the read-only monitoring
+# user, this is the credential zabbix-server itself (and the web frontend's
+# own separate /etc/zabbix/web/zabbix.conf.php) uses to reach its database.
+# Rotated live 2026-09-26 by playbooks/rotate-zabbix-mysql-password.yml,
+# which also fixed that play to actually sync the frontend config (found
+# broken -- see the playbook's header comment) and to vault the new value
+# here going forward, rather than leaving it unvaulted as before. Read via
+# hostvars['zabbix.home.lan'].zabbix_db_password by any future playbook that
+# needs it, same pattern as zabbix_api_token below. This value should be
+# rotated by that playbook, not by hand-editing this block.
+zabbix_db_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          38653935363764656331396238663936633835346465616664323032386364633964626362333235
+          3464303932656561363063323633613631623565666539610a613962346134316332303565323435
+          62333164313133626137313936363638623164316435646339336164303431343061633261396634
+          3961366536643566650a626634376639643238643466353935666464346263636465373665323565
+          33666664313966366264343261356464616662653932306632393566643437356337386630663139
+          3237333137383765663231393266363537376633386536323432
+
 # --- API token used by ~38 zabbix-*.yml / *-zabbix-*.yml playbooks ------------
 #
 # One token, shared across every playbook in this repo that calls the Zabbix
