@@ -23,6 +23,18 @@
 # Surfaced 2026-08-27: the kernel OOM-killer killed VM 105 (k8s-worker) on
 # pve.home.lan on 2026-08-24 20:00:07, and nothing alerted before, during, or
 # after. See scripts/oom-kill-monitor.sh for the full incident detail.
+#
+# zabbix_sender install added 2026-09-27 for the three RKE2 VMs added to
+# [oom_monitored] that day: unlike the original four hosts, none of them
+# carry a host-level Zabbix agent at all (they're monitored via the
+# in-cluster zabbix-agent DaemonSet instead), so zabbix_sender was missing
+# outright rather than merely out of date. It's a plain Ubuntu-archive
+# package, no Zabbix repo needed (verified live: `apt-cache policy
+# zabbix-sender` resolves it from the default `noble` archives on all
+# three). The dependency check right after stays as a safety net rather
+# than being removed now that install is unconditional — it catches a
+# future host where the package name differs or apt itself fails, instead
+# of the monitor silently never reporting.
 
 - name: Deploy OOM-kill monitoring
   hosts: oom_monitored
@@ -34,6 +46,13 @@
         daemon_reload: true
 
   tasks:
+    - name: Ensure zabbix_sender is installed
+      ansible.builtin.apt:
+        name: zabbix-sender
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
     # Same fix as smart-monitor.yml needed: `command -v` is a shell builtin,
     # so it has to run under `shell`, not `command` (which executes the binary
     # directly with no shell and can never find a builtin).
