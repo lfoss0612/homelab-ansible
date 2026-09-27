@@ -94,8 +94,17 @@
     - name: Install the monitoring script, timer and service
       ansible.builtin.include_tasks: tasks/oom-kill-monitor-setup.yml
 
+    # environment: here is load-bearing, not cosmetic: this runs the script
+    # directly rather than through `systemctl start`, so it does NOT pick up
+    # the systemd unit's own Environment= line (including oom_zabbix_server,
+    # added 2026-09-27 for k8s-master's proxy routing) - found the hard way
+    # when this task kept reporting the old default server address right
+    # after the unit file had already been correctly updated to the new one.
     - name: Run an initial OOM-kill check
       ansible.builtin.command: /usr/local/bin/oom-kill-monitor
+      environment:
+        ZABBIX_SERVER: "{{ oom_zabbix_server | default('10.0.5.9') }}"
+        ZABBIX_PORT: "10051"
       register: oom_check_result
       changed_when: false
       # Finding a past OOM-kill is a normal, expected report, not a monitor
