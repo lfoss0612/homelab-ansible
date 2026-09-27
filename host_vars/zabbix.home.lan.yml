@@ -62,27 +62,36 @@ zabbix_db_password: !vault |
 # after the value got echoed into a Claude session transcript by an unrelated
 # `grep -n` while looking up how to call the Zabbix API.
 #
-# Actually rotated 2026-09-27: this now belongs to the Zabbix user's token
-# renamed "ansible-admin" (was "smart-monitoring" -- misleadingly named,
-# since none of the SMART-monitoring playbooks ever used the API token at
-# all; SMART/OOM-kill data delivery goes over the zabbix_sender/trapper
+# Rotated 2026-09-27: belongs to the Zabbix user's token renamed
+# "ansible-admin" (was "smart-monitoring" -- misleadingly named, since none
+# of the SMART-monitoring playbooks ever used the API token at all;
+# SMART/OOM-kill data delivery goes over the zabbix_sender/trapper
 # protocol, which isn't gated by API-token RBAC. The ~38 playbooks that DO
 # use this token need a genuinely broad ~31-method spread across hosts,
 # discovery rules, items/prototypes, triggers/prototypes, macros, valuemaps,
-# templates and dashboards -- see the rotation discussion for the full
-# breakdown). Minted by hand in the Zabbix UI (token.create/token.get are
-# both refused to this token's own role, so that step can't be scripted --
-# see playbooks/rotate-zabbix-api-token.yml's header comment for why not
-# routing around that via a raw DB insert), verified live against
-# apiinfo.version before being vaulted here. The OLD token value is still
-# active in Zabbix until disabled/deleted by hand in the UI.
+# templates and dashboards). Minted by hand in the Zabbix UI (token.create/
+# token.get are both refused to this token's own role, so that step can't
+# be scripted -- see playbooks/rotate-zabbix-api-token.yml's header comment
+# for why not routing around that via a raw DB insert).
+#
+# ROTATED A SECOND TIME the same day: the first replacement value was
+# accidentally exposed in a Claude session transcript by a diagnostic uri
+# task missing no_log:true (a Python http.client exception put the raw
+# Authorization header, token included, into its error message). Confirmed
+# THIS value is clean before vaulting: no trailing newline (the earlier
+# exposure incidentally revealed the first replacement had one -- typing a
+# token into an interactive `ansible-vault encrypt_string` prompt and
+# pressing Enter before Ctrl+D captures that newline as part of the
+# string), no other stray whitespace, and it authenticates live via
+# host.get. The OLD (twice-since-superseded) token value is still active
+# in Zabbix until disabled/deleted by hand in the UI.
 zabbix_api_token: !vault |
           $ANSIBLE_VAULT;1.1;AES256
-          30393264386437383238633736373062383465316161353532316136633235663835613938303233
-          3765663635333131323761653035313235303661383562620a656232313430616235626563653333
-          38623566313834643962343530306339353737333836383033653565376437393037373735636637
-          6439396433623766350a633330663965343862616535663232636138353539663137663739643336
-          66376333383033353239626565336438373462666530613532643339333336653765396662303238
-          35663032646334326333376663313033363737626336663664353833303636303138306636396331
-          62636364363437653733306365386135326137383638303537613066383463383162316162663734
-          66613338653732383166
+          34643833366630306261343530316162363263616239373331386366653463646131373161623735
+          3533326564643238386263313630373662626466313233630a323932386565306639323237336638
+          61643366383830343931316637313064306133323765626632376338323032653135383861646239
+          3933313931646363320a383639623130383139356666376636333366346162356638376633346262
+          64346264393133376639373263363933393165316434643164626630306333363766666266623438
+          61653936653532633662623030643932306236663264396334356231313466613165626438323832
+          34343534383839303032373365333338353933343837643534643532643638396438663134313134
+          36386133366465303035
