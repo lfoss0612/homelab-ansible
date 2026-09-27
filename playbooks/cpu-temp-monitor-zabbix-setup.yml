@@ -1,0 +1,117 @@
+---
+# Create the server-side Zabbix objects that CPU temperature monitoring pushes
+# into: a low-level discovery rule per host, an item/trigger prototype stamped
+# out per discovered sensor, an aggregate item, and the aggregate triggers.
+#
+# Counterpart to playbooks/cpu-temp-monitor.yml, which installs the script
+# that feeds these. Both are needed: the script alone pushes values the server
+# accepts and silently discards, and this alone creates items nothing feeds.
+#
+# Usage:
+#   ansible-playbook playbooks/cpu-temp-monitor-zabbix-setup.yml --check --diff
+#   ansible-playbook playbooks/cpu-temp-monitor-zabbix-setup.yml
+#
+# Idempotent: every object is looked up before it is created, so re-running is
+# a no-op once the fleet is set up. Direct structural copy of
+# smart-monitor-zabbix-setup.yml's approach -- see that file and
+# docs/smart-monitoring.md for the fuller reasoning behind the LLD shape,
+# get-then-create pattern, and the disable-not-delete handling for prototypes
+# (itemprototype.delete etc. are refused to this repo's API token).
+
+- name: Configure Zabbix for CPU temperature monitoring
+  hosts: localhost
+  gather_facts: false
+  # This play only talks to an HTTP API from the control node. ansible.cfg
+  # sets become = True globally, which would sudo every one of these to root
+  # for no reason whatsoever.
+  become: false
+
+  vars:
+    zabbix_api: "http://10.0.5.9/zabbix/api_jsonrpc.php"
+    # Vaulted in host_vars/zabbix.home.lan.yml, read via hostvars (see
+    # that file for why this isn't a plain group_vars/vars_files include).
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+
+    # Single source of truth: the inventory group, not a list repeated here.
+    cputemp_target_hosts: "{{ groups['cputemp_monitored'] | default([]) }}"
+
+    # No live CPU temperature has ever been read on any of these four hosts —
+    # unlike SMART's 55/75 macros, which came from a real fleet measurement,
+    # this is a conservative starting estimate: comfortably under the
+    # ~95-100 °C throttle/critical point on both modern Intel and AMD
+    # desktop/server parts. Overridable per host in the Zabbix UI without
+    # touching this file. Revisit once real readings exist (see TODO.md).
+    cputemp_temp_macros:
+      - macro: '{$CPUTEMP.MAX}'
+        value: "85"
+
+    cputemp_aggregate_items:
+      - key: "cputemp.max"
+        name: "CPU: highest sensor temperature"
+        description: >-
+          Highest reading across every CPU sensor discovery found on this
+          host (package, per-core, Tctl/Tdie, etc., depending on chip driver).
+
+    # ---------------------------------------------------------------------
+    # {% raw %} is not decoration -- Zabbix LLD macros are written {#ID}, and
+    # `{#` is JINJA COMMENT SYNTAX, so Ansible would otherwise parse
+    # "cputemp.sensor[{#ID}..." as the start of a comment and die with
+    # "Missing end of comment tag". Same issue documented in
+    # smart-monitor-zabbix-setup.yml.
+    # ---------------------------------------------------------------------
+    cputemp_item_prototypes:
+      - key: "{% raw %}cputemp.sensor[{#ID},value]{% endraw %}"
+        name: "{% raw %}CPU {#SENSOR} ({#CHIP}): temperature{% endraw %}"
+        units: "°C"
+        description: "One reading from cpu-temp-monitor's sensors -j discovery."
+
+    # @HOST@ is substituted with the real FQDN per host by the included tasks.
+    cputemp_trigger_prototypes:
+      - description: "{% raw %}CPU {#SENSOR} on {HOST.NAME} is over temperature{% endraw %}"
+        expression: "{% raw %}last(/@HOST@/cputemp.sensor[{#ID},value])>{$CPUTEMP.MAX}{% endraw %}"
+        priority: 2        # Warning
+        comments: >-
+          Threshold comes from the host macro {$CPUTEMP.MAX} — a starting
+          estimate (85 °C), not a fleet-measured value. Tune per host once
+          real readings are seen.
+
+    cputemp_aggregate_triggers:
+      - description: "CPU temperature on {HOST.NAME}: over threshold"
+        expression: "last(/@HOST@/cputemp.max)>{$CPUTEMP.MAX}"
+        priority: 2        # Warning
+        comments: "Roll-up. The per-sensor trigger names which one."
+      # The most important trigger in this file, same reasoning as SMART's
+      # equivalent: everything above depends on the script continuing to run,
+      # and nothing above notices if it stops. The timer fires every 30
+      # minutes, so 2h is four missed runs.
+      - description: "CPU temperature on {HOST.NAME}: monitoring has stopped reporting"
+        expression: "nodata(/@HOST@/cputemp.max,2h)=1"
+        priority: 3        # Average
+        manual_close: 1
+        comments: >-
+          No CPU temperature value in 2 hours. Check cpu-temp-monitor.timer
+          on the host and `journalctl -u cpu-temp-monitor.service`.
+
+  tasks:
+    - name: Assert the inventory group exists
+      ansible.builtin.assert:
+        that: cputemp_target_hosts | length > 0
+        fail_msg: >-
+          [cputemp_monitored] is empty or missing from the inventory. This
+          play derives its targets from that group so the two CPU temperature
+          playbooks cannot drift apart.
+
+    - name: Configure each host
+      ansible.builtin.include_tasks: tasks/cputemp-zabbix-host.yml
+      loop: "{{ cputemp_target_hosts }}"
+      loop_control:
+        loop_var: cputemp_host
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          Configured {{ cputemp_target_hosts | length }} host(s):
+          {{ cputemp_target_hosts | join(', ') }}.
+          Per-sensor items appear once the host's next cpu-temp-monitor run
+          pushes cputemp.discovery -- within 30 minutes, or immediately via
+          `systemctl start cpu-temp-monitor.service`.

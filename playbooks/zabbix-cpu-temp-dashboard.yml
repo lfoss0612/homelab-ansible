@@ -1,0 +1,241 @@
+---
+# Build the "CPU Temperature" Zabbix dashboard.
+#
+# Answers one question at a glance: is any host's CPU running hot, and which
+# sensor. Direct structural copy of zabbix-smart-dashboard.yml's approach --
+# see that file for the fuller reasoning behind pattern-matched widgets and
+# the "renaming a prototype silently empties a panel" coupling.
+#
+# Depends on playbooks/cpu-temp-monitor-zabbix-setup.yml having created the
+# discovery rule, and on each host having pushed at least one
+# cputemp.discovery payload. Until that happens the honeycombs render empty --
+# the items they match do not exist yet. That is not a dashboard fault; run
+# cpu-temp-monitor.service.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-cpu-temp-dashboard.yml --check --diff
+#   ansible-playbook playbooks/zabbix-cpu-temp-dashboard.yml
+#
+# Idempotent: creates the dashboard, or replaces its pages in place if it
+# already exists, keeping the same dashboardid and URL.
+
+- name: Build the CPU Temperature dashboard
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_api: "http://10.0.5.9/zabbix/api_jsonrpc.php"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+
+    dashboard_name: "CPU Temperature"
+
+    # Scoped to a broad group ON PURPOSE, rather than to the four cputemp
+    # hosts -- no host group matches those four exactly. Scoping wide and
+    # letting the ITEM PATTERN do the real filtering is both simpler and
+    # self-maintaining, same reasoning as zabbix-smart-dashboard.yml.
+    fleet_group_name: "Linux servers"
+
+    # Must match the item names in cpu-temp-monitor-zabbix-setup.yml.
+    pattern_temperature: "CPU * temperature"
+    name_rollup: "CPU: highest sensor temperature"
+
+    # Thresholds colour a cell when value >= threshold. 85 matches the default
+    # {$CPUTEMP.MAX} macro -- see cpu-temp-monitor-zabbix-setup.yml for why
+    # that number is a starting estimate, not a measured one.
+    thresholds_temperature:
+      - threshold: "0"
+        color: "4CAF50"   # green
+      - threshold: "70"
+        color: "FF9800"   # amber
+      - threshold: "85"
+        color: "F44336"   # red
+
+    # Same regsub trick as zabbix-smart-dashboard.yml's smart_drive_cell_label:
+    # {HOST.NAME} strips ".home.lan" down to the short name, {ITEM.NAME}
+    # pulls the sensor id back out of "CPU Package id 0 (coretemp-isa-0000):
+    # temperature" set in cpu-temp-monitor-zabbix-setup.yml.
+    cputemp_cell_label: >-
+      {% raw %}{{HOST.NAME}.regsub("^([^.]+).*", "\1")}/{{ITEM.NAME}.regsub("^CPU (.+) \(.+\): temperature$", "\1")}{% endraw %}
+
+  tasks:
+    - name: Resolve the host group
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: hostgroup.get
+          params:
+            output: ["groupid", "name"]
+            filter:
+              name: ["{{ fleet_group_name }}"]
+          id: 1
+      register: cputemp_group
+      check_mode: false
+      failed_when: >-
+        cputemp_group.json.error is defined
+        or (cputemp_group.json.result | default([]) | length) != 1
+
+    - name: Set the group id
+      ansible.builtin.set_fact:
+        cputemp_groupid: "{{ cputemp_group.json.result[0].groupid }}"
+
+    - name: Look for an existing dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.get
+          params:
+            output: ["dashboardid", "name"]
+            filter:
+              name: ["{{ dashboard_name }}"]
+          id: 1
+      register: cputemp_dash_lookup
+      check_mode: false
+      failed_when: cputemp_dash_lookup.json.error is defined
+
+    - name: Assemble the page
+      ansible.builtin.set_fact:
+        cputemp_dashboard_pages:
+          - name: "CPU temperature"
+            widgets:
+              - type: problems
+                name: "Active CPU temperature problems"
+                x: 0
+                y: 0
+                width: 72
+                height: 4
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ cputemp_groupid }}"}
+                  - {type: 1, name: "problem", value: "CPU temperature"}
+                  - {type: 0, name: "show_lines", value: 15}
+                  - {type: 1, name: "reference", value: "CPUPR"}
+
+              # Per-host roll-up: one cell per physical host.
+              - type: honeycomb
+                name: "Host roll-up (highest sensor per host)"
+                x: 0
+                y: 4
+                width: 24
+                height: 7
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ cputemp_groupid }}"}
+                  - {type: 1, name: "items.0", value: "{{ name_rollup }}"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "FF9800"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "70"}
+                  - {type: 1, name: "thresholds.2.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.2.threshold", value: "85"}
+                  - {type: 1, name: "reference", value: "CPURU"}
+
+              # One cell per SENSOR across every host.
+              - type: honeycomb
+                name: "Every sensor — temperature (amber 70C+, red 85C+; starting estimate, see docs)"
+                x: 24
+                y: 4
+                width: 48
+                height: 7
+                fields:
+                  - {type: 2, name: "groupids.0", value: "{{ cputemp_groupid }}"}
+                  - {type: 1, name: "items.0", value: "{{ pattern_temperature }}"}
+                  - {type: 1, name: "primary_label", value: "{{ cputemp_cell_label }}"}
+                  - {type: 1, name: "thresholds.0.color", value: "4CAF50"}
+                  - {type: 1, name: "thresholds.0.threshold", value: "0"}
+                  - {type: 1, name: "thresholds.1.color", value: "FF9800"}
+                  - {type: 1, name: "thresholds.1.threshold", value: "70"}
+                  - {type: 1, name: "thresholds.2.color", value: "F44336"}
+                  - {type: 1, name: "thresholds.2.threshold", value: "85"}
+                  - {type: 1, name: "reference", value: "CPUHC"}
+
+              # Trend matters more than any single reading: a CPU warming
+              # steadily over weeks (dust, dying fan, thermal paste) is
+              # exactly what a threshold snapshot alone will not catch.
+              - type: svggraph
+                name: "Temperature history — all sensors"
+                x: 0
+                y: 11
+                width: 72
+                height: 7
+                fields:
+                  - {type: 1, name: "ds.0.hosts.0", value: "*"}
+                  - {type: 1, name: "ds.0.items.0", value: "{{ pattern_temperature }}"}
+                  - {type: 0, name: "righty", value: 0}
+                  - {type: 1, name: "reference", value: "CPUGR"}
+
+    - name: Create the dashboard
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.create
+          params:
+            name: "{{ dashboard_name }}"
+            display_period: 30
+            auto_start: 1
+            # dashboard.create defaults to private:1 with zero shares -- see
+            # TODO.md's "invisible to the user" writeup. Explicit here so a
+            # from-scratch run doesn't regress it.
+            private: 0
+            pages: "{{ cputemp_dashboard_pages }}"
+          id: 1
+      register: cputemp_dash_create
+      when: (cputemp_dash_lookup.json.result | default([]) | length) == 0
+      changed_when: cputemp_dash_create.json.result is defined
+      failed_when: cputemp_dash_create.json.error is defined
+
+    - name: Update the existing dashboard in place
+      ansible.builtin.uri:
+        url: "{{ zabbix_api }}"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: dashboard.update
+          params:
+            dashboardid: "{{ cputemp_dash_lookup.json.result[0].dashboardid }}"
+            pages: "{{ cputemp_dashboard_pages }}"
+          id: 1
+      register: cputemp_dash_update
+      when: (cputemp_dash_lookup.json.result | default([]) | length) > 0
+      changed_when: cputemp_dash_update.json.result is defined
+      failed_when: cputemp_dash_update.json.error is defined
+
+    - name: Settle the dashboard id (pre-existing)
+      ansible.builtin.set_fact:
+        cputemp_dashboardid: "{{ cputemp_dash_lookup.json.result[0].dashboardid }}"
+      when: (cputemp_dash_lookup.json.result | default([]) | length) > 0
+
+    - name: Settle the dashboard id (just created)
+      ansible.builtin.set_fact:
+        cputemp_dashboardid: "{{ cputemp_dash_create.json.result.dashboardids[0] }}"
+      when:
+        - (cputemp_dash_lookup.json.result | default([]) | length) == 0
+        - cputemp_dash_create.json is defined
+
+    - name: Report the dashboard URL
+      ansible.builtin.debug:
+        msg: >-
+          {{ dashboard_name }} →
+          http://10.0.5.9/zabbix/zabbix.php?action=dashboard.view&dashboardid={{ cputemp_dashboardid }}
+      when: cputemp_dashboardid is defined
+
+    - name: Note that the dashboard would be created
+      ansible.builtin.debug:
+        msg: "{{ dashboard_name }} does not exist yet and would be created by a real run."
+      when: cputemp_dashboardid is not defined

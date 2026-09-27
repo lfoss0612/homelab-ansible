@@ -1,0 +1,370 @@
+---
+# Create the CPU temperature discovery rule, prototypes, aggregate item and
+# triggers for ONE Zabbix host. Included per host by
+# playbooks/cpu-temp-monitor-zabbix-setup.yml, which owns the variable
+# definitions used here. Structural copy of tasks/smart-zabbix-host.yml, minus
+# the value-map handling that file needs for its status codes -- every item
+# here is a plain numeric temperature, so no value map applies.
+#
+# Every step is get-then-create rather than blind create: the API errors on a
+# duplicate key, and a playbook that only works the first time is a playbook
+# nobody dares re-run.
+#
+# `cputemp_host` is the FQDN, and must equal both the Zabbix host name and the
+# Hostname= the agent config carries -- zabbix_sender addresses values by that
+# name and the server discards anything it cannot match.
+
+- name: "{{ cputemp_host }} — resolve the Zabbix host"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: host.get
+      params:
+        output: ["hostid", "host"]
+        filter:
+          host: ["{{ cputemp_host }}"]
+      id: 1
+  register: cputemp_host_lookup
+  check_mode: false
+  failed_when: >-
+    cputemp_host_lookup.json.error is defined
+    or (cputemp_host_lookup.json.result | default([]) | length) != 1
+
+- name: "{{ cputemp_host }} — set the host id"
+  ansible.builtin.set_fact:
+    cputemp_hostid: "{{ cputemp_host_lookup.json.result[0].hostid }}"
+
+# --- temperature threshold -------------------------------------------------
+# A single context-free macro, unlike SMART's per-class ({$SMART.TEMP.MAX:
+# "ata"/"nvme"}) split: every discovered sensor here already IS a CPU reading
+# (the script filters to known CPU chip drivers), so one scale applies to all
+# of them. Overridable per host in the Zabbix UI without touching this file.
+
+- name: "{{ cputemp_host }} — read existing CPU temperature macro"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: usermacro.get
+      params:
+        output: ["hostmacroid", "macro", "value"]
+        hostids: ["{{ cputemp_hostid }}"]
+      id: 1
+  register: cputemp_macro_lookup
+  check_mode: false
+  failed_when: cputemp_macro_lookup.json.error is defined
+
+- name: "{{ cputemp_host }} — create missing temperature macro"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: usermacro.create
+      params:
+        hostid: "{{ cputemp_hostid }}"
+        macro: "{{ item.macro }}"
+        value: "{{ item.value }}"
+      id: 1
+  loop: "{{ cputemp_temp_macros }}"
+  loop_control:
+    label: "{{ item.macro }}={{ item.value }}"
+  when: item.macro not in (cputemp_macro_lookup.json.result | default([]) | map(attribute='macro') | list)
+  register: cputemp_macro_create
+  changed_when: cputemp_macro_create.json.result is defined
+  failed_when: cputemp_macro_create.json.error is defined
+
+# Reconciled rather than only created, same reasoning as smart-zabbix-host.yml:
+# a value already present on the host would otherwise never pick up a change
+# made here. usermacro.delete is refused to this token (see docs), .update is
+# granted.
+- name: "{{ cputemp_host }} — correct temperature macro that drifted"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: usermacro.update
+      params:
+        hostmacroid: "{{ cputemp_existing_macros | selectattr('macro', 'eq', item.macro) | map(attribute='hostmacroid') | first }}"
+        value: "{{ item.value }}"
+      id: 1
+  vars:
+    cputemp_existing_macros: "{{ cputemp_macro_lookup.json.result | default([]) }}"
+  loop: "{{ cputemp_temp_macros }}"
+  loop_control:
+    label: "{{ item.macro }} -> {{ item.value }}"
+  when:
+    - cputemp_existing_macros | selectattr('macro', 'eq', item.macro) | list | length == 1
+    - (cputemp_existing_macros | selectattr('macro', 'eq', item.macro) | map(attribute='value') | first) != item.value
+  register: cputemp_macro_update
+  changed_when: cputemp_macro_update.json.result is defined
+  failed_when: cputemp_macro_update.json.error is defined
+
+# --- aggregate trapper item --------------------------------------------------
+
+- name: "{{ cputemp_host }} — read existing CPU temperature items"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: item.get
+      params:
+        output: ["itemid", "key_"]
+        hostids: ["{{ cputemp_hostid }}"]
+        search:
+          key_: "cputemp."
+      id: 1
+  register: cputemp_item_lookup
+  check_mode: false
+  failed_when: cputemp_item_lookup.json.error is defined
+
+- name: "{{ cputemp_host }} — create the aggregate item"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: item.create
+      params:
+        hostid: "{{ cputemp_hostid }}"
+        name: "{{ item.name }}"
+        key_: "{{ item.key }}"
+        type: 2               # Zabbix trapper
+        value_type: 3         # numeric unsigned
+        units: "°C"
+        description: "{{ item.description }}"
+      id: 1
+  loop: "{{ cputemp_aggregate_items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.key not in (cputemp_item_lookup.json.result | default([]) | map(attribute='key_') | list)
+  register: cputemp_agg_create
+  changed_when: cputemp_agg_create.json.result is defined
+  failed_when: cputemp_agg_create.json.error is defined
+
+# --- discovery rule ---------------------------------------------------------
+
+- name: "{{ cputemp_host }} — look for the discovery rule"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: discoveryrule.get
+      params:
+        output: ["itemid", "key_"]
+        hostids: ["{{ cputemp_hostid }}"]
+        filter:
+          key_: ["cputemp.discovery"]
+      id: 1
+  register: cputemp_lld_lookup
+  check_mode: false
+  failed_when: cputemp_lld_lookup.json.error is defined
+
+- name: "{{ cputemp_host }} — create the discovery rule"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: discoveryrule.create
+      params:
+        hostid: "{{ cputemp_hostid }}"
+        name: "CPU temperature sensor discovery"
+        key_: "cputemp.discovery"
+        type: 2               # Zabbix trapper -- the script pushes the payload
+        # Same reasoning as smart.discovery: disable rather than delete a
+        # sensor discovery stops returning, keeping history readable.
+        lifetime: "30d"
+        description: >-
+          Fed by /usr/local/bin/cpu-temp-monitor (homelab-ansible
+          scripts/cpu-temp-monitor.sh) every 30 minutes via zabbix_sender.
+          See docs/cpu-temp-monitoring.md.
+      id: 1
+  register: cputemp_lld_create
+  when: (cputemp_lld_lookup.json.result | default([]) | length) == 0
+  changed_when: cputemp_lld_create.json.result is defined
+  failed_when: cputemp_lld_create.json.error is defined
+
+- name: "{{ cputemp_host }} — settle the discovery rule id (pre-existing)"
+  ansible.builtin.set_fact:
+    cputemp_ruleid: "{{ cputemp_lld_lookup.json.result[0].itemid }}"
+  when: (cputemp_lld_lookup.json.result | default([]) | length) > 0
+
+- name: "{{ cputemp_host }} — settle the discovery rule id (just created)"
+  ansible.builtin.set_fact:
+    cputemp_ruleid: "{{ cputemp_lld_create.json.result.itemids[0] }}"
+  when: (cputemp_lld_lookup.json.result | default([]) | length) == 0
+
+- name: "{{ cputemp_host }} — assert we have a discovery rule id"
+  ansible.builtin.assert:
+    that: cputemp_ruleid | length > 0
+    fail_msg: "Could not resolve or create the cputemp.discovery rule on {{ cputemp_host }}."
+
+# --- item prototype ----------------------------------------------------------
+
+- name: "{{ cputemp_host }} — read existing item prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.get
+      params:
+        output: ["itemid", "key_", "name", "status"]
+        discoveryids: ["{{ cputemp_ruleid }}"]
+      id: 1
+  register: cputemp_proto_lookup
+  check_mode: false
+  failed_when: cputemp_proto_lookup.json.error is defined
+
+- name: "{{ cputemp_host }} — create item prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: itemprototype.create
+      params:
+        hostid: "{{ cputemp_hostid }}"
+        ruleid: "{{ cputemp_ruleid }}"
+        name: "{{ item.name }}"
+        key_: "{{ item.key }}"
+        type: 2
+        value_type: 3
+        units: "{{ item.units | default('') }}"
+        description: "{{ item.description }}"
+      id: 1
+  loop: "{{ cputemp_item_prototypes }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.key not in (cputemp_proto_lookup.json.result | default([]) | map(attribute='key_') | list)
+  register: cputemp_proto_create
+  changed_when: cputemp_proto_create.json.result is defined
+  failed_when: cputemp_proto_create.json.error is defined
+
+# --- trigger prototype -------------------------------------------------------
+
+- name: "{{ cputemp_host }} — read existing trigger prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: triggerprototype.get
+      params:
+        output: ["triggerid", "description", "expression"]
+        discoveryids: ["{{ cputemp_ruleid }}"]
+        expandExpression: true
+      id: 1
+  register: cputemp_trigproto_lookup
+  check_mode: false
+  failed_when: cputemp_trigproto_lookup.json.error is defined
+
+- name: "{{ cputemp_host }} — create trigger prototypes"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: triggerprototype.create
+      params:
+        description: "{{ item.description }}"
+        expression: "{{ item.expression | replace('@HOST@', cputemp_host) }}"
+        priority: "{{ item.priority }}"
+        manual_close: "{{ item.manual_close | default(0) }}"
+        comments: "{{ item.comments | default('') }}"
+      id: 1
+  loop: "{{ cputemp_trigger_prototypes }}"
+  loop_control:
+    label: "{{ item.description }}"
+  when: item.description not in (cputemp_trigproto_lookup.json.result | default([]) | map(attribute='description') | list)
+  register: cputemp_trigproto_create
+  changed_when: cputemp_trigproto_create.json.result is defined
+  failed_when: cputemp_trigproto_create.json.error is defined
+
+# --- aggregate triggers -------------------------------------------------------
+
+- name: "{{ cputemp_host }} — read existing triggers"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: trigger.get
+      params:
+        output: ["triggerid", "description"]
+        hostids: ["{{ cputemp_hostid }}"]
+      id: 1
+  register: cputemp_trigger_lookup
+  check_mode: false
+  failed_when: cputemp_trigger_lookup.json.error is defined
+
+- name: "{{ cputemp_host }} — create aggregate triggers"
+  ansible.builtin.uri:
+    url: "{{ zabbix_api }}"
+    method: POST
+    body_format: json
+    headers:
+      Authorization: "Bearer {{ zabbix_api_token }}"
+    body:
+      jsonrpc: "2.0"
+      method: trigger.create
+      params:
+        description: "{{ item.description }}"
+        expression: "{{ item.expression | replace('@HOST@', cputemp_host) }}"
+        priority: "{{ item.priority }}"
+        manual_close: "{{ item.manual_close | default(0) }}"
+        comments: "{{ item.comments | default('') }}"
+      id: 1
+  loop: "{{ cputemp_aggregate_triggers }}"
+  loop_control:
+    label: "{{ item.description }}"
+  when: item.description not in (cputemp_trigger_lookup.json.result | default([]) | map(attribute='description') | list)
+  register: cputemp_trigger_create
+  changed_when: cputemp_trigger_create.json.result is defined
+  failed_when: cputemp_trigger_create.json.error is defined

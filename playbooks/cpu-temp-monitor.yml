@@ -1,0 +1,102 @@
+---
+# Deploy CPU temperature monitoring to the fleet's physical hosts.
+#
+# Usage:
+#   ansible-playbook playbooks/cpu-temp-monitor.yml --check --diff
+#   ansible-playbook playbooks/cpu-temp-monitor.yml
+#   ansible-playbook playbooks/cpu-temp-monitor.yml --limit pve-router.home.lan
+#
+# The script runs every 30 minutes and reports CPU sensor temperatures to
+# Zabbix via zabbix_sender. The server-side objects it feeds are created
+# separately by playbooks/cpu-temp-monitor-zabbix-setup.yml -- run that one
+# too, or every value this pushes is accepted by the server and silently
+# discarded. See docs/cpu-temp-monitoring.md.
+#
+# Targets [cputemp_monitored] (pbs, pve, pve-ai, pve-router) -- see
+# inventory.ini for why this is its own group rather than a reuse of
+# [smart_monitored]/[oom_monitored] despite identical membership today.
+#
+# pve-router carries no confirm_pve_router gate here, matching this play's
+# nearest precedent, playbooks/smart-monitor.yml -- that gate is reserved for
+# hypervisor-config-scope plays (deploy-openclaw.yml, proxmox-config.yml, the
+# OPNsense plays), not for installing a monitoring agent. Recommended
+# sequencing precisely because sensors-detect loads kernel modules, a step up
+# from SMART's read-only smartctl calls: run the other three hosts first with
+# `--limit`, confirm the results, then run pve-router on its own reviewing the
+# sensors-detect output before trusting it.
+
+- name: Deploy CPU temperature monitoring
+  hosts: cputemp_monitored
+  become: true
+
+  handlers:
+    - name: systemd_daemon_reload
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  tasks:
+    - name: Install lm-sensors and jq
+      ansible.builtin.apt:
+        name:
+          - lm-sensors
+          - jq
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # --auto takes the DEFAULT answer shown at each prompt rather than forcing
+    # yes to everything: safe probes default to yes, but the riskier legacy
+    # ISA/SMBus force-probes default to no and stay no under --auto. Wrapped in
+    # `timeout` with stdin from /dev/null as a hard backstop -- if a future
+    # lm-sensors version ever adds a prompt --auto doesn't cover, this fails
+    # fast instead of hanging a live run against pve-router indefinitely.
+    #
+    # Always run, never skipped by idempotency logic: detection is what finds
+    # newly-added hardware, and re-running it is cheap. What matters for
+    # "did this work" is verified separately below (an actual sensors reading),
+    # not sensors-detect's own exit chatter.
+    - name: Run sensors-detect to load the right kernel modules
+      ansible.builtin.shell: timeout 120 sensors-detect --auto < /dev/null
+      register: cpu_sensors_detect
+      changed_when: false
+      check_mode: false
+
+    - name: Show what sensors-detect found
+      ansible.builtin.debug:
+        msg: "{{ cpu_sensors_detect.stdout_lines | default([]) }}"
+
+    - name: Check for the tools the monitor depends on
+      ansible.builtin.shell: "command -v {{ item }}"
+      loop:
+        - sensors
+        - jq
+        - zabbix_sender
+      register: cputemp_tooling
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Fail loudly when a dependency is missing
+      ansible.builtin.assert:
+        that: cputemp_tooling.results | selectattr('rc', 'ne', 0) | list | length == 0
+        fail_msg: >-
+          Missing on {{ inventory_hostname }}:
+          {{ cputemp_tooling.results | selectattr('rc', 'ne', 0)
+             | map(attribute='item') | join(', ') }}.
+          A silently skipped host here is exactly how the fleet-update
+          notifier and (initially) the SMART monitor went dark unnoticed.
+
+    - name: Install the monitoring script, timer and service
+      ansible.builtin.include_tasks: tasks/cpu-temp-monitor-setup.yml
+
+    - name: Run an initial CPU temperature check
+      ansible.builtin.command: /usr/local/bin/cpu-temp-monitor
+      register: cputemp_check_result
+      changed_when: false
+      # The script exits 0 for a normal (even hot) reading and non-zero only
+      # when it could not report at all -- see cpu-temp-monitor.sh.
+      failed_when: cputemp_check_result.rc != 0
+
+    - name: Show the initial results
+      ansible.builtin.debug:
+        msg: "{{ cputemp_check_result.stdout_lines | default([]) }}"

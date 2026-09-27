@@ -1,0 +1,69 @@
+---
+# Deploy CPU temperature monitoring to send readings to Zabbix
+# Usage: include_tasks tasks/cpu-temp-monitor-setup.yml
+# or in a playbook: - include_tasks: tasks/cpu-temp-monitor-setup.yml
+
+- name: Deploy CPU temperature monitoring script
+  ansible.builtin.copy:
+    src: ../scripts/cpu-temp-monitor.sh
+    dest: /usr/local/bin/cpu-temp-monitor
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create CPU temperature monitoring timer
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=Run CPU temperature monitoring check
+      Documentation=man:systemd.timer(5)
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=30min
+      AccuracySec=1s
+
+      [Install]
+      WantedBy=timers.target
+    dest: /etc/systemd/system/cpu-temp-monitor.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: systemd_daemon_reload
+
+- name: Create CPU temperature monitoring service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=CPU temperature monitoring and Zabbix reporting
+      Documentation=file:///usr/local/bin/cpu-temp-monitor
+
+      [Service]
+      Type=oneshot
+      Environment="ZABBIX_SERVER=10.0.5.9"
+      Environment="ZABBIX_PORT=10051"
+      ExecStart=/usr/local/bin/cpu-temp-monitor
+      StandardOutput=journal
+      StandardError=journal
+    dest: /etc/systemd/system/cpu-temp-monitor.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: systemd_daemon_reload
+
+# Skipped under --check on purpose. The unit file above has not actually been
+# written in check mode, so systemd cannot find the timer and the task fails
+# with "Could not find the requested service cpu-temp-monitor.timer" on any
+# host that does not already have it -- i.e. every NEW host, which is
+# precisely when a clean dry run matters most. Same reasoning as
+# tasks/smart-monitor-setup.yml.
+- name: Enable and start CPU temperature monitoring timer
+  ansible.builtin.systemd_service:
+    name: cpu-temp-monitor.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Flush handlers to ensure units are reloaded
+  ansible.builtin.meta: flush_handlers
