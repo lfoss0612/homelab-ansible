@@ -1,14 +1,20 @@
 ---
 # Fix k8s-worker-2's `hostname -f` returning the short name instead of the FQDN.
 #
-# WHY: /etc/hosts on this host lists the short name before the FQDN
-# (`10.0.5.4 k8s-worker-2 k8s-worker-2.home.lan`) - backwards from the
-# convention `k8s-master`/`k8s-worker` both use
-# (`<ip> <fqdn> <short-name>`). glibc's canonical-name resolution
-# (getaddrinfo with AI_CANONNAME, which `hostname -f`/`--fqdn` uses) returns
-# whichever name appears FIRST on the matching /etc/hosts line as canonical,
-# regardless of which one is actually the FQDN - so this host's `hostname -f`
-# returns "k8s-worker-2", while the other two correctly return their FQDN.
+# WHY, and it's worse than just ordering: /etc/hosts on this host has
+# `10.0.5.4 k8s-worker-2 k8s-worker-2.home.lan` - and 10.0.5.4 is not this
+# host at all, it's pve.home.lan's actual IP (confirmed against inventory.ini
+# ansible_host). This host's real address is 10.2.5.4 (matches its own
+# ansible_host, and the convention k8s-master/k8s-worker both use - each
+# lists its OWN k8s-network IP, FQDN first, short name second). So this
+# is a stale/wrong hostname-to-IP mapping, not merely a canonical-name
+# ordering quirk - the wrong-IP line has to be removed outright, not just
+# reordered, or two conflicting lines for "k8s-worker-2" would coexist.
+# Separately, glibc's canonical-name resolution (getaddrinfo with
+# AI_CANONNAME, which `hostname -f`/`--fqdn` uses) returns whichever name
+# appears FIRST on the matching line as canonical regardless of which one is
+# actually the FQDN - so even setting the IP right, name order still matters
+# and must follow the same FQDN-first convention as the other two nodes.
 #
 # Surfaced 2026-09-27 setting up OOM-kill monitoring
 # (playbooks/oom-kill-monitor.yml): none of the three RKE2 nodes carry a
@@ -60,13 +66,24 @@
           fix-k8s-master-hostname.yml for that class of fix). Refusing.
         success_msg: "OS hostname confirmed correct ({{ target_fqdn }})."
 
-    - name: Reorder /etc/hosts so the FQDN is canonical (comes first)
+    - name: Remove the stale line mapping this host's names to a different host's IP
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        # Matches by NAME, not IP - the whole point is this line's IP is
+        # wrong, so anchoring on ansible_host would never find it (that's
+        # exactly what happened on the first --check run of this playbook:
+        # the wrong-IP line was left untouched and a second, correct line
+        # got appended instead, leaving both present).
+        regexp: '^\S+\s+{{ target_short }}\s+{{ target_fqdn }}\s*$'
+        state: absent
+        backup: true
+
+    - name: Ensure the correct line exists, FQDN first
       ansible.builtin.lineinfile:
         path: /etc/hosts
         regexp: '^{{ ansible_host }}\s'
         line: "{{ ansible_host }} {{ target_fqdn }} {{ target_short }}"
         state: present
-        backup: true
 
     - name: Confirm hostname -f now returns the FQDN
       ansible.builtin.command: hostname -f
@@ -85,3 +102,21 @@
           NSS ordering) may be overriding /etc/hosts here.
         success_msg: "hostname -f now correctly returns {{ target_fqdn }}."
       when: not ansible_check_mode
+
+    - name: Read back every /etc/hosts line mentioning this host's names
+      ansible.builtin.command: "grep -E '\\b({{ target_fqdn }}|{{ target_short }})\\b' /etc/hosts"
+      register: all_matching_lines
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm exactly one line remains, with the correct IP
+      ansible.builtin.assert:
+        that:
+          - all_matching_lines.stdout_lines | length == 1
+          - all_matching_lines.stdout_lines[0].startswith(ansible_host)
+        fail_msg: >-
+          Expected exactly one /etc/hosts line for this host, starting with
+          {{ ansible_host }}. Found: {{ all_matching_lines.stdout_lines }}.
+          A leftover stale entry (or a second one this playbook doesn't
+          know about) may still be present.
+        success_msg: "Exactly one, correct /etc/hosts entry remains: {{ all_matching_lines.stdout_lines[0] }}"
