@@ -17,12 +17,30 @@
 # This is NOT specific to k8s-master - any RKE2 node on a ballooned VM could
 # hit the same race on any future boot. The fix: before rke2-server/
 # rke2-agent starts, wait for /proc/meminfo's MemTotal to stop changing
-# across a few consecutive reads. This doesn't assume WHY the value might
-# still be settling (balloon inflation is the leading theory but wasn't
-# proven at the kernel level - the fix targets the observed symptom, not a
-# specific mechanism), and it fails safe: on timeout it logs a warning and
-# proceeds anyway rather than blocking boot indefinitely, which is no worse
-# than today's behavior.
+# across several consecutive reads. This doesn't assume WHY the value might
+# still be settling (the fix targets the observed symptom, not a specific
+# mechanism), and it fails safe: on timeout it logs a warning and proceeds
+# anyway rather than blocking boot indefinitely, which is no worse than
+# today's behavior.
+#
+# Tested live on k8s-worker, 2026-09-27 (v1, STABLE_READS_NEEDED=3 /
+# CHECK_INTERVAL=2 / TIMEOUT=60): the fix ran and genuinely caught an early
+# boot-time change (10s in), but a fuller ~130s sample afterward showed the
+# real behavior is noisier than "ramps once, then freezes" - MemTotal
+# overshot to a peak (~24.5GiB, vs. a 24576MiB ceiling) around 60-90s post-
+# boot, then settled back down into a ~200MB band close to where the v1
+# script's 6s stability window had already caught it. Consistent with `pve`
+# itself being memory-tight overall (a separate, already-known condition -
+# see host_vars/pve.home.lan.yml's ballooning notes): a fresh boot briefly
+# gets its full configured memory before the host's balloon manager reclaims
+# it back down to something sustainable alongside every other VM on that
+# host. v1's captured value landed inside that ~1%-of-total noise band by
+# luck of timing, not because 6s was actually long enough - v2 below widens
+# the stability window to 15s specifically so it isn't relying on luck.
+# Some residual noise (~1% of total memory) is expected to remain
+# permanently, since ballooning here is genuinely ongoing, not a one-time
+# settle - this narrows kubelet's one-time snapshot into that noise band
+# rather than eliminating the gap altogether.
 #
 # Usage:
 #   ansible-playbook playbooks/rke2-wait-for-memory-boot-fix.yml --check --diff
@@ -56,9 +74,15 @@
           # rather than blocking boot, matching today's (buggy) behavior as
           # the worst case rather than making boot less reliable.
           set -u
-          STABLE_READS_NEEDED=3
-          CHECK_INTERVAL=2
-          TIMEOUT=60
+          # v2, 2026-09-27: widened from 3 reads/2s (6s stable window, 60s
+          # timeout) after live testing on k8s-worker showed the real
+          # settle-and-overshoot cycle runs on the order of 60-130s. 5
+          # reads/3s = 15s of genuine no-change required, with enough
+          # timeout headroom to ride out an overshoot-and-settle cycle
+          # rather than getting lucky on a mid-cycle plateau.
+          STABLE_READS_NEEDED=5
+          CHECK_INTERVAL=3
+          TIMEOUT=180
           elapsed=0
           prev=""
           stable=0
