@@ -1,0 +1,91 @@
+---
+# Remove the stale zfs-import@pbs_storage.service unit on pbs.
+#
+# `pbs_storage` was an earlier pool name, since replaced by `backup10tb` (the
+# TerraMaster mirror backing /mnt/datastore) - confirmed by the user
+# 2026-09-27 that `pbs_storage` will never exist again, so this isn't a
+# "disable for now" - the enablement itself is being removed.
+#
+# Background: pools imported with `cachefile=none` (as backup10tb also is -
+# see zfs-import@backup10tb.service) aren't picked up by the generic
+# zfs-import-cache/zfs-import-scan units, so each needs its own
+# `systemctl enable zfs-import@<poolname>.service` instance. pbs_storage's
+# instance was never disabled when the pool it pointed at went away, so it's
+# tried and failed ("cannot import 'pbs_storage': no such pool available")
+# on every boot since at least 2026-09-24. Harmless - backup10tb imports via
+# its own separate, working instance - but it clutters `systemctl --failed`
+# forever otherwise.
+#
+# There is no separate on-disk unit file for this instance to delete (it's
+# the generic /usr/lib/systemd/system/zfs-import@.service template, enabled
+# only via a boot-target symlink) - `disable` + `reset-failed` IS complete
+# removal here, not a partial measure.
+#
+# Guarded rather than unconditional: refuses to touch anything if a pool
+# actually named pbs_storage exists (rc 0 from `zpool list`) or if the unit
+# isn't in the expected failed state, so this can't silently do something
+# unexpected if the host's state has changed since this was written.
+#
+# Usage:
+#   ansible-playbook playbooks/pbs-remove-pbs-storage-zfs-import.yml --check --diff
+#   ansible-playbook playbooks/pbs-remove-pbs-storage-zfs-import.yml
+
+- name: Remove the stale pbs_storage zfs-import unit on pbs
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    stale_unit: zfs-import@pbs_storage.service
+
+  tasks:
+    - name: Confirm no pool named pbs_storage actually exists
+      ansible.builtin.command: zpool list -H pbs_storage
+      register: pool_check
+      changed_when: false
+      failed_when: pool_check.rc == 0
+      # rc != 0 ("no such pool") is the expected, safe state to proceed from.
+
+    - name: Read the unit's current state
+      ansible.builtin.command: "systemctl show {{ stale_unit }} --property=ActiveState,UnitFileState,Result"
+      register: unit_state
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm the unit is in the expected stale/failed state before touching it
+      ansible.builtin.assert:
+        that:
+          - "'ActiveState=failed' in unit_state.stdout or 'UnitFileState=enabled' in unit_state.stdout"
+        fail_msg: >-
+          {{ stale_unit }} is not in the expected failed/enabled state
+          ({{ unit_state.stdout }}) - stopping rather than guessing. Check by
+          hand before re-running.
+        success_msg: "{{ stale_unit }} confirmed stale ({{ unit_state.stdout }})."
+
+    - name: Disable the stale unit instance
+      ansible.builtin.systemd:
+        name: "{{ stale_unit }}"
+        enabled: false
+
+    - name: Clear its failed-state flag
+      ansible.builtin.command: "systemctl reset-failed {{ stale_unit }}"
+      changed_when: true
+
+    - name: Confirm it no longer appears in systemctl --failed
+      ansible.builtin.command: systemctl --failed --no-legend
+      register: still_failed
+      changed_when: false
+      failed_when: stale_unit in still_failed.stdout
+      check_mode: false
+
+    - name: Confirm it is no longer enabled
+      ansible.builtin.command: "systemctl is-enabled {{ stale_unit }}"
+      register: enabled_check
+      changed_when: false
+      failed_when: enabled_check.stdout | trim == 'enabled'
+      check_mode: false
+      # "disabled" or "not-found" (systemd may drop a template instance from
+      # its cache entirely once nothing references it) are both acceptable.
+
+    - name: Report the result
+      ansible.builtin.debug:
+        msg: "{{ stale_unit }} is disabled, failed-state cleared, and no longer listed in systemctl --failed."
