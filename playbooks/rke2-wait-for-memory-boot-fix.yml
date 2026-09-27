@@ -16,31 +16,40 @@
 #
 # This is NOT specific to k8s-master - any RKE2 node on a ballooned VM could
 # hit the same race on any future boot. The fix: before rke2-server/
-# rke2-agent starts, wait for /proc/meminfo's MemTotal to stop changing
-# across several consecutive reads. This doesn't assume WHY the value might
-# still be settling (the fix targets the observed symptom, not a specific
-# mechanism), and it fails safe: on timeout it logs a warning and proceeds
-# anyway rather than blocking boot indefinitely, which is no worse than
-# today's behavior.
+# rke2-agent starts, wait 90s and let memory settle before letting kubelet
+# take its one-time reading.
 #
-# Tested live on k8s-worker, 2026-09-27 (v1, STABLE_READS_NEEDED=3 /
-# CHECK_INTERVAL=2 / TIMEOUT=60): the fix ran and genuinely caught an early
-# boot-time change (10s in), but a fuller ~130s sample afterward showed the
-# real behavior is noisier than "ramps once, then freezes" - MemTotal
-# overshot to a peak (~24.5GiB, vs. a 24576MiB ceiling) around 60-90s post-
-# boot, then settled back down into a ~200MB band close to where the v1
-# script's 6s stability window had already caught it. Consistent with `pve`
-# itself being memory-tight overall (a separate, already-known condition -
-# see host_vars/pve.home.lan.yml's ballooning notes): a fresh boot briefly
-# gets its full configured memory before the host's balloon manager reclaims
-# it back down to something sustainable alongside every other VM on that
-# host. v1's captured value landed inside that ~1%-of-total noise band by
-# luck of timing, not because 6s was actually long enough - v2 below widens
-# the stability window to 15s specifically so it isn't relying on luck.
-# Some residual noise (~1% of total memory) is expected to remain
-# permanently, since ballooning here is genuinely ongoing, not a one-time
-# settle - this narrows kubelet's one-time snapshot into that noise band
-# rather than eliminating the gap altogether.
+# WHY A PLAIN DELAY, NOT A "WAIT FOR STABILITY" LOOP - tried that first and
+# rejected it, tested live on k8s-worker, 2026-09-27:
+#   v1 (3 reads/2s = 6s stable window, 60s timeout): ran and caught real
+#   early boot-time change, but a fuller ~130s sample afterward showed the
+#   real behavior is an overshoot-and-settle cycle (peak ~24.5GiB against a
+#   24576MiB ceiling around 60-90s post-boot, settling into a ~200MB band by
+#   ~130s) - not a one-time ramp a 6s window can reliably catch. v1's result
+#   landed in the right range by luck of timing, not because 6s was enough.
+#   v2 (5 reads/3s = 15s stable window, 180s timeout): widened deliberately
+#   to ride out that cycle - and hit the full 180s timeout on every boot
+#   tested. Real conclusion: `pve` itself is memory-tight overall (a
+#   separate, already-known condition - see host_vars/pve.home.lan.yml's
+#   ballooning notes), and its balloon management here jitters continuously
+#   rather than settling to a fixed value. There is no stability point to
+#   wait for, so "wait for N identical reads" would warn-and-fall-back on
+#   every single boot forever - functionally a fixed delay already, just
+#   dressed up as a failure each time.
+#   v2's timeout-fallback capture (24434048Ki) still landed within ~100MB of
+#   the true value moments later, i.e. inside the same ~1.5%-of-total jitter
+#   band v1 also landed in - a plain, later, single read gets the same
+#   practical result as the stability loop did, without the always-fires
+#   false-warning behavior. 90s was chosen because the worst early-boot
+#   swings observed in testing had passed by 60-90s.
+#
+# Some residual noise (order of ~1-1.5% of total node memory) is expected to
+# remain permanently in whatever kubelet captures, since ballooning here is
+# genuinely ongoing on this host, not a one-time settle. This narrows
+# kubelet's one-time snapshot into that small noise band - vastly better
+# than the original bug's fixed, arbitrary, ~23%-of-total permanent gap on
+# k8s-master - but does not and cannot eliminate the gap altogether short of
+# Kubernetes supporting a live-refreshed node Capacity, which it doesn't.
 #
 # Usage:
 #   ansible-playbook playbooks/rke2-wait-for-memory-boot-fix.yml --check --diff
@@ -48,19 +57,21 @@
 #
 # Verification requires an actual reboot per host (the bug only manifests at
 # boot) - not done by this playbook. After applying, reboot one node at a
-# time and confirm `kubectl describe node <name>` shows the full memory
-# ceiling immediately, without needing a follow-up service restart.
+# time and confirm `kubectl describe node <name>`'s Capacity is close to
+# `free -h`'s Total on that host, without needing a follow-up service
+# restart.
 
-- name: Install a memory-stabilization wait before rke2 starts
+- name: Install a fixed boot delay before rke2 starts, to let memory settle
   hosts: k8s
   become: true
 
   vars:
     rke2_service: "{{ 'rke2-server' if 'k8s_master' in group_names else 'rke2-agent' }}"
     wait_script_path: /usr/local/sbin/rke2-wait-for-memory.sh
+    boot_delay_seconds: 90
 
   tasks:
-    - name: Install the memory-stabilization wait script
+    - name: Install the boot-delay script
       ansible.builtin.copy:
         dest: "{{ wait_script_path }}"
         mode: "0755"
@@ -68,41 +79,16 @@
         group: root
         content: |
           #!/bin/sh
-          # Wait for /proc/meminfo's MemTotal to stop changing before rke2
-          # starts. See homelab-ansible playbooks/rke2-wait-for-memory-boot-fix.yml
-          # for why. Always exits 0 - a timeout logs a warning and proceeds
-          # rather than blocking boot, matching today's (buggy) behavior as
-          # the worst case rather than making boot less reliable.
-          set -u
-          # v2, 2026-09-27: widened from 3 reads/2s (6s stable window, 60s
-          # timeout) after live testing on k8s-worker showed the real
-          # settle-and-overshoot cycle runs on the order of 60-130s. 5
-          # reads/3s = 15s of genuine no-change required, with enough
-          # timeout headroom to ride out an overshoot-and-settle cycle
-          # rather than getting lucky on a mid-cycle plateau.
-          STABLE_READS_NEEDED=5
-          CHECK_INTERVAL=3
-          TIMEOUT=180
-          elapsed=0
-          prev=""
-          stable=0
-          while [ "$elapsed" -lt "$TIMEOUT" ]; do
-            cur=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-            if [ "$cur" = "$prev" ]; then
-              stable=$((stable + 1))
-              if [ "$stable" -ge "$STABLE_READS_NEEDED" ]; then
-                echo "rke2-wait-for-memory: MemTotal stable at ${cur}kB after ${elapsed}s, proceeding"
-                exit 0
-              fi
-            else
-              stable=0
-            fi
-            prev="$cur"
-            sleep "$CHECK_INTERVAL"
-            elapsed=$((elapsed + CHECK_INTERVAL))
-          done
-          echo "rke2-wait-for-memory: WARNING timed out after ${TIMEOUT}s waiting for MemTotal to stabilize (last value ${prev}kB) - proceeding anyway"
-          exit 0
+          # Fixed delay before rke2 starts, letting this host's ongoing
+          # memory ballooning pass its worst early-boot swings before
+          # kubelet takes its one-time Capacity reading. See
+          # homelab-ansible playbooks/rke2-wait-for-memory-boot-fix.yml for
+          # why this is a plain delay and not a "wait for stability" loop
+          # (tried and rejected - this host's memory jitters continuously,
+          # there is no stability point to detect).
+          echo "rke2-wait-for-memory: sleeping {{ boot_delay_seconds }}s before rke2 starts (MemTotal now: $(awk '/^MemTotal:/{print $2}' /proc/meminfo)kB)"
+          sleep {{ boot_delay_seconds }}
+          echo "rke2-wait-for-memory: done sleeping (MemTotal now: $(awk '/^MemTotal:/{print $2}' /proc/meminfo)kB), proceeding"
       register: wait_script
 
     - name: Create the systemd drop-in directory
@@ -121,10 +107,11 @@
         group: root
         content: |
           # Installed by playbooks/rke2-wait-for-memory-boot-fix.yml.
-          # Waits for /proc/meminfo's MemTotal to stabilize before rke2
-          # starts, so kubelet's one-time node Capacity read doesn't race an
-          # early-boot memory settle. See that playbook's header for the
-          # full story.
+          # Fixed delay before rke2 starts, so kubelet's one-time node
+          # Capacity read doesn't land in the middle of this host's
+          # early-boot memory settling. See that playbook's header for the
+          # full story, including why this is a plain delay rather than a
+          # "wait for stability" check.
           [Service]
           ExecStartPre={{ wait_script_path }}
       register: dropin
@@ -137,9 +124,9 @@
     - name: Report
       ansible.builtin.debug:
         msg: >-
-          {{ rke2_service }} on {{ inventory_hostname }} now waits for memory
-          to stabilize before starting. Takes effect on the NEXT boot of this
-          host - not applied by a service restart, since the bug is a
-          boot-time race, not an ongoing condition. Verify after an actual
-          reboot: `kubectl describe node {{ inventory_hostname }}` should
-          show the full memory ceiling immediately.
+          {{ rke2_service }} on {{ inventory_hostname }} now waits
+          {{ boot_delay_seconds }}s before starting. Takes effect on the
+          NEXT boot of this host - not applied by a service restart, since
+          the bug is a boot-time race, not an ongoing condition. Verify
+          after an actual reboot: `kubectl describe node {{ inventory_hostname }}`'s
+          Capacity should be close to `free -h`'s Total on that host.
