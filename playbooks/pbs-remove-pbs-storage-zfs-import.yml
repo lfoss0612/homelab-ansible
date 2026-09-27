@@ -76,6 +76,11 @@
       changed_when: false
       failed_when: stale_unit in still_failed.stdout
       check_mode: false
+      # Only meaningful on a real run - under --check the disable/reset-failed
+      # tasks above only predicted their change and never actually ran, so the
+      # unit is still genuinely failed and this would always (correctly, but
+      # unhelpfully) report failure during a dry run.
+      when: not ansible_check_mode
 
     - name: Confirm it is no longer enabled
       ansible.builtin.command: "systemctl is-enabled {{ stale_unit }}"
@@ -85,7 +90,10 @@
       check_mode: false
       # "disabled" or "not-found" (systemd may drop a template instance from
       # its cache entirely once nothing references it) are both acceptable.
+      # Same --check caveat as the task above.
+      when: not ansible_check_mode
 
     - name: Report the result
       ansible.builtin.debug:
         msg: "{{ stale_unit }} is disabled, failed-state cleared, and no longer listed in systemctl --failed."
+      when: not ansible_check_mode
