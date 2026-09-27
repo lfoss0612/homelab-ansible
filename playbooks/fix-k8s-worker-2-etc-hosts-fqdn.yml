@@ -1,0 +1,87 @@
+---
+# Fix k8s-worker-2's `hostname -f` returning the short name instead of the FQDN.
+#
+# WHY: /etc/hosts on this host lists the short name before the FQDN
+# (`10.0.5.4 k8s-worker-2 k8s-worker-2.home.lan`) - backwards from the
+# convention `k8s-master`/`k8s-worker` both use
+# (`<ip> <fqdn> <short-name>`). glibc's canonical-name resolution
+# (getaddrinfo with AI_CANONNAME, which `hostname -f`/`--fqdn` uses) returns
+# whichever name appears FIRST on the matching /etc/hosts line as canonical,
+# regardless of which one is actually the FQDN - so this host's `hostname -f`
+# returns "k8s-worker-2", while the other two correctly return their FQDN.
+#
+# Surfaced 2026-09-27 setting up OOM-kill monitoring
+# (playbooks/oom-kill-monitor.yml): none of the three RKE2 nodes carry a
+# host-level Zabbix agent, so the monitoring script's Zabbix-hostname
+# resolution falls through to `hostname -f`. On k8s-worker-2 that means
+# every value would be pushed under the wrong host name ("k8s-worker-2"
+# instead of "k8s-worker-2.home.lan", the actual registered Zabbix host) and
+# silently discarded forever - the exact failure mode this whole section's
+# scripts already warn about repeatedly.
+#
+# THIS IS NOT fix-k8s-master-hostname.yml's situation - much smaller in
+# scope. That playbook changed the actual OS hostname (`hostname` itself)
+# to match the Kubernetes node name, which required restarting rke2-server
+# because RKE2's cloud provider stamps status.addresses[Hostname] from the
+# OS hostname. Here, `hostname` alone is ALREADY correct
+# ("k8s-worker-2.home.lan", verified live) - only the /etc/hosts canonical-
+# name ORDER is wrong. No RKE2 restart, no node identity change, no cluster
+# impact: `metadata.name`/the Kubernetes node name come from RKE2's own
+# node-name / the OS hostname via gethostname(), never from /etc/hosts
+# canonicalization.
+#
+# Usage:
+#   ansible-playbook playbooks/fix-k8s-worker-2-etc-hosts-fqdn.yml --check --diff
+#   ansible-playbook playbooks/fix-k8s-worker-2-etc-hosts-fqdn.yml
+
+- name: Fix k8s-worker-2's /etc/hosts FQDN ordering
+  hosts: k8s-worker-2.home.lan
+  become: true
+
+  vars:
+    target_fqdn: k8s-worker-2.home.lan
+    target_short: k8s-worker-2
+
+  tasks:
+    - name: Confirm the OS hostname is already correct (not this playbook's job to fix)
+      ansible.builtin.command: hostname
+      register: os_hostname
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse to run if the OS hostname itself is wrong
+      ansible.builtin.assert:
+        that:
+          - os_hostname.stdout | trim == target_fqdn
+        fail_msg: >-
+          `hostname` returned "{{ os_hostname.stdout | trim }}", not
+          "{{ target_fqdn }}". This playbook only reorders /etc/hosts - a
+          wrong OS hostname is a different, bigger problem (see
+          fix-k8s-master-hostname.yml for that class of fix). Refusing.
+        success_msg: "OS hostname confirmed correct ({{ target_fqdn }})."
+
+    - name: Reorder /etc/hosts so the FQDN is canonical (comes first)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^{{ ansible_host }}\s'
+        line: "{{ ansible_host }} {{ target_fqdn }} {{ target_short }}"
+        state: present
+        backup: true
+
+    - name: Confirm hostname -f now returns the FQDN
+      ansible.builtin.command: hostname -f
+      register: fqdn_check
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Assert the fix landed
+      ansible.builtin.assert:
+        that:
+          - fqdn_check.stdout | trim == target_fqdn
+        fail_msg: >-
+          `hostname -f` still returns "{{ fqdn_check.stdout | trim }}" after
+          the /etc/hosts edit, not "{{ target_fqdn }}". Something else (DNS,
+          NSS ordering) may be overriding /etc/hosts here.
+        success_msg: "hostname -f now correctly returns {{ target_fqdn }}."
+      when: not ansible_check_mode
