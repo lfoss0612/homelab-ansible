@@ -22,8 +22,13 @@ with no `sudo`/`wheel` membership. It escalates via `sudo -u ansible` to exactly
 binaries — `/usr/bin/ansible`, `ansible-playbook`, `ansible-inventory` — and nothing else.
 Full runbook in [docs/claude-access.md](docs/claude-access.md).
 
+**Always connect as `claude@` explicitly** (`ssh claude@cockpit`, never bare `ssh cockpit`).
+`~/.ssh/config` only applies the `id_claude` key under `Match user claude`, so the bare
+alias resolves to the human `lfoss` account. `.claude/settings.json` denies every other
+ssh form; if a command is blocked, fix the command — do not route around the rule.
+
 ```bash
-ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook playbooks/<play>.yml --check --diff'
+ssh claude@cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook playbooks/<play>.yml --check --diff'
 ```
 
 - **Always `cd /opt/ansible` first.** Without it `ansible.cfg` is never discovered and

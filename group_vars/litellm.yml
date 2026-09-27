@@ -1,0 +1,59 @@
+---
+# group_vars/litellm.yml
+#
+# Connection and API settings for LiteLLM, reached over its HTTP API rather
+# than SSH. Same shape as group_vars/network_appliances.yml for OPNsense —
+# see that file for the fuller reasoning on ansible_connection: local.
+
+# LiteLLM is reached over the network from cockpit, not connected to as a
+# host. `become` MUST stay off for the same reason as network_appliances.yml:
+# ansible.cfg sets `[privilege_escalation] become = True` globally, which
+# would sudo every API call to root on cockpit for no reason. Every LiteLLM
+# play ALSO carries `become: false` as a play keyword (the primary control);
+# this is the backstop for ad-hoc `ansible litellm.home.lan -m uri ...` runs.
+ansible_connection: local
+ansible_become: false
+
+# --- API endpoint ------------------------------------------------------------
+#
+# The MetalLB LoadBalancer IP for the litellm Service, not the ingress
+# hostname — this is the same address host_vars/pve-ai.home.lan.yml's
+# openclaw_models_base_url already uses and has proven reachable from the
+# home network. No TLS: the litellm Helm release's ingress config
+# (homelab-gitops argocd/litellm/litellm.yaml) doesn't terminate TLS, so
+# there's nothing to gain by routing through it instead.
+litellm_api_base: "http://10.2.6.1:4000"
+
+# --- Credentials -------------------------------------------------------------
+#
+# A dedicated `ansible-litellm-writer` LiteLLM virtual key, role
+# `proxy_admin` (the only role with /model/new, /model/update, /model/delete
+# access — see `GET /user/available_roles` on the live proxy). Deliberately
+# NOT the cluster's PROXY_MASTER_KEY secret (litellm-masterkey in the
+# litellm namespace): reusing one credential for two purposes means neither
+# can be revoked or re-scoped independently, and the OPNsense credentials
+# above already record that exact anti-pattern as the cause of a past
+# outage. Claude's own LiteLLM access is a *separate*, read-only
+# proxy_admin_viewer key (LITELLM_API_TOKEN in ~/.bashrc on the workstation,
+# see docs/claude-access.md "On LiteLLM") — it cannot write models at all,
+# so it is not a substitute for this one.
+#
+# Mint the key as a Service Account (Key Ownership: Service Account, not a
+# User — see docs/claude-access.md "On LiteLLM" for why) via POST
+# /key/service-account/generate with "key_type": "management" — that's the
+# type covering /model/* and /key/* admin routes; "AI APIs" and "Full Access"
+# are the wrong shape (inference-only, and unrestricted, respectively). Then
+# encrypt it here. ansible.cfg already points at /etc/ansible-vault-password,
+# so no --vault-password-file is needed:
+#   ansible-vault encrypt_string --name litellm_admin_api_key '<key>'
+# and paste the resulting `!vault |` block below, replacing this line.
+#
+# Until this is filled in, playbooks/manage-litellm-models.yml fails its
+# credentials-present assert with instructions. Nothing writes to LiteLLM
+# without it.
+#
+# MUST STAY THE LAST VARIABLE IN THIS FILE. playbooks/rotate-litellm-writer-key.yml
+# rewrites this file with a regex anchored on "everything from this line to
+# end-of-file" (avoiding a hand-rolled multi-line-vault-block parser) — adding
+# anything after this line will make that replacement swallow or corrupt it.
+litellm_admin_api_key: ""

@@ -1,7 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ssh cockpit *)"
+      "Bash(ssh claude@*)",
+      "Bash(ssh * claude@*)"
+    ],
+    "deny": [
+      "Bash(ssh cockpit*)",
+      "Bash(ssh zabbix*)",
+      "Bash(ssh 10.*)",
+      "Bash(ssh lfoss@*)",
+      "Bash(ssh ansible@*)",
+      "Bash(ssh root@*)",
+      "Bash(ssh * cockpit*)",
+      "Bash(ssh * zabbix*)",
+      "Bash(ssh * 10.*)",
+      "Bash(ssh * lfoss@*)",
+      "Bash(ssh * ansible@*)",
+      "Bash(ssh * root@*)",
+      "Bash(ssh * -l *)"
     ]
   }
 }

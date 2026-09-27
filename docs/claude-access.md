@@ -5,7 +5,8 @@ uses to operate this repo. A second, purpose-scoped playbook,
 `playbooks/users/claude-user-zabbix.yml`, extends the same identity to
 zabbix.home.lan — see [On zabbix.home.lan](#on-zabbixhomelan-exception-to-cockpit-only)
 below for why that host is an explicit, reasoned exception rather than a reversal of
-the policy.
+the policy. [On LiteLLM](#on-litellm-read-only-api-key-writes-go-through-ansible) covers
+a third, differently-shaped case: no OS account at all, just a read-only API key.
 
 ## Design
 
@@ -110,7 +111,7 @@ workstation before appending it to `~/.ssh/known_hosts`.
 Verify end to end:
 
 ```bash
-ssh cockpit 'id; cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible --version | head -1'
+ssh claude@cockpit 'id; cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible --version | head -1'
 ```
 
 `id` must show **no** `sudo` or `wheel` group, and the second command must print a
@@ -119,7 +120,7 @@ something else granted it.
 
 ### 5. Reduce permission prompts
 
-Add `Bash(ssh cockpit *)` to `.claude/settings.json` in this repo so routine calls do not
+Add `Bash(ssh claude@*)` to `.claude/settings.json` in this repo so routine calls do not
 prompt. Note the **space** before `*`, not a colon — that is the prefix-wildcard form
 Claude Code generates and honors.
 
@@ -128,7 +129,7 @@ Claude Code generates and honors.
 Claude works through this pattern, never as root directly:
 
 ```bash
-ssh cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook playbooks/<play>.yml --check --diff'
+ssh claude@cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook playbooks/<play>.yml --check --diff'
 ```
 
 ### Two details that are easy to get wrong
@@ -226,6 +227,56 @@ ansible-playbook playbooks/manage-zabbix-server-conf.yml --check --diff \
   -e '{"zabbix_server_conf_settings": [{"key": "SomeKey", "value": "SomeValue"}]}'
 ```
 
+## On LiteLLM (read-only API key; writes go through Ansible)
+
+Not an OS account at all — LiteLLM (litellm.home.lan / 10.2.6.1:4000, `litellm`
+namespace) is an HTTP API, not a host Claude needs to log into, so the
+zabbix.home.lan shape (SSH + group membership) doesn't apply. Same underlying
+policy though: Claude gets read-only, reviewed writes go through Ansible.
+
+| | cockpit (`claude-user.yml`) | LiteLLM |
+|---|---|---|
+| Access mechanism | SSH key, escalates to `ansible` | Bearer token, direct HTTPS call to the LiteLLM API — no SSH involved |
+| Role | N/A (shell account) | LiteLLM `proxy_admin_viewer` — "view all keys, view all spend"; cannot call `/model/new`, `/model/update`, or `/model/delete` |
+| Credential storage | `keys/claude_ed25519.pub` (git) + private half on the workstation | `LITELLM_API_TOKEN` / `LITELLM_API_URL` exported in `~/.bashrc` on the workstation — the same place `VAULT_PVE_TOKEN`, `VAULT_OPNSENSE_KEY`/`_SECRET`, and `ZABBIX_API_TOKEN`/`ZABBIX_API_URL` already live. Not committed to git. |
+| Writes | Reviewed playbooks via `ansible` | `playbooks/manage-litellm-models.yml`, using a *separate* `ansible-litellm-writer` key (`proxy_admin` role) stored ansible-vault-encrypted in `group_vars/litellm.yml` — never the cluster's `PROXY_MASTER_KEY` secret, and never Claude's own read-only key |
+
+Why two LiteLLM keys instead of one: same reasoning `group_vars/network_appliances.yml`
+already gives for OPNsense's dedicated `ansible-writer` API user — one credential
+serving two callers means neither can be revoked or re-scoped without breaking the
+other, and that repo's own history already has an outage caused by exactly that
+shortcut. Claude's key can't write regardless, so even if the two were merged
+Claude would still route changes through the playbook — but keeping them separate
+means the read-only key can be handed out more freely without it also being a
+proxy_admin credential.
+
+Both keys are minted directly on the live LiteLLM proxy (UI or API) and placed by
+hand — not by Claude, since Claude has no path to `/etc/ansible-vault-password`
+(its cockpit sudo grant covers only `ansible`/`ansible-playbook`/`ansible-inventory`,
+not `ansible-vault`) and the read-only key is simplest to just set directly.
+
+Operating pattern:
+
+```bash
+# Read — direct, no ansible involved
+curl -s -H "Authorization: Bearer $LITELLM_API_TOKEN" "$LITELLM_API_URL/model/info"
+
+# Write — reviewed playbook via cockpit, like every other fleet change
+sudo -iu ansible
+cd /opt/ansible
+ansible-playbook playbooks/manage-litellm-models.yml --check --diff \
+  -e '{"litellm_model_deletes": [{"model_id": "<id-from-model/info>"}]}'
+```
+
+Model inventory and known issues (retired NIM entries, OpenRouter quota, etc.) are
+tracked in the vault at `Kubernetes/Services/litellm-models.md`, not here.
+
+Rotating `ansible-litellm-writer` itself is `playbooks/rotate-litellm-writer-key.yml`
+— it regenerates the key on the live proxy and re-encrypts it into
+`group_vars/litellm.yml` in one run, with `no_log: true` on every task that ever
+holds the plaintext so it never appears in Ansible's own console output. Run it the
+same way, from cockpit as `ansible`.
+
 ## Variables
 
 | Variable | Default | Purpose |
@@ -240,4 +291,6 @@ ansible-playbook playbooks/manage-zabbix-server-conf.yml --check --diff \
 - `playbooks/users/ansible-user.yml` — the automation identity `claude-user.yml` escalates to
 - `playbooks/users/lfoss-user.yml` — the admin identity `claude-user.yml` is modeled on
 - `playbooks/users/claude-user-zabbix.yml` — the zabbix.home.lan exception, see above
+- `playbooks/manage-litellm-models.yml` / `group_vars/litellm.yml` — the LiteLLM write path, see above
+- `playbooks/rotate-litellm-writer-key.yml` — rotates the ansible-litellm-writer key itself, see above
 - `docs/ansible-user.md` — original bootstrap notes

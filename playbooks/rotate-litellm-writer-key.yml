@@ -1,0 +1,88 @@
+---
+# Rotate the ansible-litellm-writer key on the live LiteLLM proxy and
+# re-encrypt the new value straight into group_vars/litellm.yml.
+#
+# WHY THIS EXISTS: rotating this key by hand means calling
+# POST /key/regenerate, catching the plaintext it returns, and running
+# `ansible-vault encrypt_string` before it's forgotten in a terminal
+# scrollback — three manual steps with a live secret passing through a human
+# (or Claude's) hands each time. This playbook does the same three steps as
+# one atomic, reviewed action, with the plaintext never once written to disk
+# unencrypted or printed anywhere.
+#
+# SECRET HANDLING — read before changing this file:
+#   Every task below that ever holds the plaintext key (the regenerate
+#   response, the encrypt_string invocation) is marked `no_log: true`. That
+#   is what keeps the plaintext out of Ansible's own console output — and
+#   therefore out of anything piping that output elsewhere (a terminal
+#   scrollback, a log file, Claude's own tool-call capture when it invokes
+#   this playbook via cockpit). If you add a task that touches
+#   litellm_regen_result or the plaintext key directly, it needs no_log too,
+#   or this guarantee silently stops applying to it.
+#
+#   The encrypt step uses `--stdin-name` (feeding the plaintext over stdin)
+#   rather than passing it as a CLI argument, so it never appears in this
+#   host's process list either.
+#
+# The new key authenticates its own rotation call (Authorization: Bearer
+# {{ litellm_admin_api_key }}) — its key_type is "management", which is the
+# same route category /key/regenerate itself falls under, so no dependency
+# on the cluster's PROXY_MASTER_KEY secret is needed here at all.
+#
+# Usage:
+#   ansible-playbook playbooks/rotate-litellm-writer-key.yml --check --diff
+#   ansible-playbook playbooks/rotate-litellm-writer-key.yml
+#
+# --check will call the *real* regenerate endpoint if run for real (uri's
+# check-mode skip applies to the HTTP call, so a true --check run does NOT
+# rotate anything live — confirm this shows "skipped" for the regenerate
+# task, not "changed", before trusting the dry run).
+
+- name: Rotate the LiteLLM ansible-litellm-writer key
+  hosts: "{{ litellm_hosts | default('litellm.home.lan') }}"
+  become: false
+  gather_facts: false
+
+  vars:
+    litellm_group_vars_file: "{{ playbook_dir }}/../group_vars/litellm.yml"
+
+  tasks:
+    - name: Assert the current LiteLLM admin API key is configured
+      ansible.builtin.assert:
+        that:
+          - litellm_admin_api_key | default('') | length > 0
+        fail_msg: >-
+          litellm_admin_api_key is empty in group_vars/litellm.yml — there is
+          nothing to rotate yet. Mint the initial ansible-litellm-writer key
+          by hand first (see docs/claude-access.md, "On LiteLLM").
+      run_once: true
+
+    - name: Regenerate the key on the live LiteLLM proxy
+      ansible.builtin.uri:
+        url: "{{ litellm_api_base }}/key/regenerate?key={{ litellm_admin_api_key }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ litellm_admin_api_key }}"
+        status_code: 200
+      register: litellm_regen_result
+      no_log: true
+
+    - name: Encrypt the new key for group_vars/litellm.yml
+      ansible.builtin.command:
+        cmd: ansible-vault encrypt_string --stdin-name litellm_admin_api_key
+        stdin: "{{ litellm_regen_result.json.key }}"
+      register: litellm_encrypted_block
+      no_log: true
+      changed_when: true
+
+    - name: Write the newly encrypted key into group_vars/litellm.yml
+      # Matches from the litellm_admin_api_key declaration to the true end of
+      # file — safe ONLY because that variable is required to be the last
+      # thing in the file (see the comment above it there). DOTALL (the `s`
+      # flag) makes `.` match newlines, so this swallows the entire existing
+      # `!vault |` block regardless of how many indented ciphertext lines it
+      # spans, without needing to hand-parse YAML's vault block structure.
+      ansible.builtin.replace:
+        path: "{{ litellm_group_vars_file }}"
+        regexp: '(?ms)^litellm_admin_api_key:.*\Z'
+        replace: "{{ litellm_encrypted_block.stdout }}"

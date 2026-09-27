@@ -1,0 +1,117 @@
+---
+# Create, update, or delete LiteLLM model entries via its admin API.
+#
+# WHY THIS EXISTS: LiteLLM's model list is store_model_in_db: True (see
+# homelab-vault Kubernetes/Services/litellm-models.md) — 34 of 35 models
+# live only in its Postgres database, added through the UI/API, invisible to
+# GitOps. Before this playbook, changing one meant `kubectl exec` into the
+# litellm pod and calling its API directly with PROXY_MASTER_KEY (full
+# proxy_admin power over every model, key, and user on the proxy) — exactly
+# how the gpt-oss-120b model was repointed to openrouter/openai/gpt-oss-120b:free
+# earlier the same day this playbook was written. That is reviewable by
+# no one and leaves no record outside LiteLLM's own audit log.
+#
+# This playbook is that reviewed path instead, using a dedicated
+# `ansible-litellm-writer` key (group_vars/litellm.yml) scoped to nothing
+# else. See docs/claude-access.md, "On LiteLLM": Claude's own LiteLLM
+# credential is a separate, read-only proxy_admin_viewer key that cannot
+# call any of the endpoints below — model changes go through this playbook,
+# run from cockpit as the `ansible` user, same as every other fleet change.
+#
+# SAFETY: every list below is empty by default, making a bare run a true
+# no-op — safe to run any time to confirm that. Supply real changes via -e
+# or a vars file, e.g.:
+#
+#   ansible-playbook playbooks/manage-litellm-models.yml --check --diff \
+#     -e '{"litellm_model_deletes": [{"model_id": "291ba546-334a-497d-b63b-1404dff76e1e"}]}'
+#
+#   ansible-playbook playbooks/manage-litellm-models.yml --check --diff \
+#     -e '{"litellm_model_updates": [{"model_name": "gpt-oss-120b", "model_id": "291ba546-334a-497d-b63b-1404dff76e1e", "litellm_params": {"model": "openrouter/openai/gpt-oss-120b:free"}}]}'
+#
+# model_id values come from GET /model/info (Claude's read-only key can
+# fetch this) — LiteLLM's /model/update and /model/delete key off the
+# internal model_info.id, not the human-readable model_name, since a
+# model_name is not unique.
+#
+# `uri` skips non-GET/HEAD requests under --check by design, so --check
+# --diff naturally previews without writing.
+#
+# Usage:
+#   ansible-playbook playbooks/manage-litellm-models.yml --check --diff
+#   ansible-playbook playbooks/manage-litellm-models.yml
+
+- name: Manage LiteLLM model definitions via its admin API
+  hosts: "{{ litellm_hosts | default('litellm.home.lan') }}"
+  become: false
+  gather_facts: false
+
+  vars:
+    # Each item: {model_id}
+    litellm_model_deletes: []
+    # Each item: {model_name, model_id, litellm_params: {...}} — litellm_params
+    # is merged into the existing deployment's params (matches the shape
+    # GET /model/info returns for litellm_params).
+    litellm_model_updates: []
+    # Each item: a full model definition — {model_name, litellm_params: {...}}
+    litellm_model_creates: []
+
+  tasks:
+    - name: Assert the LiteLLM admin API key is configured
+      ansible.builtin.assert:
+        that:
+          - litellm_admin_api_key | default('') | length > 0
+        fail_msg: >-
+          litellm_admin_api_key is empty in group_vars/litellm.yml. Mint a
+          proxy_admin-role key on the LiteLLM proxy, then:
+            ansible-vault encrypt_string --name litellm_admin_api_key '<key>'
+          and paste the result into group_vars/litellm.yml.
+      run_once: true
+
+    - name: Delete requested models
+      ansible.builtin.uri:
+        url: "{{ litellm_api_base }}/model/delete"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ litellm_admin_api_key }}"
+        body_format: json
+        body:
+          id: "{{ item.model_id }}"
+        status_code: 200
+      loop: "{{ litellm_model_deletes }}"
+      loop_control:
+        label: "{{ item.model_id }}"
+      changed_when: true
+
+    - name: Update requested models
+      ansible.builtin.uri:
+        url: "{{ litellm_api_base }}/model/update"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ litellm_admin_api_key }}"
+        body_format: json
+        body:
+          model_name: "{{ item.model_name }}"
+          litellm_params: "{{ item.litellm_params }}"
+          model_info:
+            id: "{{ item.model_id }}"
+        status_code: 200
+      loop: "{{ litellm_model_updates }}"
+      loop_control:
+        label: "{{ item.model_name }}"
+      changed_when: true
+
+    - name: Create requested models
+      ansible.builtin.uri:
+        url: "{{ litellm_api_base }}/model/new"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ litellm_admin_api_key }}"
+        body_format: json
+        body:
+          model_name: "{{ item.model_name }}"
+          litellm_params: "{{ item.litellm_params }}"
+        status_code: 200
+      loop: "{{ litellm_model_creates }}"
+      loop_control:
+        label: "{{ item.model_name }}"
+      changed_when: true
