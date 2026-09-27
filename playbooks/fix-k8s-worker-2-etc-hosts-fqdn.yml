@@ -108,6 +108,7 @@
       register: all_matching_lines
       changed_when: false
       check_mode: false
+      when: not ansible_check_mode
 
     - name: Confirm exactly one line remains, with the correct IP
       ansible.builtin.assert:
@@ -120,3 +121,4 @@
           A leftover stale entry (or a second one this playbook doesn't
           know about) may still be present.
         success_msg: "Exactly one, correct /etc/hosts entry remains: {{ all_matching_lines.stdout_lines[0] }}"
+      when: not ansible_check_mode
