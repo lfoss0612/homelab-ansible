@@ -1,0 +1,69 @@
+---
+# Remove the stale /mnt/backups fstab entry on pbs, left behind after the
+# AmazonBasics/VL711 enclosure (sdc, WD Blue SA510 2 TB) was retired.
+#
+# All four directories that lived on it (argocd, scripts, switches, docs) were
+# already confirmed copied onto the backup10tb ZFS mirror under
+# /mnt/datastore on 2026-08-26, and Longhorn's backup target was already
+# pointed at the mirror - see homelab-vault DONE.md, Storage, for the full
+# retirement checklist. The user unmounted /mnt/backups and removed the
+# mountpoint directory by hand (2026-09-27); this play only removes the now-
+# dangling fstab line, matched by UUID rather than the /mnt/backups path so a
+# stray directory of the same name created later isn't accidentally matched.
+#
+# This entry was never Ansible-managed to begin with (no host_vars/group_vars
+# reference it - confirmed by search), so there is no role to update
+# alongside it; this play is the only place it existed in git, and after this
+# runs it exists nowhere.
+#
+# Not covered here: [smart_monitored] in inventory.ini lists pbs.home.lan
+# itself, not individual disks - SMART monitoring is LLD-discovered per drive,
+# so sdc's item will auto-disable once the disk is physically removed, the
+# same way Zabbix LLD already handles other vanished hardware in this repo.
+# Nothing to change there.
+#
+# Usage:
+#   ansible-playbook playbooks/pbs-remove-sdc-fstab-entry.yml --check --diff
+#   ansible-playbook playbooks/pbs-remove-sdc-fstab-entry.yml
+
+- name: Remove the retired sdc /mnt/backups fstab entry on pbs
+  hosts: pbs.home.lan
+  become: true
+
+  vars:
+    sdc_uuid: ea65df50-1599-4b6d-89da-f1cdc9bb9a89
+    sdc_mountpoint: /mnt/backups
+
+  tasks:
+    - name: Confirm the mountpoint is not currently mounted
+      ansible.builtin.command: findmnt --noheadings "{{ sdc_mountpoint }}"
+      register: still_mounted
+      changed_when: false
+      failed_when: still_mounted.rc == 0
+      # rc 1 (not a mountpoint) is the expected, safe state; rc 0 would mean
+      # something is mounted there right now and this play should not touch
+      # fstab out from under an active mount.
+
+    - name: Remove the fstab line for the retired disk
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^UUID={{ sdc_uuid }}\s'
+        state: absent
+        backup: true
+
+    - name: Read back /etc/fstab
+      ansible.builtin.command: cat /etc/fstab
+      register: fstab_after
+      changed_when: false
+
+    - name: Confirm the UUID is gone
+      ansible.builtin.assert:
+        that:
+          - sdc_uuid not in fstab_after.stdout
+        fail_msg: "{{ sdc_uuid }} is still present in /etc/fstab after the edit."
+        success_msg: "Confirmed: {{ sdc_uuid }} ({{ sdc_mountpoint }}) is gone from /etc/fstab."
+      when: not ansible_check_mode
+
+    - name: Show the current fstab
+      ansible.builtin.debug:
+        msg: "{{ fstab_after.stdout_lines }}"
