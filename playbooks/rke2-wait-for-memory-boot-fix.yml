@@ -1,0 +1,121 @@
+---
+# Fix a boot-timing bug found 2026-09-27: kubelet reads a node's memory
+# Capacity once, very early in its own startup, and never refreshes it short
+# of a restart. On these Proxmox VMs (memory ballooning, no hotplug), that
+# early read can race whatever the guest's true available memory settles to
+# a few seconds into boot, leaving kubelet permanently reporting a smaller
+# Capacity than the node actually has.
+#
+# Confirmed live on k8s-master (VMID 103, memory: 16384/balloon: 12288):
+# kubectl reported Capacity=12896880Ki (~12.3GiB) for over a day after boot,
+# while the guest's own /proc/meminfo showed MemTotal=16304752kB (~15.9GiB)
+# at the SAME moment. A plain `systemctl restart rke2-server` - no VM
+# reboot, no config change - immediately fixed it: Capacity became
+# 16304752Ki, exact match. See homelab-vault DONE.md, Kubernetes, for the
+# full writeup and the live before/after numbers.
+#
+# This is NOT specific to k8s-master - any RKE2 node on a ballooned VM could
+# hit the same race on any future boot. The fix: before rke2-server/
+# rke2-agent starts, wait for /proc/meminfo's MemTotal to stop changing
+# across a few consecutive reads. This doesn't assume WHY the value might
+# still be settling (balloon inflation is the leading theory but wasn't
+# proven at the kernel level - the fix targets the observed symptom, not a
+# specific mechanism), and it fails safe: on timeout it logs a warning and
+# proceeds anyway rather than blocking boot indefinitely, which is no worse
+# than today's behavior.
+#
+# Usage:
+#   ansible-playbook playbooks/rke2-wait-for-memory-boot-fix.yml --check --diff
+#   ansible-playbook playbooks/rke2-wait-for-memory-boot-fix.yml
+#
+# Verification requires an actual reboot per host (the bug only manifests at
+# boot) - not done by this playbook. After applying, reboot one node at a
+# time and confirm `kubectl describe node <name>` shows the full memory
+# ceiling immediately, without needing a follow-up service restart.
+
+- name: Install a memory-stabilization wait before rke2 starts
+  hosts: k8s
+  become: true
+
+  vars:
+    rke2_service: "{{ 'rke2-server' if 'k8s_master' in group_names else 'rke2-agent' }}"
+    wait_script_path: /usr/local/sbin/rke2-wait-for-memory.sh
+
+  tasks:
+    - name: Install the memory-stabilization wait script
+      ansible.builtin.copy:
+        dest: "{{ wait_script_path }}"
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/bin/sh
+          # Wait for /proc/meminfo's MemTotal to stop changing before rke2
+          # starts. See homelab-ansible playbooks/rke2-wait-for-memory-boot-fix.yml
+          # for why. Always exits 0 - a timeout logs a warning and proceeds
+          # rather than blocking boot, matching today's (buggy) behavior as
+          # the worst case rather than making boot less reliable.
+          set -u
+          STABLE_READS_NEEDED=3
+          CHECK_INTERVAL=2
+          TIMEOUT=60
+          elapsed=0
+          prev=""
+          stable=0
+          while [ "$elapsed" -lt "$TIMEOUT" ]; do
+            cur=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+            if [ "$cur" = "$prev" ]; then
+              stable=$((stable + 1))
+              if [ "$stable" -ge "$STABLE_READS_NEEDED" ]; then
+                echo "rke2-wait-for-memory: MemTotal stable at ${cur}kB after ${elapsed}s, proceeding"
+                exit 0
+              fi
+            else
+              stable=0
+            fi
+            prev="$cur"
+            sleep "$CHECK_INTERVAL"
+            elapsed=$((elapsed + CHECK_INTERVAL))
+          done
+          echo "rke2-wait-for-memory: WARNING timed out after ${TIMEOUT}s waiting for MemTotal to stabilize (last value ${prev}kB) - proceeding anyway"
+          exit 0
+      register: wait_script
+
+    - name: Create the systemd drop-in directory
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ rke2_service }}.service.d"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Install the ExecStartPre drop-in
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ rke2_service }}.service.d/wait-for-memory.conf"
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # Installed by playbooks/rke2-wait-for-memory-boot-fix.yml.
+          # Waits for /proc/meminfo's MemTotal to stabilize before rke2
+          # starts, so kubelet's one-time node Capacity read doesn't race an
+          # early-boot memory settle. See that playbook's header for the
+          # full story.
+          [Service]
+          ExecStartPre={{ wait_script_path }}
+      register: dropin
+
+    - name: Reload systemd if the drop-in or script changed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: dropin.changed or wait_script.changed
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ rke2_service }} on {{ inventory_hostname }} now waits for memory
+          to stabilize before starting. Takes effect on the NEXT boot of this
+          host - not applied by a service restart, since the bug is a
+          boot-time race, not an ongoing condition. Verify after an actual
+          reboot: `kubectl describe node {{ inventory_hostname }}` should
+          show the full memory ceiling immediately.
