@@ -51,15 +51,23 @@
     # lm-sensors version ever adds a prompt --auto doesn't cover, this fails
     # fast instead of hanging a live run against pve-router indefinitely.
     #
-    # Always run, never skipped by idempotency logic: detection is what finds
-    # newly-added hardware, and re-running it is cheap. What matters for
-    # "did this work" is verified separately below (an actual sensors reading),
-    # not sensors-detect's own exit chatter.
+    # Skipped under --check, same reasoning as the "enable and start timer"
+    # task in tasks/cpu-temp-monitor-setup.yml: the lm-sensors package above is
+    # only SIMULATED as installed under check mode, so `sensors-detect` does
+    # not really exist on disk yet -- running it for real here would just fail
+    # with "No such file or directory" on any host that doesn't already have
+    # it, which is every host before this play's first live run. Verified live
+    # against pbs.home.lan's --check run 2026-09-27 (rc=127).
+    #
+    # On a real run this always executes, never skipped by idempotency logic:
+    # detection is what finds newly-added hardware, and re-running it is
+    # cheap. What matters for "did this work" is verified separately below (an
+    # actual sensors reading), not sensors-detect's own exit chatter.
     - name: Run sensors-detect to load the right kernel modules
       ansible.builtin.shell: timeout 120 sensors-detect --auto < /dev/null
       register: cpu_sensors_detect
       changed_when: false
-      check_mode: false
+      when: not ansible_check_mode
 
     - name: Show what sensors-detect found
       ansible.builtin.debug:
