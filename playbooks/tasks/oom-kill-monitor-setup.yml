@@ -42,7 +42,7 @@
 
       [Service]
       Type=oneshot
-      Environment="ZABBIX_SERVER=10.0.5.9"
+      Environment="ZABBIX_SERVER={{ oom_zabbix_server | default('10.0.5.9') }}"
       Environment="ZABBIX_PORT=10051"
       ExecStart=/usr/local/bin/oom-kill-monitor
       StandardOutput=journal

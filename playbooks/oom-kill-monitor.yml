@@ -35,6 +35,21 @@
 # than being removed now that install is unconditional — it catches a
 # future host where the package name differs or apt itself fails, instead
 # of the monitor silently never reporting.
+#
+# oom_zabbix_server (host_vars-overridable, defaults to the direct server
+# 10.0.5.9) exists because of a real, previously-undiagnosed failure found
+# 2026-09-27: k8s-master is monitored via a Zabbix PROXY ("rke2-proxy"),
+# not directly by the server, while k8s-worker/k8s-worker-2 are not. Zabbix
+# refuses trapper data sent directly to the server for a proxy-monitored
+# host outright - "cannot process item ... trap: host is monitored by a
+# proxy or proxy group" (found in zabbix_server.log; the client-side
+# zabbix_sender/API surface gives no hint why, just a generic "discarded").
+# host_vars/k8s-master.home.lan.yml sets this to the proxy pod's in-cluster
+# ClusterIP (zabbix-proxy-agent-zabbix-helm-chrt-proxy service, port
+# 10051) instead - reachable from the host network via kube-proxy, same as
+# any other Service. Any FUTURE host added to [oom_monitored] needs the
+# same check (`monitored_by`/`proxyid` via the Zabbix API) before assuming
+# the plain server address will work.
 
 - name: Deploy OOM-kill monitoring
   hosts: oom_monitored

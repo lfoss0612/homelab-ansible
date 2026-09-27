@@ -95,3 +95,28 @@ zbx_kube_api_token: !vault |
           32326263333731656561623865323439623437303464316465393661316334623036303238376431
           36363134653963393063356634393464623639636333333338363331306238316234383661326165
           653834356164333764363538373664353936
+
+# --- OOM-kill monitoring Zabbix target ----------------------------------------
+#
+# Found 2026-09-27 setting up playbooks/oom-kill-monitor.yml: this host's
+# Zabbix host object is monitored via the "rke2-proxy" Zabbix proxy
+# (monitored_by=1, confirmed via the API), unlike k8s-worker/k8s-worker-2
+# which are monitored directly by the server (monitored_by=0) - consistent
+# with zbx_kube_api_url above already needing to be reachable from inside
+# that same proxy pod's network namespace. Trapper data sent straight to
+# the server for a proxy-monitored host is unconditionally refused
+# ("cannot process item ... trap: host is monitored by a proxy or proxy
+# group", found in zabbix_server.log - the client-side zabbix_sender/API
+# surface gives no hint why, just a generic "discarded"). This overrides
+# oom-kill-monitor.yml's default (the direct server, 10.0.5.9) to the
+# proxy pod's in-cluster ClusterIP instead
+# (zabbix-proxy-agent-zabbix-helm-chrt-proxy service, cattle-monitoring-
+# system namespace, port 10051 - the standard Zabbix trapper port),
+# reachable from this host's network via kube-proxy like any other Service.
+# Not vault-encrypted - a ClusterIP is not a secret.
+#
+# This ClusterIP is only stable as long as the Service object itself is
+# never deleted/recreated (normal pod restarts/reschedules do not change
+# it) - if it ever needs re-verifying: `kubectl get svc -n
+# cattle-monitoring-system zabbix-proxy-agent-zabbix-helm-chrt-proxy`.
+oom_zabbix_server: "10.43.121.198"
