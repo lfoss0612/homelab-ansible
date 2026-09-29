@@ -1,0 +1,185 @@
+---
+# Alert when the OPNsense WAN gateway stops answering ICMP.
+#
+# Native Zabbix Simple check (icmpping), polled directly by the Zabbix
+# server against the gateway IP — no OPNsense agent involved, so this still
+# fires even if OPNsense itself is wedged and its Zabbix agent has stopped
+# responding. Same pattern as the MetalLB VIP items/triggers in
+# zabbix-metallb-vip-monitoring.yml: icmpping[<target>] items don't need a
+# host interface (Simple check is one of the item types that doesn't
+# require one — see the Zabbix API item object docs), so this hangs the
+# item on opnsense.home.lan purely as a sensible home for it, not because
+# the check goes through that host's own interface.
+#
+# WAN_GATEWAY_IP confirmed two ways: OPNsense's own routing table via
+# GET /api/diagnostics/interface/get_routes (default route, gateway
+# 74.140.32.1, netif vtnet1/ETH3_WAN), and independently against the live
+# Interfaces: Overview screen in the OPNsense UI (2026-09-28) — same value
+# both times. Not the WAN interface's own DHCP address (74.140.37.94):
+# pinging the gateway catches "the ISP link is down" even when OPNsense's
+# own WAN interface still holds its lease, which is the actual failure mode
+# worth alerting on.
+#
+# Single WAN, no failover gateway group — confirmed with the user
+# beforehand, so there is exactly one item/trigger pair here, not a loop.
+#
+# item.delete / trigger.delete are refused to this repo's Zabbix API token
+# (see zabbix-metallb-vip-monitoring.yml's remediation section for the
+# consequences of getting a Zabbix object play wrong) — get-then-create,
+# same as every other *-zabbix-*.yml play in this repo, so a bad run can
+# always be corrected forward, never needs a delete.
+#
+# no_log: true on every API call here, not just the header masking. 2026-09-27's
+# second zabbix_api_token leak (see host_vars/zabbix.home.lan.yml) happened
+# because a uri task's own error message — not a grep, an Ansible module
+# exception — put the raw Authorization header into the transcript. None of
+# the older zabbix-*.yml plays in this repo have this yet; this one does.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-opnsense-wan-gateway-monitoring.yml --check --diff
+#   ansible-playbook playbooks/zabbix-opnsense-wan-gateway-monitoring.yml
+
+- name: Alert on OPNsense WAN gateway reachability
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    # Vaulted in host_vars/zabbix.home.lan.yml, read via hostvars (see
+    # that file for why this isn't a plain group_vars/vars_files include).
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+
+    item_host: "opnsense.home.lan"
+    wan_gateway_ip: "74.140.32.1"
+    wan_item_key: "icmpping[{{ wan_gateway_ip }}]"
+    wan_item_name: "WAN gateway ({{ wan_gateway_ip }}) reachability"
+    wan_trigger_description: "OPNsense WAN gateway ({{ wan_gateway_ip }}) is unreachable"
+
+  tasks:
+    - name: "{{ item_host }} — resolve the Zabbix host id"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: ["hostid", "host"]
+            filter: {host: ["{{ item_host }}"]}
+          id: 1
+      register: host_lookup
+      check_mode: false
+      no_log: true
+      failed_when: >-
+        host_lookup.json.error is defined
+        or (host_lookup.json.result | default([]) | length) != 1
+
+    - name: "{{ item_host }} — set the host id"
+      ansible.builtin.set_fact:
+        item_hostid: "{{ host_lookup.json.result[0].hostid }}"
+
+    - name: "{{ item_host }} — look for the existing WAN gateway item"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ item_hostid }}"]
+            search: {key_: "{{ wan_item_key }}"}
+          id: 1
+      register: item_lookup
+      check_mode: false
+      no_log: true
+      failed_when: item_lookup.json.error is defined
+
+    - name: "{{ item_host }} — create the WAN gateway item"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item_hostid }}"
+            name: "{{ wan_item_name }}"
+            key_: "{{ wan_item_key }}"
+            type: 3        # Simple check — polled by the Zabbix server itself
+            value_type: 3  # numeric unsigned (icmpping returns 0/1)
+            delay: "1m"
+            description: >-
+              1 = the WAN gateway answered ICMP on the last poll, 0 = it
+              didn't. No OPNsense agent involved — the Zabbix server pings
+              {{ wan_gateway_ip }} directly, so this still fires if OPNsense
+              itself is unreachable.
+          id: 1
+      register: item_create
+      when: (item_lookup.json.result | default([]) | length) == 0
+      no_log: true
+      changed_when: item_create.json.result is defined
+      failed_when: item_create.json.error is defined
+
+    - name: "{{ item_host }} — look for the existing WAN gateway trigger"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: ["triggerid", "description"]
+            host: "{{ item_host }}"
+          id: 1
+      register: trigger_lookup
+      check_mode: false
+      no_log: true
+      failed_when: trigger_lookup.json.error is defined
+
+    - name: "{{ item_host }} — create the WAN gateway trigger"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "{{ wan_trigger_description }}"
+            # Three consecutive failed polls (three minutes at the 1m delay
+            # above), so one dropped ping isn't an alert — same reasoning
+            # and same #3 window as the MetalLB VIP triggers.
+            expression: "max(/{{ item_host }}/{{ wan_item_key }},#3)=0"
+            priority: 4     # High — full household WAN loss, not one service
+            manual_close: 0
+            tags:
+              - {tag: "component", value: "opnsense"}
+              - {tag: "target", value: "wan-gateway"}
+          id: 1
+      register: trigger_create
+      when: >-
+        (trigger_lookup.json.result
+         | selectattr('description', 'eq', wan_trigger_description)
+         | list | length) == 0
+      no_log: true
+      changed_when: trigger_create.json.result is defined
+      failed_when: trigger_create.json.error is defined
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ item_host }}: item {{ wan_item_key }}
+          {{ 'created' if (item_create.changed | default(false)) else 'already present' }},
+          trigger "{{ wan_trigger_description }}"
+          {{ 'created' if (trigger_create.changed | default(false)) else 'already present' }}.
