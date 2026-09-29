@@ -22,15 +22,19 @@
 # Single client configured, so this hangs one item off $.rows[0].status
 # rather than looping — revisit if a second OpenVPN client is ever added.
 #
-# WireGuard response shape NOT YET CONFIRMED — the "VPN: WireGuard: Status"
-# privilege didn't exist on any key until this playbook's credential was
-# created, so GET /api/wireguard/service/status has never been queried
-# successfully. The WireGuard section below is deliberately a read-only
-# diagnostic task, not an item, until a real response is seen: this repo's
-# standing lesson (see the OPNsense goal-1 handoff, 2026-09-28) is not to
-# guess FreeBSD/OPNsense-specific output shapes from memory. Run this
-# playbook once, read the "WireGuard raw response" debug output, then fill
-# in the item/trigger below it before the next run.
+# WireGuard response shape confirmed live 2026-09-29, in two steps (don't
+# guess OPNsense-specific output shapes from memory — see the goal-1 handoff,
+# 2026-09-28):
+#   GET /api/wireguard/service/status  -> {"status":"unknown","widget":{...}}
+#     A generic service-running summary, not per-tunnel data. Not used.
+#   GET /api/wireguard/service/show    -> flat rows mixing type:"interface"
+#     (one per wg0/wg1, own up/down "status") and type:"peer" (one per
+#     remote client, "peer-status" of online/offline). Used here.
+# The item hangs off each interface row's OWN status, filtered by name
+# ("vpn"/"vpn_443") and type=="interface" — NOT peer-status, which reads
+# "offline" for every peer whenever no remote client happens to be
+# connected. That is the normal idle state for a remote-access VPN, not a
+# fault, so alerting on it would be permanent false-positive noise.
 #
 # item.delete / trigger.delete are refused to this repo's Zabbix API token —
 # get-then-create throughout, same as every other *-zabbix-*.yml play here.
@@ -62,6 +66,12 @@
     openvpn_item_key: "openvpn.status"
     openvpn_item_name: "OpenVPN client (NordVPN_CA1520) status"
     openvpn_trigger_description: "OpenVPN client (NordVPN_CA1520) is not connected"
+
+    # name/ifname match service/show's own "name"/"if" fields exactly —
+    # confirmed live, see header.
+    wireguard_interfaces:
+      - {name: "vpn", ifname: "wg0"}
+      - {name: "vpn_443", ifname: "wg1"}
 
   tasks:
     - name: "{{ item_host }} — resolve the Zabbix host id"
@@ -193,43 +203,96 @@
       failed_when: openvpn_trigger_create.json.error is defined
 
     # ------------------------------------------------------------ WireGuard
-    # Diagnostic only — see header. Not gated behind no_log: the response
-    # body carries peer/handshake data, not the credential (the credential
-    # is only ever in the Authorization header, which IS suppressed below).
 
-    - name: "{{ item_host }} — WireGuard status (diagnostic read, no item created yet)"
+    - name: "{{ item_host }} — look for existing WireGuard status items"
       ansible.builtin.uri:
-        url: "{{ opnsense_api_base }}/wireguard/service/status"
-        method: GET
-        url_username: "{{ opnsense_zabbix_api_key }}"
-        url_password: "{{ opnsense_zabbix_api_secret }}"
-        force_basic_auth: true
-        ca_path: "{{ opnsense_api_ca_file }}"
-      register: wireguard_probe
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "key_"]
+            hostids: ["{{ item_hostid }}"]
+            search: {key_: "wireguard.status["}
+          id: 1
+      register: wireguard_item_lookup
       check_mode: false
       no_log: true
-      failed_when: false
+      failed_when: wireguard_item_lookup.json.error is defined
 
-    - name: "{{ item_host }} — WireGuard raw response (safe to read: no credential in the body)"
-      ansible.builtin.debug:
-        msg: "HTTP {{ wireguard_probe.status }} — {{ wireguard_probe.json | default(wireguard_probe.content) }}"
-
-    - name: "{{ item_host }} — WireGuard service/show (diagnostic read, no item created yet)"
+    - name: "{{ item_host }} — create missing WireGuard status items"
       ansible.builtin.uri:
-        url: "{{ opnsense_api_base }}/wireguard/service/show"
-        method: GET
-        url_username: "{{ opnsense_zabbix_api_key }}"
-        url_password: "{{ opnsense_zabbix_api_secret }}"
-        force_basic_auth: true
-        ca_path: "{{ opnsense_api_ca_file }}"
-      register: wireguard_show_probe
-      check_mode: false
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item_hostid }}"
+            name: "WireGuard server ({{ item.name }} / {{ item.ifname }}) status"
+            key_: "wireguard.status[{{ item.name }}]"
+            type: 19       # HTTP agent — polled by the Zabbix server itself
+            value_type: 1  # character ("up"/"down")
+            delay: "1m"
+            url: "{{ opnsense_api_base }}/wireguard/service/show"
+            authtype: 1    # basic auth
+            username: "{{ opnsense_zabbix_api_key }}"
+            password: "{{ opnsense_zabbix_api_secret }}"
+            preprocessing:
+              - type: 12   # JSONPath
+                params: "$.rows[?(@.name == '{{ item.name }}' && @.type == 'interface')].status.first()"
+                error_handler: 0
+            description: >-
+              Polls the OPNsense API directly (no agent involved) for the
+              {{ item.ifname }} WireGuard interface's own up/down status —
+              not individual peer connection state, which reads "offline"
+              whenever no remote client happens to be connected (the normal
+              idle state for this VPN, not a fault).
+          id: 1
+      register: wireguard_item_create
+      loop: "{{ wireguard_interfaces }}"
+      loop_control: {label: "{{ item.name }}"}
+      when: >-
+        ('wireguard.status[' ~ item.name ~ ']')
+        not in (wireguard_item_lookup.json.result | default([]) | map(attribute='key_') | list)
       no_log: true
-      failed_when: false
+      changed_when: wireguard_item_create.json.result is defined
+      failed_when: wireguard_item_create.json.error is defined
 
-    - name: "{{ item_host }} — WireGuard service/show raw response"
-      ansible.builtin.debug:
-        msg: "HTTP {{ wireguard_show_probe.status }} — {{ wireguard_show_probe.json | default(wireguard_show_probe.content) }}"
+    - name: "{{ item_host }} — create missing WireGuard triggers"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "WireGuard server ({{ item.name }} / {{ item.ifname }}) is down"
+            # Three consecutive polls not "up" — same #3 debounce as every
+            # other trigger in this play.
+            expression: 'count(/{{ item_host }}/wireguard.status[{{ item.name }}],#3,"ne","up")=3'
+            priority: 3     # Average
+            manual_close: 0
+            tags:
+              - {tag: "component", value: "opnsense"}
+              - {tag: "target", value: "wireguard"}
+          id: 1
+      register: wireguard_trigger_create
+      loop: "{{ wireguard_interfaces }}"
+      loop_control: {label: "{{ item.name }}"}
+      when: >-
+        ("WireGuard server (" ~ item.name ~ " / " ~ item.ifname ~ ") is down")
+        not in (trigger_lookup.json.result | default([]) | map(attribute='description') | list)
+      no_log: true
+      changed_when: wireguard_trigger_create.json.result is defined
+      failed_when: wireguard_trigger_create.json.error is defined
 
     - name: Report
       ansible.builtin.debug:
@@ -238,5 +301,7 @@
           {{ 'created' if (openvpn_item_create.changed | default(false)) else 'already present' }},
           trigger "{{ openvpn_trigger_description }}"
           {{ 'created' if (openvpn_trigger_create.changed | default(false)) else 'already present' }}.
-          WireGuard: diagnostic only this run — see the raw response above
-          and fill in its item/trigger next.
+          WireGuard items created: {{ wireguard_item_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          of {{ wireguard_interfaces | length }}.
+          WireGuard triggers created: {{ wireguard_trigger_create.results | default([]) | rejectattr('skipped', 'defined') | list | length }}
+          of {{ wireguard_interfaces | length }}.
