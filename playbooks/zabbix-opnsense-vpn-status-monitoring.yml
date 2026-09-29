@@ -294,13 +294,6 @@
       changed_when: wireguard_trigger_create.json.result is defined
       failed_when: wireguard_trigger_create.json.error is defined
 
-    - name: "TEMP DIAGNOSTIC — what actually matched"
-      ansible.builtin.debug:
-        msg:
-          openvpn_items_found: "{{ openvpn_item_lookup.json.result }}"
-          wireguard_items_found: "{{ wireguard_item_lookup.json.result }}"
-          all_triggers_on_host: "{{ trigger_lookup.json.result }}"
-
     - name: Report
       ansible.builtin.debug:
         msg: >-
