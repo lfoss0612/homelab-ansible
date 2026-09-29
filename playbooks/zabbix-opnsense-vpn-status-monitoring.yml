@@ -214,6 +214,23 @@
       ansible.builtin.debug:
         msg: "HTTP {{ wireguard_probe.status }} — {{ wireguard_probe.json | default(wireguard_probe.content) }}"
 
+    - name: "{{ item_host }} — WireGuard service/show (diagnostic read, no item created yet)"
+      ansible.builtin.uri:
+        url: "{{ opnsense_api_base }}/wireguard/service/show"
+        method: GET
+        url_username: "{{ opnsense_zabbix_api_key }}"
+        url_password: "{{ opnsense_zabbix_api_secret }}"
+        force_basic_auth: true
+        ca_path: "{{ opnsense_api_ca_file }}"
+      register: wireguard_show_probe
+      check_mode: false
+      no_log: true
+      failed_when: false
+
+    - name: "{{ item_host }} — WireGuard service/show raw response"
+      ansible.builtin.debug:
+        msg: "HTTP {{ wireguard_show_probe.status }} — {{ wireguard_show_probe.json | default(wireguard_show_probe.content) }}"
+
     - name: Report
       ansible.builtin.debug:
         msg: >-
