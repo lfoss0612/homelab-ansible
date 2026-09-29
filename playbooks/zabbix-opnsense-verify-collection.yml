@@ -1,0 +1,83 @@
+---
+# One-off verification: did the new WAN/OpenVPN/WireGuard HTTP agent and
+# simple-check items actually start collecting, or are they stuck in a
+# "not supported" state (bad auth, TLS trust, or a wrong JSONPath)? Item
+# creation succeeding proves nothing about whether the first poll worked.
+# Read-only. Not part of the create-then-verify playbooks themselves so
+# it can be re-run any time without touching monitoring config.
+#
+# Usage:
+#   ansible-playbook playbooks/zabbix-opnsense-verify-collection.yml
+
+- name: Verify the new OPNsense monitoring items are actually collecting
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+    item_host: "opnsense.home.lan"
+
+  tasks:
+    - name: "{{ item_host }} — read state of the new items"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["key_", "name", "error", "lastvalue", "status"]
+            host: "{{ item_host }}"
+            search: {key_: "icmpping[74.140.32.1]"}
+            searchByAny: true
+          id: 1
+      register: wan_check
+      check_mode: false
+      no_log: true
+      failed_when: wan_check.json.error is defined
+
+    - name: "{{ item_host }} — read state of the OpenVPN item"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["key_", "name", "error", "lastvalue", "status"]
+            host: "{{ item_host }}"
+            search: {key_: "openvpn.status"}
+          id: 1
+      register: openvpn_check
+      check_mode: false
+      no_log: true
+      failed_when: openvpn_check.json.error is defined
+
+    - name: "{{ item_host }} — read state of the WireGuard items"
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["key_", "name", "error", "lastvalue", "status"]
+            host: "{{ item_host }}"
+            search: {key_: "wireguard.status["}
+          id: 1
+      register: wireguard_check
+      check_mode: false
+      no_log: true
+      failed_when: wireguard_check.json.error is defined
+
+    - name: Report collection state (no secrets in this data — items/errors/values only)
+      ansible.builtin.debug:
+        msg: "{{ wan_check.json.result + openvpn_check.json.result + wireguard_check.json.result }}"
