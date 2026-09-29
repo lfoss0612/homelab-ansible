@@ -50,6 +50,14 @@
 
     item_host: "opnsense.home.lan"
     opnsense_api_base: "https://opnsense.home.lan/api"
+    # opnsense_zabbix_api_key/_secret and opnsense_api_ca_file live in
+    # group_vars/network_appliances.yml, scoped to the network_appliances
+    # group (opnsense.home.lan) — this play targets localhost like every
+    # other zabbix-*.yml play here, so they need the same hostvars lookup
+    # as zabbix_api_token above, not plain group_vars inheritance.
+    opnsense_zabbix_api_key: "{{ hostvars['opnsense.home.lan'].opnsense_zabbix_api_key }}"
+    opnsense_zabbix_api_secret: "{{ hostvars['opnsense.home.lan'].opnsense_zabbix_api_secret }}"
+    opnsense_api_ca_file: "{{ hostvars['opnsense.home.lan'].opnsense_api_ca_file }}"
 
     openvpn_item_key: "openvpn.status"
     openvpn_item_name: "OpenVPN client (NordVPN_CA1520) status"
