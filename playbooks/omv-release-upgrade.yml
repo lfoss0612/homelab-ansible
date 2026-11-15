@@ -1,0 +1,127 @@
+---
+# OpenMediaVault 7 (Debian 12 bookworm) -> OMV 8 "Synchrony" (Debian 13 trixie)
+# on omv.home.lan (VM 102 on pve).
+#
+# Usage (always --check --diff first):
+#   ansible-playbook playbooks/omv-release-upgrade.yml --tags prep --check --diff
+#   ansible-playbook playbooks/omv-release-upgrade.yml --tags prep
+#   ansible-playbook playbooks/omv-release-upgrade.yml --tags run -e omv_release_upgrade_go=true
+#
+# Take a PBS backup first (playbooks/release-upgrade-prep.yml --tags omv) and
+# verify it is listed. The upgrade is not reversible; the backup is the
+# rollback. The VM is a NAS (NFS exports + SMB shares): pick a quiet window.
+#
+# What /usr/sbin/omv-release-upgrade already handles (read 2026-11-15):
+#   * runs omv-upgrade first (fully updates OMV 7), so no separate patch run
+#   * pre.d: rewrites the OMV repos to synchrony, removes the kernel-backports
+#     repo, rewrites omv-extras + omvdocker sources bookworm->trixie and
+#     sandworm->synchrony, seds /etc/apt/sources.list, backs up config.xml
+#   * dist-upgrade with --force-confdef --force-confold (keeps your configs)
+#   * post.d: deploys config with omv-salt, autoremove, touches
+#     /run/reboot-required
+# What it does NOT handle, and this playbook does:
+#   * /etc/apt/sources.list.d/pbs-client.list (Proxmox backup-client) is
+#     pinned to bookworm. Left alone, dist-upgrade would see bookworm builds
+#     of proxmox-backup-client against trixie libraries. Both suites exist
+#     upstream (HTTP 200 checked), so it is repointed to trixie.
+#
+# The script opens two whiptail dialogs (confirm at the start, OK at the end)
+# and needs a TTY. A shim `whiptail` that exits 0 answers both, so the script
+# can run detached under systemd and survive an SSH/ansible disconnect --
+# the same approach used for the zabbix release upgrade. Nothing else about
+# the vendor script is changed.
+#
+# Does NOT reboot. After it finishes, check the journal, then reboot by hand.
+
+- name: OMV 7 -> 8 release upgrade
+  hosts: omv.home.lan
+  become: true
+  gather_facts: false
+  vars:
+    omv_shim_dir: /var/tmp/omv-release-upgrade-shim
+    omv_unit: omv-release-upgrade
+  tasks:
+    - name: Read OS and OMV versions
+      ansible.builtin.shell: |
+        . /etc/os-release
+        echo "$VERSION_CODENAME"
+        dpkg-query -W -f='${Version}\n' openmediavault
+      register: omv_versions
+      changed_when: false
+      check_mode: false
+      tags: [prep, run]
+
+    - name: Assert this is still Debian 12 / OMV 7
+      ansible.builtin.assert:
+        that:
+          - omv_versions.stdout_lines[0] == 'bookworm'
+          - omv_versions.stdout_lines[1] is match('^7\.')
+        fail_msg: >-
+          {{ inventory_hostname }} is not Debian 12 / OMV 7
+          ({{ omv_versions.stdout_lines | join(' / ') }}); refusing.
+      tags: [prep, run]
+
+    - name: Check the trixie suite exists for the Proxmox backup-client repo
+      ansible.builtin.uri:
+        url: http://download.proxmox.com/debian/pbs-client/dists/trixie/Release
+        method: HEAD
+        status_code: 200
+      check_mode: false
+      tags: [prep]
+
+    - name: Point the Proxmox backup-client repo at trixie
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list.d/pbs-client.list
+        regexp: '\bbookworm\b'
+        replace: trixie
+      tags: [prep]
+
+    - name: Install the whiptail shim directory
+      ansible.builtin.file:
+        path: "{{ omv_shim_dir }}"
+        state: directory
+        mode: "0755"
+      tags: [run]
+
+    - name: Install the whiptail shim (answers both dialogs with OK/yes)
+      ansible.builtin.copy:
+        dest: "{{ omv_shim_dir }}/whiptail"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          exit 0
+      tags: [run]
+
+    - name: Require explicit go-ahead to start the real upgrade
+      ansible.builtin.assert:
+        that: omv_release_upgrade_go | default(false) | bool
+        fail_msg: >-
+          Refusing to start the OMV release upgrade. Confirm a fresh PBS
+          backup exists and the NAS can be offline, then pass
+          -e omv_release_upgrade_go=true.
+      tags: [run]
+
+    - name: Ensure no release upgrade is already running
+      ansible.builtin.command: "systemctl is-active {{ omv_unit }}"
+      register: omv_unit_state
+      failed_when: omv_unit_state.stdout == 'active'
+      changed_when: false
+      check_mode: false
+      tags: [run]
+
+    - name: Start omv-release-upgrade as a detached systemd unit
+      ansible.builtin.command: >-
+        systemd-run --unit={{ omv_unit }} --collect
+        --setenv=PATH={{ omv_shim_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        --setenv=DEBIAN_FRONTEND=noninteractive
+        --setenv=APT_LISTCHANGES_FRONTEND=none
+        /usr/sbin/omv-release-upgrade
+      changed_when: true
+      tags: [run]
+
+    - name: Say how to watch it
+      ansible.builtin.debug:
+        msg: >-
+          Started. Watch with: journalctl -fu {{ omv_unit }} (on omv), or
+          systemctl is-active {{ omv_unit }}. Reboot by hand when it ends.
+      tags: [run]
