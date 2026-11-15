@@ -1,0 +1,161 @@
+---
+# Pre-flight for the OS release upgrades of zabbix (Ubuntu 24.04 -> 26.04 LTS)
+# and omv (Debian 12 -> 13 / OpenMediaVault 7 -> 8).
+#
+# Usage (always --check --diff first; command tasks report "skipping" under
+# --check, which is the module having no check mode, not a false `when`):
+#   ansible-playbook playbooks/release-upgrade-prep.yml --tags zabbix --check --diff -e confirm_pve_router=true
+#   ansible-playbook playbooks/release-upgrade-prep.yml --tags zabbix -e confirm_pve_router=true
+#   ansible-playbook playbooks/release-upgrade-prep.yml --tags omv --check --diff
+#   ansible-playbook playbooks/release-upgrade-prep.yml --tags omv
+#
+# What it does, per VM:
+#   backup  Proxmox vzdump in SNAPSHOT mode to PBS (guest agent freezes the
+#           filesystem, so monitoring / the NAS stay up). A release upgrade
+#           is not reversible, and as of 2026-11-15 the scheduled backup jobs
+#           for pve-router guests (backup-9500b0ba-68fc) are `enabled 0` --
+#           the newest VM 101 backup was 2026-08-30 and the newest VM 102
+#           backup 2026-08-16 -- so this is the only recent restore point.
+#   grow    zabbix only. Root was 83% full (6.1G free) with 16G of MySQL data
+#           on it, too tight for a release upgrade plus the MySQL 8.0 -> 8.4
+#           in-place migration. Grows the virtual disk, the partition, the PV
+#           and the LV + ext4 online. Idempotent: skipped once the disk is at
+#           or above the target size.
+#
+# omv: only the 32G root disk is backed up. Its data disks are host
+# passthrough devices already marked backup=0 in the VM config, so vzdump
+# skips them. A Proxmox *snapshot* is not possible with passthrough disks;
+# the PBS backup is the rollback path.
+#
+# Does NOT upgrade anything. The release upgrades themselves are separate
+# playbooks, run only after this one's backup is verified in PBS.
+
+# ---------------------------------------------------------------- zabbix ----
+- name: Back up and grow zabbix (VM 101) on its hypervisor
+  hosts: pve-router.home.lan
+  become: true
+  gather_facts: false
+  tags: [zabbix]
+  vars:
+    zabbix_vmid: 101
+    zabbix_pbs_storage: pbs_pve-router
+    zabbix_disk: scsi0
+    zabbix_target_size_gib: 60
+  tasks:
+    - name: Require explicit confirmation for pve-router
+      ansible.builtin.import_tasks: tasks/confirm-pve-router.yml
+
+    - name: Read VM config
+      ansible.builtin.command: "qm config {{ zabbix_vmid }}"
+      register: zabbix_qm_config
+      changed_when: false
+      check_mode: false
+      tags: [backup, grow]
+
+    - name: Assert it is the zabbix VM, with the guest agent enabled
+      ansible.builtin.assert:
+        that:
+          - "'name: zabbix' in zabbix_qm_config.stdout"
+          - "'agent: 1' in zabbix_qm_config.stdout"
+        fail_msg: "VM {{ zabbix_vmid }} is not the zabbix VM or has no guest agent; refusing."
+      tags: [backup, grow]
+
+    - name: Back up VM (snapshot mode, to PBS)
+      ansible.builtin.command: >-
+        vzdump {{ zabbix_vmid }} --mode snapshot
+        --storage {{ zabbix_pbs_storage }}
+        --notes-template pre-release-upgrade-26.04
+      async: 3600
+      poll: 30
+      changed_when: true
+      tags: [backup]
+
+    - name: Work out the current disk size (GiB)
+      ansible.builtin.set_fact:
+        zabbix_current_gib: >-
+          {{ (zabbix_qm_config.stdout
+              | regex_search(zabbix_disk ~ ':.*size=([0-9]+)G', '\1'))[0] | int }}
+      tags: [grow]
+
+    - name: Grow the virtual disk to the target size
+      ansible.builtin.command: "qm resize {{ zabbix_vmid }} {{ zabbix_disk }} {{ zabbix_target_size_gib }}G"
+      when: zabbix_current_gib | int < zabbix_target_size_gib | int
+      changed_when: true
+      tags: [grow]
+
+- name: Grow zabbix's partition, PV and root LV online
+  hosts: zabbix.home.lan
+  become: true
+  gather_facts: false
+  tags: [zabbix, grow]
+  tasks:
+    # growpart exits 1 with "NOCHANGE" when there is nothing to grow, which
+    # is the already-done case, not a failure.
+    - name: Grow partition 3 of /dev/sda
+      ansible.builtin.command: growpart /dev/sda 3
+      register: zabbix_growpart
+      changed_when: zabbix_growpart.rc == 0
+      failed_when: zabbix_growpart.rc not in [0, 1] or
+        (zabbix_growpart.rc == 1 and 'NOCHANGE' not in zabbix_growpart.stdout)
+
+    - name: Resize the LVM physical volume
+      ansible.builtin.command: pvresize /dev/sda3
+      # Output is "1 physical volume(s) resized or updated / 0 ... not resized".
+      changed_when: "'1 physical volume(s) resized' in pvresize_out.stdout"
+      register: pvresize_out
+
+    - name: Extend the root LV and its ext4 filesystem
+      ansible.builtin.command: lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+      register: zabbix_lvextend
+      # rc 5 = "matches existing size", i.e. already extended.
+      changed_when: zabbix_lvextend.rc == 0
+      failed_when: zabbix_lvextend.rc not in [0, 5]
+
+    - name: Report root filesystem usage
+      ansible.builtin.command: df -h /
+      register: zabbix_df
+      changed_when: false
+      check_mode: false
+
+    - name: Show it
+      ansible.builtin.debug:
+        var: zabbix_df.stdout_lines
+
+# ------------------------------------------------------------------- omv ----
+- name: Back up omv (VM 102) on its hypervisor
+  hosts: pve.home.lan
+  become: true
+  gather_facts: false
+  tags: [omv]
+  vars:
+    omv_vmid: 102
+    omv_pbs_storage: pbs_pve
+  tasks:
+    - name: Read VM config
+      ansible.builtin.command: "qm config {{ omv_vmid }}"
+      register: omv_qm_config
+      changed_when: false
+      check_mode: false
+
+    - name: Assert it is omv, has the guest agent, and passthrough disks are excluded from backup
+      ansible.builtin.assert:
+        that:
+          - "'name: omv' in omv_qm_config.stdout"
+          - "'agent: 1' in omv_qm_config.stdout"
+          # Every non-vm_pool disk must carry backup=0, or vzdump would try
+          # to copy ~30 TB of passthrough disks.
+          - >-
+            omv_qm_config.stdout_lines
+            | select('match', '^scsi[1-9]:')
+            | reject('search', 'backup=0')
+            | list | length == 0
+        fail_msg: "VM {{ omv_vmid }} is not omv, has no guest agent, or a data disk is not backup=0; refusing."
+
+    - name: Back up VM (snapshot mode, to PBS)
+      ansible.builtin.command: >-
+        vzdump {{ omv_vmid }} --mode snapshot
+        --storage {{ omv_pbs_storage }}
+        --notes-template pre-release-upgrade-debian13
+      async: 3600
+      poll: 30
+      changed_when: true
