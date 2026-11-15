@@ -93,6 +93,9 @@
       changed_when: false
       check_mode: false
       failed_when: omv_pve_key_check.stdout | int < 1
+      # Under --check the keyring is never written, so there is nothing to
+      # inspect yet.
+      when: not ansible_check_mode
       tags: [prep]
 
     - name: Point the Proxmox backup-client repo at trixie, pinned to that keyring
@@ -109,6 +112,9 @@
       changed_when: false
       check_mode: false
       failed_when: omv_apt_update.rc != 0 or 'GPG error' in omv_apt_update.stderr
+      # Under --check the repo file is not rewritten, so this would just
+      # re-report the current (broken) state rather than test the fix.
+      when: not ansible_check_mode
       tags: [prep]
 
     - name: Install the whiptail shim directory
