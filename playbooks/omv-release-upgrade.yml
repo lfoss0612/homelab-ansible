@@ -23,7 +23,9 @@
 #   * /etc/apt/sources.list.d/pbs-client.list (Proxmox backup-client) is
 #     pinned to bookworm. Left alone, dist-upgrade would see bookworm builds
 #     of proxmox-backup-client against trixie libraries. Both suites exist
-#     upstream (HTTP 200 checked), so it is repointed to trixie.
+#     upstream (HTTP 200 checked), so it is repointed to trixie -- and pinned
+#     to the Proxmox trixie keyring, because that suite uses a different
+#     signing key (see the comment on those tasks).
 #
 # The script opens two whiptail dialogs (confirm at the start, OK at the end)
 # and needs a TTY. A shim `whiptail` that exits 0 answers both, so the script
@@ -69,11 +71,44 @@
       check_mode: false
       tags: [prep]
 
-    - name: Point the Proxmox backup-client repo at trixie
-      ansible.builtin.replace:
-        path: /etc/apt/sources.list.d/pbs-client.list
-        regexp: '\bbookworm\b'
-        replace: trixie
+    # The trixie suite is signed with a different Proxmox release key
+    # (A7BCD1420BFE778E) than the bookworm one omv trusts. Found 2026-11-15:
+    # repointing the suite alone makes `apt-get update` fail with NO_PUBKEY,
+    # and omv-release-upgrade runs `set -e` + `apt-get update` first, so it
+    # would abort before changing anything. Install the vendor keyring (the
+    # same URL the OMV script uses for its own Proxmox kernel repo), check it
+    # actually contains that key id, and pin the repo to it with signed-by.
+    - name: Install the Proxmox trixie archive keyring
+      ansible.builtin.get_url:
+        url: https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg
+        dest: /usr/share/keyrings/proxmox-archive-keyring.gpg
+        mode: "0644"
+      tags: [prep]
+
+    - name: Verify the keyring contains the key trixie is signed with
+      ansible.builtin.shell: >-
+        gpg --show-keys --with-colons /usr/share/keyrings/proxmox-archive-keyring.gpg
+        | grep -c A7BCD1420BFE778E
+      register: omv_pve_key_check
+      changed_when: false
+      check_mode: false
+      failed_when: omv_pve_key_check.stdout | int < 1
+      tags: [prep]
+
+    - name: Point the Proxmox backup-client repo at trixie, pinned to that keyring
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/pbs-client.list
+        mode: "0644"
+        content: |
+          deb [signed-by=/usr/share/keyrings/proxmox-archive-keyring.gpg] http://download.proxmox.com/debian/pbs-client trixie main
+      tags: [prep]
+
+    - name: Prove apt can now read the repo (an unsigned repo would abort the upgrade)
+      ansible.builtin.command: apt-get update
+      register: omv_apt_update
+      changed_when: false
+      check_mode: false
+      failed_when: omv_apt_update.rc != 0 or 'GPG error' in omv_apt_update.stderr
       tags: [prep]
 
     - name: Install the whiptail shim directory
