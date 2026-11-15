@@ -222,6 +222,18 @@
       failed_when: k8s_upgradable.stdout | trim != '0'
       tags: [upgrade]
 
+    # do-release-upgrade refuses to start while a reboot is pending ("You have
+    # not rebooted after updating a package which requires a reboot"). Found
+    # 2026-11-15 on k8s-worker: patching left the flag set, and the unit
+    # failed one second after starting. Catch it here instead.
+    - name: Assert no reboot is pending
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: k8s_reboot_flag
+      check_mode: false
+      failed_when: k8s_reboot_flag.stat.exists
+      tags: [upgrade]
+
     - name: Assert a release upgrade is offered
       ansible.builtin.shell: do-release-upgrade -c 2>&1 | tail -3
       register: k8s_rel_check
@@ -287,6 +299,24 @@
       delegate_to: "{{ k8s_control_plane }}"
       register: k8s_ready
       until: k8s_ready.rc == 0
+      retries: 40
+      delay: 15
+      changed_when: false
+      check_mode: false
+      tags: [post]
+
+    # The kubelet reports Ready before Longhorn's manager on the node has
+    # finished starting; on 2026-11-15 it crash-looped once on a startup race
+    # and volumes could not attach until it recovered. Do not hand the node
+    # back to the scheduler before Longhorn agrees it is Ready.
+    - name: Wait for Longhorn to report the node Ready
+      ansible.builtin.shell: >-
+        {{ k8s_kubectl }} get nodes.longhorn.io -n longhorn-system {{ inventory_hostname }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_lh_ready
+      until: k8s_lh_ready.stdout == 'True'
       retries: 40
       delay: 15
       changed_when: false

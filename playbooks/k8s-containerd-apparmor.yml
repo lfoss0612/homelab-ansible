@@ -1,0 +1,173 @@
+---
+# Stop containerd applying its default AppArmor profile on a 26.04 RKE2 node.
+#
+# Usage -- ONE node, cordoned first (playbooks/k8s-node-release-upgrade.yml
+# --tags drain), never the control plane without the allow flag:
+#   NODE=k8s-worker.home.lan
+#   ansible-playbook playbooks/k8s-containerd-apparmor.yml -e k8s_apparmor_node=$NODE --check --diff
+#   ansible-playbook playbooks/k8s-containerd-apparmor.yml -e k8s_apparmor_node=$NODE
+#   ansible-playbook playbooks/k8s-containerd-apparmor.yml -e k8s_apparmor_node=$NODE --tags restart -e k8s_apparmor_restart=true
+#
+# Why (found 2026-11-15 on k8s-worker, the first node taken to Ubuntu 26.04
+# LTS): with AppArmor 5.0.2 and kernel 7.0 the profile containerd generates
+# (`cri-containerd.apparmor.d`) denies signals and ptrace reads inside
+# containers, because the peer is labelled
+# `cri-containerd.apparmor.d//&unconfined`, which the profile does not allow.
+# Observed: ~380 ptrace + ~184 signal denials for ingress-nginx, plus frr-k8s,
+# the MetalLB speaker, zabbix_agent2, Longhorn's livenessprobe and `gosu`.
+# `gosu` is the entrypoint of the mongo image, and its Go-runtime preemption
+# signals (urg, rtmin+1) are denied, so `mongod` never starts: exit code 2,
+# no output, killed by the liveness probe. MongoDB is pinned to k8s-worker by
+# node affinity, so it stays down.
+#
+# What this does: RKE2's generated containerd config imports
+# /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.d/*.toml, so one
+# drop-in sets `disable_apparmor = true` and the generated file is left
+# untouched. This disables the *container* profile only; the host's own
+# AppArmor profiles are unaffected. Pods keep whatever isolation their
+# securityContext (seccomp, capabilities, runAsNonRoot) already gives them.
+#
+# The setting only applies to containers created after containerd restarts.
+# RKE2 runs containerd as a child that survives `systemctl restart
+# rke2-agent` (KillMode=process), so --tags restart stops the agent, runs
+# rke2-killall.sh to stop the node's containers and containerd, then starts
+# the agent. On a cordoned, drained node that is a clean cold start.
+
+- name: Disable containerd's default AppArmor profile on one RKE2 node
+  hosts: "{{ k8s_apparmor_node | default('') }}"
+  become: true
+  gather_facts: false
+  vars:
+    k8s_control_plane: k8s-master.home.lan
+    k8s_kubectl: /var/lib/rancher/rke2/bin/kubectl
+    k8s_kubectl_env: { KUBECONFIG: /etc/rancher/rke2/rke2.yaml }
+    k8s_crictl: /var/lib/rancher/rke2/bin/crictl
+    k8s_containerd_dropin_dir: /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.d
+    k8s_containerd_dropin: "{{ k8s_containerd_dropin_dir }}/10-disable-apparmor.toml"
+  tasks:
+    - name: Require a node to be named
+      ansible.builtin.assert:
+        that: k8s_apparmor_node is defined and k8s_apparmor_node | length > 0
+        fail_msg: "Pass -e k8s_apparmor_node=<inventory hostname>."
+      run_once: true
+      delegate_to: localhost
+      become: false
+      tags: [always]
+
+    - name: Refuse the control-plane node unless explicitly allowed
+      ansible.builtin.assert:
+        that: >-
+          inventory_hostname != k8s_control_plane
+          or (k8s_upgrade_allow_control_plane | default(false) | bool)
+        fail_msg: >-
+          {{ inventory_hostname }} is the only control-plane/etcd node;
+          restarting its containerd takes the API down. Pass
+          -e k8s_upgrade_allow_control_plane=true to proceed deliberately.
+      tags: [always]
+
+    - name: Read OS release
+      ansible.builtin.shell: . /etc/os-release && echo "$VERSION_CODENAME"
+      register: k8s_apparmor_os
+      changed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: Assert this is a 26.04 (resolute) node
+      ansible.builtin.assert:
+        that: k8s_apparmor_os.stdout == 'resolute'
+        fail_msg: >-
+          {{ inventory_hostname }} is '{{ k8s_apparmor_os.stdout }}', not
+          resolute. This fix is only for nodes that hit the 26.04 AppArmor
+          denials; do not apply it to 24.04 nodes.
+      tags: [always]
+
+    - name: Read whether the node is cordoned
+      ansible.builtin.command: >-
+        {{ k8s_kubectl }} get node {{ inventory_hostname }}
+        -o jsonpath='{.spec.unschedulable}'
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_apparmor_cordon
+      changed_when: false
+      check_mode: false
+      tags: [restart]
+
+    - name: Assert the node is cordoned before restarting its containers
+      ansible.builtin.assert:
+        that: k8s_apparmor_cordon.stdout == 'true'
+        fail_msg: >-
+          {{ inventory_hostname }} is not cordoned. Cordon and drain it
+          first (k8s-node-release-upgrade.yml --tags drain).
+      tags: [restart]
+
+    - name: Create the containerd drop-in directory
+      ansible.builtin.file:
+        path: "{{ k8s_containerd_dropin_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install the AppArmor drop-in
+      ansible.builtin.copy:
+        dest: "{{ k8s_containerd_dropin }}"
+        mode: "0644"
+        content: |
+          # Managed by homelab-ansible playbooks/k8s-containerd-apparmor.yml.
+          # containerd's generated cri-containerd.apparmor.d profile denies
+          # in-container signals and ptrace reads on Ubuntu 26.04
+          # (AppArmor 5.0.2, kernel 7.0), which breaks `gosu`, nginx reloads
+          # and FRR. See the playbook header.
+          version = 3
+
+          [plugins.'io.containerd.cri.v1.runtime']
+            disable_apparmor = true
+
+    - name: Require explicit go-ahead to restart containerd on this node
+      ansible.builtin.assert:
+        that: k8s_apparmor_restart | default(false) | bool
+        fail_msg: >-
+          Refusing to restart. The node must be cordoned and drained; then
+          pass -e k8s_apparmor_restart=true.
+      tags: [restart]
+
+    - name: Stop the RKE2 agent
+      ansible.builtin.systemd:
+        name: rke2-agent
+        state: stopped
+      tags: [restart]
+
+    - name: Find rke2-killall.sh
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: [/usr/bin/rke2-killall.sh, /usr/local/bin/rke2-killall.sh]
+      register: k8s_killall
+      tags: [restart]
+
+    - name: Stop the node's containers and containerd
+      ansible.builtin.command: "{{ (k8s_killall.results | selectattr('stat.exists') | map(attribute='item') | list | first) }}"
+      changed_when: true
+      tags: [restart]
+
+    - name: Start the RKE2 agent (containerd restarts with the new config)
+      ansible.builtin.systemd:
+        name: rke2-agent
+        state: started
+      tags: [restart]
+
+    - name: Wait for containerd to answer
+      ansible.builtin.command: "{{ k8s_crictl }} --runtime-endpoint unix:///run/k3s/containerd/containerd.sock info"
+      register: k8s_crictl_info
+      until: k8s_crictl_info.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      check_mode: false
+      tags: [restart]
+
+    - name: Assert containerd now has AppArmor disabled
+      ansible.builtin.assert:
+        that: k8s_crictl_info.stdout | regex_search('"disableApparmor":\s*true') is not none
+        fail_msg: >-
+          containerd does not report disableApparmor=true after the restart.
+          Remove {{ k8s_containerd_dropin }} and restart rke2-agent to undo,
+          then check `crictl info` output for the right key name.
+      tags: [restart]
