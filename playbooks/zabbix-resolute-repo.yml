@@ -1,0 +1,104 @@
+---
+# Re-enable the Zabbix 7.4 apt repo on zabbix.home.lan after the Ubuntu
+# 24.04 -> 26.04 ("resolute") release upgrade, and move the Zabbix packages
+# to their 26.04 builds.
+#
+# Usage (always --check --diff first):
+#   ansible-playbook playbooks/zabbix-resolute-repo.yml --check --diff
+#   ansible-playbook playbooks/zabbix-resolute-repo.yml
+#
+# State found 2026-11-15 after do-release-upgrade:
+#   * /etc/apt/sources.list.d/zabbix.sources was left `Enabled: no` with
+#     `Suites: noble` -- the upgrader disables third-party repos -- so apt
+#     had no live Zabbix repo at all.
+#   * The installed zabbix-* packages are still the noble builds
+#     (7.4.16-2+ubuntu24.04); zabbix_server is linked against
+#     libmysqlclient.so.21 (MySQL 8.0 client), kept around only because
+#     something still depends on it. MySQL itself is already 8.4.13.
+#   * repo.zabbix.com/zabbix/7.4/stable/ubuntu/dists/resolute exists and
+#     carries the same version rebuilt for 26.04 (7.4.16-2+ubuntu26.04), so
+#     this is a rebuild against the new libraries, not a Zabbix version
+#     change and not a database schema change.
+#
+# The server restarts for a few seconds when its package is replaced.
+
+- name: Move Zabbix packages to the resolute repo
+  hosts: zabbix.home.lan
+  become: true
+  vars:
+    zabbix_sources_file: /etc/apt/sources.list.d/zabbix.sources
+    zabbix_packages:
+      - zabbix-server-mysql
+      - zabbix-agent2
+      - zabbix-frontend-php
+      - zabbix-apache-conf
+      - zabbix-sql-scripts
+  tasks:
+    - name: Assert this is Ubuntu 26.04 (resolute)
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['distribution_release'] == 'resolute'
+        fail_msg: "{{ inventory_hostname }} is not Ubuntu resolute; refusing."
+
+    - name: Check the Zabbix 7.4 resolute suite exists upstream
+      ansible.builtin.uri:
+        url: https://repo.zabbix.com/zabbix/7.4/stable/ubuntu/dists/resolute/Release
+        method: HEAD
+        status_code: 200
+      check_mode: false
+
+    - name: Point the Zabbix repo at resolute
+      ansible.builtin.replace:
+        path: "{{ zabbix_sources_file }}"
+        regexp: '^Suites: noble$'
+        replace: 'Suites: resolute'
+
+    - name: Re-enable the Zabbix repo
+      ansible.builtin.replace:
+        path: "{{ zabbix_sources_file }}"
+        regexp: '^Enabled: no$'
+        replace: 'Enabled: yes'
+
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+      changed_when: false
+
+    - name: Simulate the package move to see what it would do
+      ansible.builtin.command:
+        cmd: "apt-get -s install --only-upgrade {{ zabbix_packages | join(' ') }}"
+      register: zabbix_sim
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse if the simulation would remove anything
+      ansible.builtin.assert:
+        that: zabbix_sim.stdout_lines | select('match', '^Remv ') | list | length == 0
+        fail_msg: >-
+          Moving Zabbix to resolute would REMOVE:
+          {{ zabbix_sim.stdout_lines | select('match', '^Remv ')
+             | map('regex_replace', '^Remv (\S+).*', '\1') | join(', ') }}.
+          Refusing; investigate first.
+
+    - name: Install the resolute builds
+      ansible.builtin.apt:
+        name: "{{ zabbix_packages }}"
+        state: latest
+
+    - name: Confirm services are up
+      ansible.builtin.command: systemctl is-active zabbix-server zabbix-agent2 apache2 mysql
+      register: zabbix_active
+      changed_when: false
+      check_mode: false
+      failed_when: zabbix_active.stdout_lines | reject('equalto', 'active') | list | length > 0
+
+    - name: Confirm zabbix_server now links the 8.4-era client library
+      ansible.builtin.shell: ldd /usr/sbin/zabbix_server | grep -i mysql || true
+      register: zabbix_ldd
+      changed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ zabbix_ldd.stdout_lines }}"
