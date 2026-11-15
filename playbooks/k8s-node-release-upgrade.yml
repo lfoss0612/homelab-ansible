@@ -1,0 +1,320 @@
+---
+# Ubuntu 24.04 -> 26.04 LTS release upgrade of ONE RKE2 node at a time.
+#
+# Usage -- always one node, always --check --diff first for the early phases:
+#   NODE=k8s-worker.home.lan
+#   ansible-playbook playbooks/k8s-node-release-upgrade.yml -e k8s_upgrade_node=$NODE --tags preflight
+#   ansible-playbook playbooks/k8s-node-release-upgrade.yml -e k8s_upgrade_node=$NODE --tags drain  -e k8s_upgrade_force_drain=true
+#   # patch the node (playbooks/os-update.yml -e os_update_hosts=$NODE --limit $NODE)
+#   ansible-playbook playbooks/k8s-node-release-upgrade.yml -e k8s_upgrade_node=$NODE --tags upgrade -e k8s_upgrade_go=true
+#   # when the unit ends: reboot by hand, then
+#   ansible-playbook playbooks/k8s-node-release-upgrade.yml -e k8s_upgrade_node=$NODE --tags post
+#
+# Write phases (drain, upgrade) need a fresh PBS backup of the VM and a recent
+# etcd snapshot; preflight asserts the snapshot, the backup is a human check.
+#
+# Why this is not just `kubectl drain` (found 2026-11-15 on k8s-worker):
+#   * yb-master-pdb / yb-tserver-pdb are maxUnavailable=0 with ONE replica
+#     each, so an eviction can never succeed. Draining a node that holds the
+#     Yugabyte master therefore needs --disable-eviction, i.e. a deliberate
+#     database outage for the length of the upgrade. That is gated behind
+#     k8s_upgrade_force_drain=true and only runs after a graceful drain has
+#     failed.
+#   * Longhorn's three instance-manager PDBs allow zero disruptions and
+#     node-drain-policy is block-if-contains-last-replica. The instance
+#     managers are excluded from the drain (pod selector) and simply go down
+#     with the node at reboot -- the same as a node crash for volumes that
+#     have another in-sync replica. The drain waits until no Longhorn volume
+#     is still attached to the node so engines stop cleanly first.
+#   * A volume whose only in-sync replica is on this node (comfyui-pvc on
+#     k8s-worker, 2026-11-15) will be unavailable until the node is back.
+#
+# The control-plane node (single etcd) is refused unless
+# k8s_upgrade_allow_control_plane=true: the API is down for the duration.
+#
+# Does not reboot (do it by hand, after the upgrade unit has ended).
+
+- name: Release-upgrade one RKE2 node
+  hosts: "{{ k8s_upgrade_node | default('') }}"
+  become: true
+  gather_facts: false
+  vars:
+    k8s_control_plane: k8s-master.home.lan
+    k8s_kubectl_env: { KUBECONFIG: /etc/rancher/rke2/rke2.yaml }
+    k8s_kubectl: /var/lib/rancher/rke2/bin/kubectl
+    k8s_snapshot_dir: /var/lib/rancher/rke2/server/db/snapshots
+    k8s_snapshot_max_age_s: 86400
+    k8s_min_free_gib: 8
+    k8s_upgrade_unit: k8s-release-upgrade
+    k8s_drain_selector: "longhorn.io/component!=instance-manager"
+  tasks:
+    - name: Require a node to be named
+      ansible.builtin.assert:
+        that: k8s_upgrade_node is defined and k8s_upgrade_node | length > 0
+        fail_msg: "Pass -e k8s_upgrade_node=<inventory hostname>."
+      run_once: true
+      delegate_to: localhost
+      become: false
+      tags: [always]
+
+    - name: Refuse the control-plane node unless explicitly allowed
+      ansible.builtin.assert:
+        that: >-
+          inventory_hostname != k8s_control_plane
+          or (k8s_upgrade_allow_control_plane | default(false) | bool)
+        fail_msg: >-
+          {{ inventory_hostname }} is the only control-plane/etcd node; the
+          API is down while it upgrades. Pass
+          -e k8s_upgrade_allow_control_plane=true to proceed deliberately.
+      tags: [always]
+
+    # ------------------------------------------------------------ preflight
+    - name: Read OS release and root free space
+      ansible.builtin.shell: |
+        . /etc/os-release
+        echo "$VERSION_CODENAME"
+        df --output=avail -BG / | tail -1 | tr -dc 0-9
+      register: k8s_os
+      changed_when: false
+      check_mode: false
+      tags: [preflight, drain, upgrade]
+
+    - name: Assert Ubuntu 24.04 (noble) with enough free space
+      ansible.builtin.assert:
+        that:
+          - k8s_os.stdout_lines[0] == 'noble'
+          - k8s_os.stdout_lines[1] | int >= k8s_min_free_gib
+        fail_msg: >-
+          {{ inventory_hostname }}: expected noble with >= {{ k8s_min_free_gib }}G
+          free, got {{ k8s_os.stdout_lines | join(' / ') }}.
+      tags: [preflight, drain, upgrade]
+
+    - name: Read cluster node readiness
+      ansible.builtin.command: "{{ k8s_kubectl }} get nodes --no-headers"
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_nodes
+      changed_when: false
+      check_mode: false
+      tags: [preflight, drain, upgrade]
+
+    - name: Assert every node is Ready (cordoned is fine once draining has started)
+      ansible.builtin.assert:
+        that: >-
+          k8s_nodes.stdout_lines
+          | reject('search', '\sReady(,SchedulingDisabled)?\s')
+          | list | length == 0
+        fail_msg: "A node is not Ready: {{ k8s_nodes.stdout }}"
+      tags: [preflight, drain]
+
+    - name: Find the newest etcd snapshot age (seconds)
+      ansible.builtin.shell: >-
+        echo $(( $(date +%s) - $(stat -c %Y $(ls -t {{ k8s_snapshot_dir }}/etcd-snapshot-* | head -1)) ))
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_snapshot_age
+      changed_when: false
+      check_mode: false
+      tags: [preflight, drain, upgrade]
+
+    - name: Assert a recent etcd snapshot exists
+      ansible.builtin.assert:
+        that: k8s_snapshot_age.stdout | int < k8s_snapshot_max_age_s
+        fail_msg: "Newest etcd snapshot is {{ k8s_snapshot_age.stdout }}s old."
+      tags: [preflight, drain, upgrade]
+
+    - name: Show what is scheduled on the node
+      ansible.builtin.shell: >-
+        {{ k8s_kubectl }} get pods -A -o wide --no-headers
+        --field-selector spec.nodeName={{ inventory_hostname }}
+        | awk '{print $1"/"$2, $4}'
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_pods_on_node
+      changed_when: false
+      check_mode: false
+      tags: [preflight]
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ k8s_pods_on_node.stdout_lines }}"
+      tags: [preflight]
+
+    # ---------------------------------------------------------------- drain
+    - name: Cordon the node
+      ansible.builtin.command: "{{ k8s_kubectl }} cordon {{ inventory_hostname }}"
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      changed_when: true
+      tags: [drain]
+
+    - name: Graceful drain (honours PodDisruptionBudgets; Longhorn instance managers excluded)
+      ansible.builtin.command: >-
+        {{ k8s_kubectl }} drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data
+        --pod-selector={{ k8s_drain_selector }} --timeout=300s
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_drain
+      failed_when: false
+      changed_when: true
+      tags: [drain]
+
+    - name: Forced drain of what the PDBs blocked (deliberate outage, gated)
+      ansible.builtin.command: >-
+        {{ k8s_kubectl }} drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
+        --pod-selector={{ k8s_drain_selector }} --timeout=300s
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      when: k8s_drain.rc != 0 and (k8s_upgrade_force_drain | default(false) | bool)
+      changed_when: true
+      tags: [drain]
+
+    - name: Fail if the graceful drain failed and forcing was not authorised
+      ansible.builtin.fail:
+        msg: >-
+          Graceful drain failed ({{ k8s_drain.stderr | default('') | truncate(300) }}).
+          Pass -e k8s_upgrade_force_drain=true to bypass the PDBs, accepting
+          an outage for whatever they protect.
+      when: k8s_drain.rc != 0 and not (k8s_upgrade_force_drain | default(false) | bool)
+      tags: [drain]
+
+    - name: Wait until no Longhorn volume is still attached to this node
+      ansible.builtin.shell: >-
+        {{ k8s_kubectl }} get volumes.longhorn.io -n longhorn-system -o json
+        | python3 -c "import json,sys;n=sys.argv[1];print(sum(1 for v in json.load(sys.stdin)['items'] if v['status'].get('currentNodeID')==n))" {{ inventory_hostname }}
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_attached
+      until: k8s_attached.stdout | trim == '0'
+      retries: 40
+      delay: 15
+      changed_when: false
+      check_mode: false
+      tags: [drain]
+
+    # -------------------------------------------------------------- upgrade
+    - name: Require explicit go-ahead to start the real release upgrade
+      ansible.builtin.assert:
+        that: k8s_upgrade_go | default(false) | bool
+        fail_msg: >-
+          Refusing to start. Confirm a fresh PBS backup, that the node is
+          drained, and that it has no pending package updates, then pass
+          -e k8s_upgrade_go=true.
+      tags: [upgrade]
+
+    - name: Assert the node is cordoned
+      ansible.builtin.shell: >-
+        {{ k8s_kubectl }} get node {{ inventory_hostname }} -o jsonpath='{.spec.unschedulable}'
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_cordoned
+      changed_when: false
+      check_mode: false
+      failed_when: k8s_cordoned.stdout != 'true'
+      tags: [upgrade]
+
+    - name: Assert the node has no pending package updates
+      ansible.builtin.shell: apt-get update -qq && apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: k8s_upgradable
+      changed_when: false
+      check_mode: false
+      failed_when: k8s_upgradable.stdout | trim != '0'
+      tags: [upgrade]
+
+    - name: Assert a release upgrade is offered
+      ansible.builtin.shell: do-release-upgrade -c 2>&1 | tail -3
+      register: k8s_rel_check
+      changed_when: false
+      check_mode: false
+      failed_when: "'26.04' not in k8s_rel_check.stdout"
+      tags: [upgrade]
+
+    - name: Ensure no release upgrade is already running
+      ansible.builtin.command: "systemctl is-active {{ k8s_upgrade_unit }}"
+      register: k8s_unit_state
+      failed_when: k8s_unit_state.stdout == 'active'
+      changed_when: false
+      check_mode: false
+      tags: [upgrade]
+
+    - name: Start do-release-upgrade as a detached systemd unit
+      ansible.builtin.command: >-
+        systemd-run --unit={{ k8s_upgrade_unit }} --collect
+        --setenv=DEBIAN_FRONTEND=noninteractive --setenv=TERM=dumb
+        do-release-upgrade -f DistUpgradeViewNonInteractive
+      changed_when: true
+      tags: [upgrade]
+
+    - name: Say how to watch it
+      ansible.builtin.debug:
+        msg: >-
+          Started. journalctl -u {{ k8s_upgrade_unit }} on the node.
+          systemd itself is upgraded mid-run, so `systemctl is-active` can
+          report inactive while the unit's transient file is gone: confirm
+          the end in the journal ("Cleanup" / dpkg --audit clean), not the
+          unit state alone. Reboot by hand, then run --tags post.
+      tags: [upgrade]
+
+    # ----------------------------------------------------------------- post
+    - name: Wait for the node to come back
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+      tags: [post]
+
+    - name: Assert the node is now Ubuntu 26.04 (resolute)
+      ansible.builtin.shell: . /etc/os-release && echo "$VERSION_CODENAME"
+      register: k8s_os_after
+      changed_when: false
+      check_mode: false
+      failed_when: k8s_os_after.stdout != 'resolute'
+      tags: [post]
+
+    - name: Wait for rke2-agent / rke2-server to be active
+      ansible.builtin.shell: systemctl is-active rke2-agent rke2-server 2>/dev/null | grep -qx active
+      register: k8s_rke2
+      until: k8s_rke2.rc == 0
+      retries: 40
+      delay: 15
+      changed_when: false
+      check_mode: false
+      tags: [post]
+
+    - name: Wait for the node to be Ready in the cluster
+      ansible.builtin.shell: >-
+        {{ k8s_kubectl }} get node {{ inventory_hostname }} --no-headers | grep -E '\sReady'
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_ready
+      until: k8s_ready.rc == 0
+      retries: 40
+      delay: 15
+      changed_when: false
+      check_mode: false
+      tags: [post]
+
+    - name: Uncordon the node
+      ansible.builtin.command: "{{ k8s_kubectl }} uncordon {{ inventory_hostname }}"
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      changed_when: true
+      tags: [post]
+
+    - name: Summarise cluster state
+      ansible.builtin.shell: |
+        {{ k8s_kubectl }} get nodes -o wide --no-headers | cut -c1-170
+        echo ---
+        {{ k8s_kubectl }} get pods -A --no-headers | awk '{print $4}' | sort | uniq -c
+        echo --- longhorn
+        {{ k8s_kubectl }} get volumes.longhorn.io -n longhorn-system -o custom-columns=ST:.status.state,ROB:.status.robustness --no-headers | sort | uniq -c
+      environment: "{{ k8s_kubectl_env }}"
+      delegate_to: "{{ k8s_control_plane }}"
+      register: k8s_summary
+      changed_when: false
+      check_mode: false
+      tags: [post]
+
+    - name: Show it
+      ansible.builtin.debug:
+        msg: "{{ k8s_summary.stdout_lines }}"
+      tags: [post]
