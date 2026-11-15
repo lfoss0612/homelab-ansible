@@ -100,6 +100,32 @@
           first (k8s-node-release-upgrade.yml --tags drain).
       tags: [restart]
 
+    # A node with a hand-made template (k8s-worker-2: a full copy of RKE2's
+    # generated config plus the NVIDIA runtimes, Mar 2026, not managed by any
+    # repo) is rendered from that template verbatim, and the stock template's
+    # `imports = [...config-v3.toml.d/*.toml]` line is not in it. The drop-in
+    # below is then silently ignored: found 2026-11-15, containerd kept
+    # reporting disableApparmor=false after a cold restart. Make any custom
+    # template import the drop-in directory too. Original is kept (backup).
+    - name: Find a custom containerd template on this node
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /var/lib/rancher/rke2/agent/etc/containerd/config.toml.tmpl
+        - /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.tmpl
+      register: k8s_containerd_tmpls
+
+    - name: Make a custom template import the drop-in directory
+      ansible.builtin.lineinfile:
+        path: "{{ item.item }}"
+        insertafter: '^version = 3'
+        regexp: '^imports = '
+        line: 'imports = ["{{ k8s_containerd_dropin_dir }}/*.toml"]'
+        backup: true
+      loop: "{{ k8s_containerd_tmpls.results | selectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.item }}"
+
     - name: Create the containerd drop-in directory
       ansible.builtin.file:
         path: "{{ k8s_containerd_dropin_dir }}"
