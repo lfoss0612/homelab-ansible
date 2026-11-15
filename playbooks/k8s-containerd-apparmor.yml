@@ -29,7 +29,7 @@
 #
 # The setting only applies to containers created after containerd restarts.
 # RKE2 runs containerd as a child that survives `systemctl restart
-# rke2-agent` (KillMode=process), so --tags restart stops the agent, runs
+# rke2-agent` (KillMode=process), so --tags restart stops the service (rke2-server on the control plane), runs
 # rke2-killall.sh to stop the node's containers and containerd, then starts
 # the agent. On a cordoned, drained node that is a clean cold start.
 
@@ -42,6 +42,8 @@
     k8s_kubectl: /var/lib/rancher/rke2/bin/kubectl
     k8s_kubectl_env: { KUBECONFIG: /etc/rancher/rke2/rke2.yaml }
     k8s_crictl: /var/lib/rancher/rke2/bin/crictl
+    # the control plane runs rke2-server (rke2-agent is masked there)
+    k8s_rke2_unit: "{{ 'rke2-server' if inventory_hostname == k8s_control_plane else 'rke2-agent' }}"
     k8s_containerd_dropin_dir: /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.d
     k8s_containerd_dropin: "{{ k8s_containerd_dropin_dir }}/10-disable-apparmor.toml"
   tasks:
@@ -155,9 +157,9 @@
           pass -e k8s_apparmor_restart=true.
       tags: [restart]
 
-    - name: Stop the RKE2 agent
+    - name: Stop the RKE2 service
       ansible.builtin.systemd:
-        name: rke2-agent
+        name: "{{ k8s_rke2_unit }}"
         state: stopped
       tags: [restart]
 
@@ -173,9 +175,9 @@
       changed_when: true
       tags: [restart]
 
-    - name: Start the RKE2 agent (containerd restarts with the new config)
+    - name: Start the RKE2 service (containerd restarts with the new config)
       ansible.builtin.systemd:
-        name: rke2-agent
+        name: "{{ k8s_rke2_unit }}"
         state: started
       tags: [restart]
 
@@ -194,6 +196,6 @@
         that: k8s_crictl_info.stdout | regex_search('"disableApparmor":\s*true') is not none
         fail_msg: >-
           containerd does not report disableApparmor=true after the restart.
-          Remove {{ k8s_containerd_dropin }} and restart rke2-agent to undo,
+          Remove {{ k8s_containerd_dropin }} and restart the rke2 service to undo,
           then check `crictl info` output for the right key name.
       tags: [restart]
