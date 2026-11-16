@@ -79,6 +79,8 @@
       check_mode: false
       tags: [preflight, drain, upgrade]
 
+    # noble is only required before the release upgrade; the drain tag is also
+    # used on already-upgraded nodes (e.g. for an RKE2 patch upgrade).
     - name: Assert Ubuntu 24.04 (noble) with enough free space
       ansible.builtin.assert:
         that:
@@ -87,7 +89,7 @@
         fail_msg: >-
           {{ inventory_hostname }}: expected noble with >= {{ k8s_min_free_gib }}G
           free, got {{ k8s_os.stdout_lines | join(' / ') }}.
-      tags: [preflight, drain, upgrade]
+      tags: [preflight, upgrade]
 
     - name: Read cluster node readiness
       ansible.builtin.command: "{{ k8s_kubectl }} get nodes --no-headers"
