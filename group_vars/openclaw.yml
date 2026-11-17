@@ -8,7 +8,29 @@ openclaw_install_dir: /opt/openclaw
 # Note the GitHub release tag for this same version is v2026.7.1.
 openclaw_version: "2026.7.1-2"
 
-# Node.js floor required by openclaw_version. common role upgrades below this.
+# Node.js the pinned openclaw_version needs. Two variables, always edited
+# together with openclaw_version in the same commit:
+#
+#   openclaw_node_major        NodeSource major the hosts track (the `node_<N>.x`
+#                              apt repo). The common role re-points
+#                              /etc/apt/sources.list.d/nodesource.sources at it
+#                              (and re-enables it if a release upgrade disabled
+#                              it) the first time a host is below the floor.
+#   openclaw_node_min_version  Floor within that major. A host below it, or on an
+#                              older major, gets nodejs upgraded before openclaw.
+#
+# HOW TO BUMP OPENCLAW (same procedure every time):
+#   1. `npm view openclaw@<new version> engines.node` -- the range it requires.
+#   2. If the current Node already satisfies it, change only openclaw_version.
+#      If not, also raise openclaw_node_major / openclaw_node_min_version to a
+#      release that satisfies it (and check the release notes for security-driven
+#      floors above the declared range, e.g. 2026.10.6 wanted Node >= 24.22.1).
+#   3. Dry-run, then run update-openclaw.yml by hand and validate-openclaw.yml --
+#      see docs/execution-model.md "Bumping the OpenClaw pin".
+# A wrong Node can't slip through: the npm install uses --engine-strict, so it
+# fails before touching the install when the host's Node doesn't satisfy the
+# package's declared engines, and validate-openclaw.yml asserts the Node floor.
+openclaw_node_major: "22"
 openclaw_node_min_version: "22.22.3"
 
 # What NODES dial to reach the gateway — routed through the OPNsense HAProxy

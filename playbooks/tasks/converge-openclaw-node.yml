@@ -8,6 +8,36 @@
 # Included under `when: openclaw_update_required` by both callers, which is
 # what replaces the earlier `meta: end_host` skip: the include simply does not
 # run for a host already at the pin.
+#
+# Gateway first, always. A node must never be moved to a version the gateway
+# isn't already running: the gateway owns the pairing and the state schema, and
+# the gateway/node compatibility window between releases is not something the
+# release notes promise. The play ordering in update-openclaw.yml already gives
+# gateway-before-nodes on a normal run, and a gateway that is unreachable aborts
+# the run before any node play (seen 2026-11-15). This makes it explicit, so it
+# also holds for a hand-run `--limit <node>` or `--tags` invocation that skips
+# the gateway play. Read live, not from phase 1's fact, which is stale by now.
+# (In --check the gateway is never really updated, so the assertion is waived
+# there to keep a bump dry-run readable.)
+- name: Read the gateway's current OpenClaw version
+  ansible.builtin.command: openclaw --version
+  delegate_to: "{{ groups['openclaw_gateway'] | first }}"
+  become: true
+  run_once: true
+  register: openclaw_gateway_version_now
+  changed_when: false
+  check_mode: false
+
+- name: Assert the gateway is at the pin before this node moves
+  ansible.builtin.assert:
+    that: >-
+      ansible_check_mode or
+      openclaw_version in (openclaw_gateway_version_now.stdout | default(''))
+    fail_msg: >-
+      Refusing to move {{ inventory_hostname }} to {{ openclaw_version }}: the
+      gateway {{ groups['openclaw_gateway'] | first }} reports
+      '{{ openclaw_gateway_version_now.stdout | default('unreachable') }}'.
+      Converge the gateway first (update-openclaw.yml does, in order).
 
 - name: Converge node to the pinned version
   ansible.builtin.include_role:
@@ -20,6 +50,10 @@
   ansible.builtin.command: systemctl is-active openclaw-node
   register: openclaw_node_active
   changed_when: false
+  # Read-only, so it runs in --check too: without this a bump dry-run died here
+  # ("Command would have run if not in check mode") on the first node and never
+  # showed the rest of the fleet.
+  check_mode: false
   until: openclaw_node_active.stdout == "active"
   retries: 6
   delay: 5
@@ -28,4 +62,8 @@
   ansible.builtin.command: openclaw --version
   register: openclaw_node_version_check
   changed_when: false
-  failed_when: openclaw_version not in openclaw_node_version_check.stdout
+  check_mode: false
+  # In --check nothing was installed, so the host is still on the old version.
+  failed_when: >-
+    not ansible_check_mode and
+    openclaw_version not in openclaw_node_version_check.stdout

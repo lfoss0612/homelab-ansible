@@ -16,21 +16,116 @@
       {{ (openclaw_node_installed_version.stdout | trim | regex_replace('^v', ''))
          if openclaw_node_installed_version.rc == 0 else '0.0.0' }}
 
+# Below the floor, or on an older major than the one openclaw_node_major asks
+# for (group_vars/openclaw.yml documents how the two move with the pin).
 - name: Determine whether Node.js needs upgrading
   ansible.builtin.set_fact:
     openclaw_node_needs_upgrade: >-
-      {{ openclaw_node_installed_version_clean is version(openclaw_node_min_version, '<') }}
+      {{ openclaw_node_installed_version_clean is version(openclaw_node_min_version, '<')
+         or (openclaw_node_installed_version_clean.split('.')[0] | int) < (openclaw_node_major | int) }}
+
+# --- NodeSource repo --------------------------------------------------------
+# The repo file is created by hand on each host (Phase 3), so the major in its
+# URI was whatever was set up then (node_22.x everywhere on 2026-11-17). A Node
+# major bump needs that URI moved, and a release upgrade (Ubuntu 24.04 ->
+# 26.04) leaves the file `Enabled: no` -- found 2026-11-17 on zabbix and the
+# three k8s nodes -- so apt would silently offer no nodejs at all. Both are
+# corrected here, but ONLY on a host that actually needs a Node upgrade, so a
+# run where every host already satisfies the pin touches no apt source.
+- name: Stat the NodeSource apt source
+  ansible.builtin.stat:
+    path: "{{ openclaw_nodesource_sources }}"
+  register: openclaw_nodesource_stat
+  when: openclaw_node_needs_upgrade
+
+- name: Require the NodeSource apt source before upgrading Node.js
+  ansible.builtin.assert:
+    that: openclaw_nodesource_stat.stat.exists
+    fail_msg: >-
+      {{ inventory_hostname }} needs Node.js {{ openclaw_node_min_version }}+ but
+      {{ openclaw_nodesource_sources }} does not exist, so there is no repo to
+      take it from. Configure NodeSource there first (the Phase 3 step).
+  when: openclaw_node_needs_upgrade
+
+- name: Point the NodeSource repo at Node.js {{ openclaw_node_major }}.x
+  ansible.builtin.replace:
+    path: "{{ openclaw_nodesource_sources }}"
+    regexp: '^(URIs:\s*https://deb\.nodesource\.com/node_)\d+(\.x\s*)$'
+    replace: '\g<1>{{ openclaw_node_major }}\g<2>'
+    backup: true
+  when: openclaw_node_needs_upgrade
+
+- name: Re-enable the NodeSource repo if a release upgrade disabled it
+  ansible.builtin.replace:
+    path: "{{ openclaw_nodesource_sources }}"
+    regexp: '^Enabled:\s*no\s*$'
+    replace: 'Enabled: yes'
+    backup: true
+  when: openclaw_node_needs_upgrade
+
+- name: Refresh apt metadata so the NodeSource change is visible
+  ansible.builtin.apt:
+    update_cache: true
+  changed_when: false
+  when: openclaw_node_needs_upgrade
+
+# Same guard the Zabbix repo move uses: never let a package upgrade remove
+# something else as a side effect. `nodejs` from NodeSource normally removes
+# nothing; a conflict with a distro libnode package would show up here.
+- name: Simulate the Node.js upgrade
+  ansible.builtin.command: apt-get -s install --only-upgrade nodejs
+  register: openclaw_node_upgrade_sim
+  changed_when: false
+  check_mode: false
+  when:
+    - openclaw_node_needs_upgrade
+    - not ansible_check_mode
+
+- name: Refuse if the Node.js upgrade would remove anything
+  ansible.builtin.assert:
+    that: openclaw_node_upgrade_sim.stdout_lines | select('match', '^Remv ') | list | length == 0
+    fail_msg: >-
+      Upgrading nodejs on {{ inventory_hostname }} would REMOVE:
+      {{ openclaw_node_upgrade_sim.stdout_lines | select('match', '^Remv ')
+         | map('regex_replace', '^Remv (\S+).*', '\1') | join(', ') }}.
+      Refusing; investigate first.
+  when:
+    - openclaw_node_needs_upgrade
+    - not ansible_check_mode
 
 # Guard on the installed version, not `creates:` — this must also catch a
 # host that already has an older Node.js from a previous NodeSource install.
-# The NodeSource repo itself is assumed already configured (Phase 3); this
-# does not rewrite nodesource.sources.
 - name: Upgrade Node.js to the {{ openclaw_node_min_version }} floor
   ansible.builtin.apt:
     name: nodejs
     state: latest
-    update_cache: true
   when: openclaw_node_needs_upgrade
+
+- name: Re-read the installed Node.js version
+  ansible.builtin.command: node -v
+  register: openclaw_node_after_upgrade
+  changed_when: false
+  check_mode: false
+  when:
+    - openclaw_node_needs_upgrade
+    - not ansible_check_mode
+
+# If apt picked a different candidate than the repo change implies (a distro
+# package outranking NodeSource, a mirror lagging), stop here with the real
+# version rather than letting npm fail with a less obvious engines error.
+- name: Assert Node.js now meets the floor
+  ansible.builtin.assert:
+    that:
+      - openclaw_node_after_upgrade.stdout | trim | regex_replace('^v', '') is version(openclaw_node_min_version, '>=')
+      - (openclaw_node_after_upgrade.stdout | trim | regex_replace('^v', '')).split('.')[0] | int >= openclaw_node_major | int
+    fail_msg: >-
+      {{ inventory_hostname }} is on Node.js {{ openclaw_node_after_upgrade.stdout | trim }}
+      after the upgrade; expected >= {{ openclaw_node_min_version }} (major
+      {{ openclaw_node_major }}). Check `apt-cache policy nodejs` for which
+      repo is winning.
+  when:
+    - openclaw_node_needs_upgrade
+    - not ansible_check_mode
 
 - name: Create openclaw group
   ansible.builtin.group:
@@ -240,8 +335,15 @@
 
 # Postinstall (postinstall-bundled-plugins.mjs) is allowed to run — no
 # --ignore-scripts — it installs the bundled plugins the CLI expects.
+#
+# --engine-strict is what makes a version bump reusable without anyone having to
+# remember the Node requirement: npm refuses (EBADENGINE) before changing
+# anything when this host's Node doesn't satisfy the package's declared
+# `engines.node`, instead of installing a CLI that then won't start. Verified
+# 2026-11-17: 2026.11.3 on Node 22.23.5 exits 1 with "Required: >=24.16.0 <25 ||
+# >=26.1.0", and the current 2026.7.1-2 pin exits 0.
 - name: Install/upgrade the openclaw CLI via npm
-  ansible.builtin.command: "npm install -g openclaw@{{ openclaw_version }}"
+  ansible.builtin.command: "npm install -g --engine-strict openclaw@{{ openclaw_version }}"
   when: >-
     openclaw_cli_version.rc != 0 or
     openclaw_version not in openclaw_cli_version.stdout

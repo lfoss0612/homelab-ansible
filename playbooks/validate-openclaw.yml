@@ -45,6 +45,8 @@
       vars:
         openclaw_required_vars:
           - openclaw_version
+          - openclaw_node_major
+          - openclaw_node_min_version
           - openclaw_node_gateway_host
           - openclaw_node_gateway_address
           - openclaw_node_hardening
@@ -61,6 +63,26 @@
           {{ inventory_hostname }} is at '{{ openclaw_validate_version.stdout }}',
           expected '{{ openclaw_version }}'.
         success_msg: "{{ inventory_hostname }} is at the pinned version."
+
+    # The Node.js the pin needs is part of the pin: a host can be on the right
+    # openclaw and a Node that has since drifted below the floor (a rebuilt
+    # host, an apt downgrade, a disabled NodeSource repo). Floor and major, not
+    # an exact patch version -- patch releases arrive through normal OS updates.
+    - name: Check installed Node.js version
+      ansible.builtin.command: node -v
+      register: openclaw_validate_node
+      changed_when: false
+
+    - name: Assert Node.js meets the floor for the pinned version
+      ansible.builtin.assert:
+        that:
+          - openclaw_validate_node.stdout | trim | regex_replace('^v', '') is version(openclaw_node_min_version, '>=')
+          - (openclaw_validate_node.stdout | trim | regex_replace('^v', '')).split('.')[0] | int >= openclaw_node_major | int
+        fail_msg: >-
+          {{ inventory_hostname }} runs Node.js {{ openclaw_validate_node.stdout | trim }};
+          the pin needs >= {{ openclaw_node_min_version }} (major {{ openclaw_node_major }}).
+          Run update-openclaw.yml, or check the NodeSource repo on this host.
+        success_msg: "{{ inventory_hostname }} Node.js {{ openclaw_validate_node.stdout | trim }} meets the floor."
 
     # Reported, not remediated here — see docs/execution-model.md "DNS
     # resolver assertion". The fix (common role, --tags dns) is not part of
@@ -111,6 +133,8 @@
       vars:
         openclaw_required_vars:
           - openclaw_version
+          - openclaw_node_major
+          - openclaw_node_min_version
           - openclaw_node_gateway_host
           - openclaw_node_gateway_address
           - openclaw_node_hardening
@@ -140,6 +164,24 @@
           {{ inventory_hostname }} is at '{{ openclaw_validate_version.stdout }}',
           expected '{{ openclaw_version }}'.
         success_msg: "{{ inventory_hostname }} is at the pinned version."
+      when: not (openclaw_optional_probe.unreachable | default(false))
+
+    - name: Check installed Node.js version
+      ansible.builtin.command: node -v
+      register: openclaw_validate_node
+      changed_when: false
+      when: not (openclaw_optional_probe.unreachable | default(false))
+
+    - name: Assert Node.js meets the floor for the pinned version
+      ansible.builtin.assert:
+        that:
+          - openclaw_validate_node.stdout | trim | regex_replace('^v', '') is version(openclaw_node_min_version, '>=')
+          - (openclaw_validate_node.stdout | trim | regex_replace('^v', '')).split('.')[0] | int >= openclaw_node_major | int
+        fail_msg: >-
+          {{ inventory_hostname }} runs Node.js {{ openclaw_validate_node.stdout | trim }};
+          the pin needs >= {{ openclaw_node_min_version }} (major {{ openclaw_node_major }}).
+          Run update-openclaw.yml, or check the NodeSource repo on this host.
+        success_msg: "{{ inventory_hostname }} Node.js {{ openclaw_validate_node.stdout | trim }} meets the floor."
       when: not (openclaw_optional_probe.unreachable | default(false))
 
     - name: Resolve the gateway hostname from this host

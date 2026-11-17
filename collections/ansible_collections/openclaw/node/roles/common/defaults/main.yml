@@ -3,6 +3,11 @@ openclaw_user: openclaw
 openclaw_group: openclaw
 openclaw_version: "latest"
 openclaw_node_min_version: "22.22.3"
+# NodeSource major the hosts track, and the apt source that carries it. Kept in
+# step with openclaw_node_min_version (see group_vars/openclaw.yml for the bump
+# procedure; the group_vars value wins, this is only the role-level fallback).
+openclaw_node_major: "22"
+openclaw_nodesource_sources: /etc/apt/sources.list.d/nodesource.sources
 
 # Claude Code automation identity. Provisioned on all hosts for centralized
 # access and verification. Host-specific additional groups or sudoers rules

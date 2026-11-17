@@ -282,6 +282,38 @@ notification: the unit carries `OnFailure=`/`OnSuccess=` into
 1/0 to a Zabbix trapper and optionally POSTs to a webhook. See the README for the
 mechanism and the one-time Zabbix item that still has to be created server-side.
 
+### Bumping the OpenClaw pin
+
+The same steps every time, whether the new version only changes the CLI or also
+needs a newer Node.js (2026.9.3 moved the floor from Node 22 to 24):
+
+1. **Read the requirement.** `npm view openclaw@<new> engines.node`, and the release
+   notes from the current pin up to the target (docs.openclaw.ai/releases/<version>).
+   Release notes can raise the Node floor above the declared range for security
+   reasons (2026.10.6: Node >= 24.22.1), so check both.
+2. **One commit** to `group_vars/openclaw.yml`: `openclaw_version`, and, only if the
+   requirement changed, `openclaw_node_major` and `openclaw_node_min_version`. Nothing
+   else is version-specific. The common role re-points
+   `/etc/apt/sources.list.d/nodesource.sources` at `node_<major>.x` (and re-enables it
+   if a release upgrade left it `Enabled: no`) and upgrades `nodejs`, refusing if apt
+   would remove anything, before it installs the CLI.
+3. **Do not push yet.** The timer pulls `main` weekly (Sun 03:00) and would roll the
+   bump out unattended. Roll out by hand first, then push.
+4. **Before touching the gateway:** snapshot its VM and confirm the gateway role's
+   state backup. Gateway state migrates one way; rolling back means restoring a
+   backup, not reinstalling the old version.
+5. **Dry-run** `update-openclaw.yml --check --diff`, then run it: gateway first, then
+   the nodes one at a time. A node refuses to move unless the gateway already reports
+   the pin (`tasks/converge-openclaw-node.yml`), and `npm install --engine-strict`
+   refuses a package whose declared Node range the host doesn't meet, before changing
+   anything.
+6. **Verify** with `validate-openclaw.yml` (version pin, Node floor, pairing, DNS,
+   sandbox) and the Zabbix drift trigger, then push.
+
+Rollback: restore the gateway snapshot/state backup, set the pin and Node variables
+back, re-run `update-openclaw.yml`. A Node major going *down* is not done by `apt`
+upgrade; point the NodeSource repo back and install the older `nodejs` explicitly.
+
 ## Sandboxing openclaw-node.service
 
 Removing the sudo grant stopped the agent becoming root. It did **not** make it
