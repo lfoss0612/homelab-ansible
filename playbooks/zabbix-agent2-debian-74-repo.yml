@@ -1,0 +1,163 @@
+---
+# Move zabbix-agent2 on Debian 13 (trixie) hosts from Debian's own 7.0 LTS
+# package to the official Zabbix 7.4 repo, so the agent series matches the
+# Zabbix server (7.4.x).
+#
+# Why: found 2026-11-16 -- the ten Debian hosts ran Debian's packaged
+# zabbix-agent2 1:7.0.22 (no Zabbix repo configured) while the server is
+# 7.4.16. Monitoring works (a newer server accepts older agents) but the
+# fleet runs two series and the Debian hosts miss 7.4 fixes. The Ubuntu hosts
+# (zabbix, vscode) already track repo.zabbix.com via upgrade-to-zabbix-agent2.yml.
+#
+# What it does, one host at a time:
+#   * asserts Debian 13 and that the 7.4 trixie suite exists upstream,
+#   * installs the Zabbix signing key and a deb822 source (Signed-By, no
+#     global trusted.gpg.d entry),
+#   * simulates the install and refuses if apt would REMOVE anything,
+#   * upgrades zabbix-agent2 (and zabbix-sender where installed) with
+#     force-confold, so /etc/zabbix/zabbix_agent2.conf and the drop-ins
+#     (os-update-status.conf, openclaw-version.conf) are kept as they are,
+#   * confirms the service is active and reports a 7.4 version.
+# The agent restarts for a few seconds; VMs/containers are not touched.
+#
+# After the fleet is moved, re-run zabbix-agent2-version-guard.yml: it holds the
+# agent wherever the repo candidate would be newer than the server.
+#
+# Usage (one host first, always --check --diff first):
+#   ansible-playbook playbooks/zabbix-agent2-debian-74-repo.yml -e zabbix_deb_hosts=pdm.home.lan --check --diff
+#   ansible-playbook playbooks/zabbix-agent2-debian-74-repo.yml -e zabbix_deb_hosts=pdm.home.lan
+# Note: in --check the repo file does not exist yet, so the simulation and
+# version checks are skipped; the real run performs them.
+
+- name: Move zabbix-agent2 to the official Zabbix 7.4 repo (Debian 13)
+  hosts: "{{ zabbix_deb_hosts | default('') }}"
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  vars:
+    zabbix_repo_series: "7.4"
+    zabbix_repo_key_url: https://repo.zabbix.com/zabbix-official-repo.key
+    zabbix_repo_key_path: /etc/apt/keyrings/zabbix-official-repo.asc
+    zabbix_sources_file: /etc/apt/sources.list.d/zabbix.sources
+  tasks:
+    - name: Require a host to be named
+      ansible.builtin.assert:
+        that: zabbix_deb_hosts is defined and zabbix_deb_hosts | length > 0
+        fail_msg: "Pass -e zabbix_deb_hosts=<inventory hostname>."
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Assert Debian 13 (trixie)
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Debian'
+          - ansible_facts['distribution_release'] == 'trixie'
+        fail_msg: "{{ inventory_hostname }} is not Debian trixie; refusing."
+
+    - name: Check the Zabbix repo has a trixie suite for this series
+      ansible.builtin.uri:
+        url: "https://repo.zabbix.com/zabbix/{{ zabbix_repo_series }}/stable/debian/dists/trixie/Release"
+        method: HEAD
+        status_code: 200
+      check_mode: false
+
+    - name: Record the installed version before the change
+      ansible.builtin.command: dpkg-query -W -f='${Version}' zabbix-agent2
+      register: zabbix_before
+      changed_when: false
+      check_mode: false
+
+    - name: Create the apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Install the Zabbix signing key
+      ansible.builtin.get_url:
+        url: "{{ zabbix_repo_key_url }}"
+        dest: "{{ zabbix_repo_key_path }}"
+        mode: "0644"
+
+    - name: Add the Zabbix repo (deb822, signed-by)
+      ansible.builtin.copy:
+        dest: "{{ zabbix_sources_file }}"
+        mode: "0644"
+        content: |
+          # Managed by homelab-ansible playbooks/zabbix-agent2-debian-74-repo.yml
+          Types: deb
+          URIs: https://repo.zabbix.com/zabbix/{{ zabbix_repo_series }}/stable/debian
+          Suites: trixie
+          Components: main
+          Architectures: amd64
+          Signed-By: {{ zabbix_repo_key_path }}
+      register: zabbix_repo_file
+
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Find which Zabbix packages are installed here
+      ansible.builtin.shell: >-
+        dpkg-query -W -f='${Package} ${Status}\n' zabbix-agent2 zabbix-sender 2>/dev/null
+        | awk '/ install ok installed$/ {print $1}'
+      register: zabbix_installed
+      changed_when: false
+      check_mode: false
+
+    - name: Simulate the upgrade
+      ansible.builtin.command:
+        cmd: "apt-get -s install --only-upgrade {{ zabbix_installed.stdout_lines | join(' ') }}"
+      register: zabbix_sim
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Refuse if the simulation would remove anything
+      ansible.builtin.assert:
+        that: zabbix_sim.stdout_lines | select('match', '^Remv ') | list | length == 0
+        fail_msg: >-
+          Moving to the Zabbix repo would REMOVE:
+          {{ zabbix_sim.stdout_lines | select('match', '^Remv ')
+             | map('regex_replace', '^Remv (\S+).*', '\1') | join(', ') }}.
+          Refusing; investigate first.
+      when: not ansible_check_mode
+
+    - name: Upgrade the agent from the Zabbix repo (keep local config)
+      ansible.builtin.apt:
+        name: "{{ zabbix_installed.stdout_lines }}"
+        state: latest
+        install_recommends: false
+        dpkg_options: "force-confold,force-confdef"
+
+    - name: Make sure the agent is enabled and running
+      ansible.builtin.systemd_service:
+        name: zabbix-agent2
+        state: started
+        enabled: true
+
+    - name: Read the running agent version
+      ansible.builtin.command: zabbix_agent2 -t agent.version
+      register: zabbix_agent_version
+      changed_when: false
+      check_mode: false
+      retries: 5
+      delay: 3
+      until: zabbix_agent_version.rc == 0
+      when: not ansible_check_mode
+
+    - name: Assert the agent reports the target series
+      ansible.builtin.assert:
+        that: zabbix_agent_version.stdout is search('\[s\|' ~ zabbix_repo_series | regex_escape)
+        fail_msg: "Agent reports: {{ zabbix_agent_version.stdout }}"
+      when: not ansible_check_mode
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ zabbix_before.stdout }} -> {{ zabbix_agent_version.stdout | default('(check mode)') }}
+      when: not ansible_check_mode
