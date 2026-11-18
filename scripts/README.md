@@ -88,6 +88,22 @@ Without `--apply` it adds `--check --diff`. `--keep` leaves the copy for debuggi
 `command` tasks are skipped under `--check` unless they set `check_mode: false`, so a dry run
 of a playbook that probes with `command` can fail on an empty result.
 
+## lint-check-mode.py
+
+Finds `command`/`shell`/`raw`/`script` tasks that misbehave under `--check` (they are skipped, so a
+read-only probe leaves its registered variable empty). Standard library only.
+
+```bash
+scripts/lint-check-mode.py                       # playbooks, the openclaw collection, roles
+scripts/lint-check-mode.py playbooks/validate-openclaw.yml
+scripts/lint-check-mode.py --strict              # warnings fail the run too
+```
+
+- `E1`: `changed_when: false` without `check_mode:`. A read-only probe should add
+  `check_mode: false`. A task that really changes something (a backup run, a wait) is correctly
+  skipped under `--check`; mark it with a `# lint-check-mode: ignore` comment instead.
+- `W1`: registers output but sets neither `check_mode` nor `changed_when`.
+
 ## ansible-on-cockpit.sh and probes/
 
 Runs ad-hoc Ansible, inventory queries, committed-checkout playbooks and read-only probes through
