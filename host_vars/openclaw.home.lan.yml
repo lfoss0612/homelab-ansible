@@ -25,5 +25,4 @@ openclaw_networkd_static_network:
   gateway: "10.0.5.1"
   dns:
     - "10.0.5.1"
-    - "8.8.8.8"
   domains: "home.lan"

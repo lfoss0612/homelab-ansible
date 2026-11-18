@@ -354,8 +354,11 @@ attempts on 2026-11-17, all rolled back from the VM snapshot):
 - Doctor also wants `/home/openclaw/.cache` not group-writable, moves `meta.lastTouchedAt`
   into shared SQLite state and flags the retired `agents.defaults.models` key. None blocked
   the gateway; check `openclaw doctor` output after a bump.
-- Use `-e '{"openclaw_networkd_static_network": {}}'` to keep unrelated networkd drift out
-  of a bump.
+- The networkd static config in `host_vars/openclaw.home.lan.yml` and `host_vars/pdm.home.lan.yml`
+  now matches what is deployed (`DNS=10.0.5.1` only). It used to also list `8.8.8.8`, which the
+  DNS tasks strip, so every run rewrote the file and restarted networkd; that is why a bump needed
+  `-e '{"openclaw_networkd_static_network": {}}'`. The override is no longer needed (verified
+  2026-11-18: a dry run of `deploy-openclaw.yml --tags networkd` reports no change).
 
 Rollback: restore the gateway snapshot/state backup, set the pin and Node variables
 back, re-run `update-openclaw.yml`. A Node major going *down* is not done by `apt`
