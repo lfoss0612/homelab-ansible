@@ -1,0 +1,126 @@
+---
+# Read-only version and update report for every SSH-managed host.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/fleet-versions.yml            (uncommitted changes)
+#   scripts/ansible-on-cockpit.sh playbook playbooks/fleet-versions.yml (committed checkout)
+#
+# Collects, per host: OS release, running vs newest installed kernel, reboot-required, the
+# number of packages apt would install (phased updates excluded), Node.js, the NodeSource
+# repo, OpenClaw, the Zabbix agent version and the Zabbix repo it comes from, whether the
+# claude user exists, and failed units. It then compares them with the pins in group_vars,
+# the latest OpenClaw on npm and the Zabbix server version, and prints a markdown table
+# with an "Attention" list. The same text and the raw JSON are saved on the control node in
+# {{ fleet_versions_report_dir }}.
+#
+# Nothing on any managed host is changed. The tasks are marked check_mode: false so the
+# default dry run of the wrappers produces the full report; the only writes are the report
+# files on the control node.
+#
+# api_managed hosts (opnsense, litellm) use a local connection and are excluded: a task
+# aimed at them would silently run on cockpit and report cockpit's facts as theirs.
+#
+# fleet_latest_os is maintained by hand: update it when a new Debian or Ubuntu release is
+# out and you want hosts on the old one to be reported as behind.
+
+- name: Collect version facts from every managed host
+  hosts: "{{ fleet_versions_hosts | default('all:!api_managed') }}"
+  become: true
+  gather_facts: false
+  vars:
+    fleet_versions_collector: "{{ playbook_dir }}/../scripts/fleet-versions-collect.py"
+  tasks:
+    - name: Run the collector
+      ansible.builtin.script: "{{ fleet_versions_collector }}"
+      register: fleet_versions_raw
+      changed_when: false
+      check_mode: false
+      ignore_unreachable: true
+
+    - name: Parse the collector output
+      ansible.builtin.set_fact:
+        fleet_versions_data: >-
+          {{ (fleet_versions_raw.stdout_lines | last | from_json)
+             | combine({'claude_expected': openclaw_manage_claude_user | default(true) | bool}) }}
+      when: fleet_versions_raw.rc | default(1) == 0 and fleet_versions_raw.stdout_lines | default([]) | length > 0
+
+    - name: Record why a host could not be read
+      ansible.builtin.set_fact:
+        fleet_versions_data:
+          error: "{{ fleet_versions_raw.msg | default(fleet_versions_raw.stderr | default('no output')) }}"
+      when: fleet_versions_data is not defined
+
+- name: Compare with the pins and write the report
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    fleet_versions_report_dir: /var/tmp/fleet-versions
+    fleet_latest_os:
+      debian: "13"
+      ubuntu: "26.04"
+    # Failed units that are known cosmetic leftovers (see the 2026-11-15 incident note).
+    fleet_versions_ignore_units:
+      - '^pm(cd|ie|logger|proxy)\.service$'
+      - '^hd-idle\.service$'
+      - '^quotaon@'
+      - '^zfs-load-module\.service$'
+  tasks:
+    - name: Gather the per-host results
+      ansible.builtin.set_fact:
+        fleet_versions_all: >-
+          {%- set ns = namespace(d={}) -%}
+          {%- for h in groups['all'] -%}
+          {%- if h not in groups['api_managed'] and hostvars[h].fleet_versions_data is defined -%}
+          {%- set ns.d = ns.d | combine({h: hostvars[h].fleet_versions_data}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ ns.d | to_json }}
+
+    - name: Look up the latest OpenClaw release on npm
+      ansible.builtin.command: npm view openclaw version
+      register: fleet_versions_npm
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Make the report directory
+      ansible.builtin.file:
+        path: "{{ fleet_versions_report_dir }}"
+        state: directory
+        mode: "0755"
+      check_mode: false
+
+    - name: Stage the raw data
+      ansible.builtin.copy:
+        dest: "{{ fleet_versions_report_dir }}/latest.json"
+        mode: "0644"
+        content: >-
+          {{ {'pins': {
+                'openclaw_version': hostvars['cockpit.home.lan'].openclaw_version | default(none),
+                'node_major': hostvars['cockpit.home.lan'].openclaw_node_major | default(none),
+                'node_min_version': hostvars['cockpit.home.lan'].openclaw_node_min_version | default(none),
+                'openclaw_latest_npm': (fleet_versions_npm.stdout | default('') | trim) or none,
+                'latest_os': fleet_latest_os,
+                'ignore_units': fleet_versions_ignore_units},
+              'hosts': fleet_versions_all | from_json}
+             | to_nice_json }}
+      check_mode: false
+
+    - name: Render the markdown report
+      ansible.builtin.command: "python3 {{ playbook_dir }}/../scripts/fleet-versions-report.py {{ fleet_versions_report_dir }}/latest.json"
+      register: fleet_versions_report
+      changed_when: false
+      check_mode: false
+
+    - name: Save the markdown report
+      ansible.builtin.copy:
+        dest: "{{ fleet_versions_report_dir }}/latest.md"
+        mode: "0644"
+        content: "{{ fleet_versions_report.stdout }}\n"
+      check_mode: false
+
+    - name: Show the report
+      ansible.builtin.debug:
+        msg: "{{ fleet_versions_report.stdout_lines }}"

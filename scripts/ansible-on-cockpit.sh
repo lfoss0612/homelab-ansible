@@ -12,7 +12,8 @@
 #
 # probe     runs scripts/probes/<name>.sh on the matching hosts via the script module and
 #           prints one line per host. Probes are read-only; add new ones as files, never as
-#           inline shell. Default pattern is "all".
+#           inline shell. Default pattern is all:!api_managed, because api_managed hosts
+#           (opnsense, litellm) use a local connection and would silently run on cockpit.
 # adhoc     runs /usr/bin/ansible. Modules that only read (ping, setup, command, shell,
 #           script, raw, slurp, stat, find, getent, package_facts, service_facts,
 #           systemd_service with no state) run freely; anything else needs --apply before
@@ -104,7 +105,7 @@ case "$cmd" in
     if [ "$name" = "list" ]; then list_probes; exit 0; fi
     file="$probes_dir/$name.sh"
     [ -f "$file" ] || { echo "no such probe: $name. Available:" >&2; list_probes >&2; exit 2; }
-    pattern="${1:-all}"
+    pattern="${1:-all:!api_managed}"
     [ $# -gt 0 ] && shift
     # Ship the probe to a private temp file on cockpit, run it, remove it.
     remote_file="$(ssh "$CONTROL_HOST" 'f=$(mktemp /tmp/probe-XXXXXXXX.sh) && cat > "$f" && chmod 755 "$f" && echo "$f"' < "$file")"
