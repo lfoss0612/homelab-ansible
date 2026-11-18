@@ -15,6 +15,10 @@ openclaw_nodesource_sources: /etc/apt/sources.list.d/nodesource.sources
 # ansible escalation, claude-user-pbs.yml for backup directory access).
 # See docs/claude-access-enforcement.md for the access model and audit procedures.
 claude_user: claude
+
+# Create/maintain the claude automation user. Set false in host_vars for a host
+# where that identity must not be added (pve-router, by owner decision 2026-11-17).
+openclaw_manage_claude_user: true
 claude_pubkey_path: "{{ playbook_dir }}/../keys/claude_ed25519.pub"
 # Pin the key to the workstation's VLAN, same value and reasoning as
 # claude-user.yml/claude-user-zabbix.yml/claude-user-pbs.yml's claude_key_from.

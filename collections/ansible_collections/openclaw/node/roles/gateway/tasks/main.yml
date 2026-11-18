@@ -104,6 +104,88 @@
     - openclaw_device_auth_bypass_fix is changed
     - not ansible_check_mode
 
+# --- State migration on a package change -------------------------------------
+# A new OpenClaw can change the on-disk state schema (SQLite, pairing stores,
+# config), and `openclaw doctor --fix` is what migrates it -- but only with the
+# gateway stopped. The package was just replaced by the common role (the running
+# gateway still has the old binary in memory), so: stop, [optionally set the
+# legacy agent DB aside], doctor, and let the "ensure running" task below start
+# it. Skipped entirely when the package did not change, so a no-op run never
+# stops the gateway.
+#
+# Doctor's own exit code is NOT trusted: it exits 1 at the very end because it
+# cannot restart a system-scope unit as the openclaw user (seen 2026-11-17 on
+# 2026.9.7 after a successful migration). The gateway health gate at the bottom
+# of this role is the real check, and a doctor that left unmigrated state makes
+# the gateway fail to start there. Only a doctor that is killed (rc >= 2, incl.
+# timeout 124) fails here. The log is kept for diagnosis either way.
+#
+# This is a no-op on the first deploy (no state dir yet).
+- name: Migrate OpenClaw state after a package change
+  when:
+    - openclaw_cli_install is defined
+    - openclaw_cli_install is changed
+    - openclaw_state_dir.stat.exists
+    - not ansible_check_mode
+  block:
+    - name: Record the migration timestamp
+      ansible.builtin.set_fact:
+        openclaw_migrate_stamp: "{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}"
+
+    - name: Stop the gateway and node (doctor needs the gateway stopped)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop: [openclaw-gateway.service, openclaw-node.service]
+      when: item in (ansible_facts.services | default({}))
+
+    - name: Find legacy per-agent SQLite databases
+      ansible.builtin.find:
+        paths: "/home/{{ openclaw_user }}/.openclaw/agents"
+        patterns: ["openclaw-agent.sqlite", "openclaw-agent.sqlite-wal", "openclaw-agent.sqlite-shm"]
+        recurse: true
+      register: openclaw_legacy_agent_dbs
+      when: openclaw_migrate_discard_legacy_agent_db | bool
+
+    - name: Set the legacy agent databases aside (sessions in them are lost)
+      ansible.builtin.shell: |
+        set -e
+        aside=/var/backups/openclaw-agent-legacy-{{ openclaw_migrate_stamp }}
+        mkdir -p "$aside" && chmod 700 "$aside"
+        mv {{ openclaw_legacy_agent_dbs.files | map(attribute='path') | map('quote') | join(' ') }} "$aside"/
+      when:
+        - openclaw_migrate_discard_legacy_agent_db | bool
+        - openclaw_legacy_agent_dbs.files | length > 0
+
+    - name: Run openclaw doctor --fix as the service user
+      ansible.builtin.shell:
+        cmd: >-
+          runuser -u {{ openclaw_user }} --
+          timeout {{ openclaw_doctor_timeout_seconds }}
+          {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw doctor --fix --non-interactive
+          > /var/tmp/openclaw-doctor-{{ openclaw_migrate_stamp }}.log 2>&1
+      register: openclaw_doctor
+      changed_when: true
+      failed_when: openclaw_doctor.rc >= 2
+
+    - name: Tail the doctor log
+      ansible.builtin.command: tail -n 25 /var/tmp/openclaw-doctor-{{ openclaw_migrate_stamp }}.log
+      register: openclaw_doctor_log
+      changed_when: false
+
+    - name: Show the doctor log tail (rc {{ openclaw_doctor.rc }}; rc 1 is expected, see comment)
+      ansible.builtin.debug:
+        var: openclaw_doctor_log.stdout_lines
+  rescue:
+    - name: Fail loudly, leaving the gateway stopped
+      ansible.builtin.fail:
+        msg: >-
+          OpenClaw state migration failed and the gateway was left STOPPED (the
+          new package cannot be rolled back over migrated state, and the old one
+          refuses a newer schema). Log: /var/tmp/openclaw-doctor-*.log on this
+          host. Recover from the VM snapshot, or the state backup this role took
+          at the top (/var/backups/openclaw-state-*.tar.gz).
+
 - name: Install gateway systemd unit
   ansible.builtin.template:
     src: openclaw-gateway.service.j2
@@ -130,5 +212,35 @@
     return_content: true
   register: openclaw_gateway_health
   until: openclaw_gateway_health.status == 200 and (openclaw_gateway_health.json.ok | default(false))
-  retries: 12
+  retries: "{{ openclaw_gateway_health_retries }}"
   delay: 5
+
+# gateway.trustedProxies takes effect without a restart (live reload). Read,
+# compare, set, verify -- same shape as the device-auth task above.
+- name: Read gateway.trustedProxies
+  ansible.builtin.command:
+    cmd: >-
+      runuser -u {{ openclaw_user }} --
+      {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
+      config get gateway.trustedProxies --json
+  register: openclaw_trusted_proxies_now
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when:
+    - openclaw_gateway_trusted_proxies | length > 0
+    - openclaw_version is version(openclaw_gateway_trusted_proxies_min_version, '>=')
+
+- name: Set gateway.trustedProxies
+  ansible.builtin.command:
+    cmd: >-
+      runuser -u {{ openclaw_user }} --
+      {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
+      config set gateway.trustedProxies '{{ openclaw_gateway_trusted_proxies | to_json }}' --strict-json
+  when:
+    - openclaw_gateway_trusted_proxies | length > 0
+    - openclaw_version is version(openclaw_gateway_trusted_proxies_min_version, '>=')
+    - >-
+      openclaw_trusted_proxies_now.rc != 0 or
+      (openclaw_trusted_proxies_now.stdout | from_json) != openclaw_gateway_trusted_proxies
+

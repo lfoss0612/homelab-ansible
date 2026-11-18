@@ -22,6 +22,16 @@
     name: openclaw.node.common
   tags: [privileges, dns, networkd]
 
+# Inside ~/.openclaw, which the sandbox already makes writable. 0700 because the
+# secure-temp-root check refuses a directory others can write.
+- name: Ensure the node temp directory exists
+  ansible.builtin.file:
+    path: "{{ openclaw_node_tmpdir }}"
+    state: directory
+    owner: "{{ openclaw_user }}"
+    group: "{{ openclaw_group }}"
+    mode: "0700"
+
 - name: Write environment file (token, insecure-ws flag)
   ansible.builtin.template:
     src: openclaw-node-env.j2

@@ -7,3 +7,6 @@ OPENCLAW_GATEWAY_TOKEN={{ openclaw_gateway_token }}
 # certificate chain" without this, even after update-ca-certificates has
 # run. Points at the same file the common role installs system-wide.
 NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/home-lan-ca.crt
+
+# See openclaw_node_tmpdir in the node role defaults.
+TMPDIR={{ openclaw_node_tmpdir }}

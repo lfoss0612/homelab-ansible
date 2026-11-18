@@ -17,3 +17,8 @@ openclaw_gateway_port: 18789
 
 
 openclaw_force_reinstall: false
+
+# HAProxy on OPNsense reaches the gateway from 10.0.5.1. See the gateway role's
+# defaults for why trusting it is safe with this HAProxy.
+openclaw_gateway_trusted_proxies:
+  - 10.0.5.1

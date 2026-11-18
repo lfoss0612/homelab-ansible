@@ -35,7 +35,7 @@
 # than comparing raw counts, which would never match.
 
 - name: Validate OpenClaw version pin fleet-wide
-  hosts: openclaw:!openclaw_optional
+  hosts: openclaw:!openclaw_optional:!openclaw_deferred
   gather_facts: false
   become: true
 

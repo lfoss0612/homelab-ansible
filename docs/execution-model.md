@@ -310,6 +310,52 @@ needs a newer Node.js (2026.9.3 moved the floor from Node 22 to 24):
 6. **Verify** with `validate-openclaw.yml` (version pin, Node floor, pairing, DNS,
    sandbox) and the Zabbix drift trigger, then push.
 
+**What the roles now do on a package change** (added after the first three 2026.11.5
+attempts on 2026-11-17, all rolled back from the VM snapshot):
+
+- *Gateway:* when the common role's `npm install` changes the package, the gateway role
+  stops the gateway and node, runs `openclaw doctor --fix --non-interactive` as the service
+  user (log in `/var/tmp/openclaw-doctor-<stamp>.log`, tail shown in the run), and the
+  normal "ensure running" task starts it; the health gate at the end of the role is the
+  real success check, because Doctor exits 1 even on success (it tries to restart a
+  system-scope unit as the `openclaw` user). On failure the gateway is left stopped with a
+  message pointing at the snapshot/backup. Nothing happens when the package is unchanged.
+- *Nodes:* a changed package restarts `openclaw-node` (handler in the common role) instead
+  of leaving the old process in memory. The node gets `TMPDIR` inside `~/.openclaw`
+  (`openclaw_node_tmpdir`), because 2026.9.x falls back to `~/.cache/openclaw-<uid>` for its
+  temp dir, which `ProtectHome=read-only` blocks. The sandbox is not widened.
+- *HAProxy:* `gateway.trustedProxies` (`openclaw_gateway_trusted_proxies`, 10.0.5.1) is set
+  from 2026.9, otherwise a 9.x gateway answers every node behind HAProxy with HTTP 403
+  `proxy_attribution_required`. This HAProxy appends its own X-Forwarded-For entry to a
+  client-supplied one rather than overwriting (sniffed 2026-11-17); the gateway reads the
+  chain right-to-left, so a spoofed leading entry is ignored.
+- *Downgrade guard:* `update-openclaw.yml` refuses to run when the gateway is already newer
+  than the pin (`-e openclaw_downgrade_ok=true` to override after restoring state). An older
+  build refuses a newer database, and the weekly timer only reads the pin in git.
+- *claude user:* `openclaw_manage_claude_user` (default true) controls whether the common
+  role creates it; it will be created on vscode.
+- *pve-router is deferred:* it is in the `[openclaw_deferred]` inventory group, excluded from
+  `update-openclaw.yml` and `validate-openclaw.yml`, so it stays on its current OpenClaw until
+  it is handled separately. A 9.x gateway will not accept its 7.x node meanwhile.
+
+**Still manual**
+
+- *A schema break needs a hop.* 2026.11.5 refuses the 2026.7.1-2 agent database ("unreleased
+  session schema"); Doctor from **2026.9.7** has to run first. Run the playbook twice:
+  `update-openclaw.yml --limit openclaw_gateway -e openclaw_version=2026.9.7 -e
+  openclaw_migrate_discard_legacy_agent_db=true`, then the real pin. The discard flag moves
+  the old per-agent database to `/var/backups` (its sessions are lost; 9.7's Doctor refuses
+  its non-canonical tables one at a time otherwise). It also needs the Node variables for the
+  hop's own requirement (24.x for 9.x).
+- *Pairing approvals.* Nodes on other VLANs and nodes re-pairing after the jump request a
+  "role-upgrade" and wait for `approve-openclaw-nodes.yml -e openclaw_approve_confirm=true`
+  (it handles both queues; dry-run by default; inventory hosts only).
+- Doctor also wants `/home/openclaw/.cache` not group-writable, moves `meta.lastTouchedAt`
+  into shared SQLite state and flags the retired `agents.defaults.models` key. None blocked
+  the gateway; check `openclaw doctor` output after a bump.
+- Use `-e '{"openclaw_networkd_static_network": {}}'` to keep unrelated networkd drift out
+  of a bump.
+
 Rollback: restore the gateway snapshot/state backup, set the pin and Node variables
 back, re-run `update-openclaw.yml`. A Node major going *down* is not done by `apt`
 upgrade; point the NodeSource repo back and install the older `nodejs` explicitly.

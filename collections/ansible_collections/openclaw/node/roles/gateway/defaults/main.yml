@@ -2,3 +2,28 @@
 openclaw_user: openclaw
 openclaw_group: openclaw
 openclaw_gateway_port: 18789
+
+# Proxies whose X-Forwarded-For the gateway trusts (gateway.trustedProxies).
+# Needed from 2026.9: without it a gateway reached through HAProxy answers
+# nodes with HTTP 403 proxy_attribution_required. Applied only when the pinned
+# version is >= openclaw_gateway_trusted_proxies_min_version, because an older
+# gateway's config schema may reject the key.
+#
+# Safe with this HAProxy: it APPENDS its own entry to a client-supplied
+# X-Forwarded-For instead of overwriting it (verified 2026-11-17 by sniffing the
+# gateway), and the gateway reads the chain right-to-left, so the last hop --
+# the real peer HAProxy saw -- wins and a spoofed leading entry is ignored.
+openclaw_gateway_trusted_proxies: []
+openclaw_gateway_trusted_proxies_min_version: "2026.9.0"
+
+# State-migration step, run when this role changes the installed package.
+#
+# openclaw_migrate_discard_legacy_agent_db: move ~/.openclaw/agents/*/agent/
+#   openclaw-agent.sqlite* to /var/backups before doctor runs. Needed when the
+#   jump crosses the schema break (2026.7.1-2 -> 2026.9.x: doctor refuses
+#   non-canonical tables in the old agent database one at a time). LOSES the
+#   sessions/transcripts in that database; the originals stay in /var/backups.
+#   Leave false unless doctor refuses -- pass -e on the one run that needs it.
+openclaw_migrate_discard_legacy_agent_db: false
+openclaw_doctor_timeout_seconds: 900
+openclaw_gateway_health_retries: 24

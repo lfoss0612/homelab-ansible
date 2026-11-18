@@ -19,7 +19,7 @@
 # PHASE 1 — Verify: compare installed version against the pin
 # ============================================================
 - name: Detect installed OpenClaw versions
-  hosts: openclaw
+  hosts: openclaw:!openclaw_deferred
   gather_facts: false
   become: true
   # A host that cannot be reached here is not marked failed, so it is still
@@ -39,6 +39,10 @@
       register: openclaw_installed_version
       changed_when: false
       failed_when: false
+      # Read-only, so it must run in --check too. Skipped there, every host
+      # reads as "update required" and the downgrade guard below has no version
+      # to compare, so a bump dry-run showed the whole fleet changing.
+      check_mode: false
 
     - name: Determine whether this host needs updating
       ansible.builtin.set_fact:
@@ -46,6 +50,32 @@
           {{ openclaw_installed_version.rc != 0 or
              openclaw_version not in openclaw_installed_version.stdout }}
       when: not (openclaw_installed_version.unreachable | default(false))
+
+    # A gateway that has already been migrated to a newer release cannot be
+    # taken back: an older build refuses the newer SQLite schema ("unreleased
+    # session schema"), and doctor does not downgrade. The weekly timer only
+    # reads the pin in git, so a gateway bumped by hand ahead of a commit (or a
+    # pin reverted after a rollback) would otherwise be "converged" into a
+    # broken state. Versions compare as [year, minor, patch, suffix].
+    - name: Refuse to downgrade the gateway
+      ansible.builtin.assert:
+        that: >-
+          openclaw_downgrade_ok | default(false) | bool or
+          (openclaw_installed_version.stdout | regex_findall('(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\d+))?') | first | default(['0','0','0',''])
+           | map('int') | list)
+          <= (openclaw_version | regex_findall('(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\d+))?') | first
+              | map('int') | list)
+        fail_msg: >-
+          The gateway is on '{{ openclaw_installed_version.stdout }}', NEWER than
+          the pin {{ openclaw_version }}. Refusing to downgrade it (older builds
+          cannot read the newer state). Raise openclaw_version in
+          group_vars/openclaw.yml, or pass -e openclaw_downgrade_ok=true after
+          restoring state from backup.
+        quiet: true
+      when:
+        - inventory_hostname in groups['openclaw_gateway']
+        - not (openclaw_installed_version.unreachable | default(false))
+        - openclaw_installed_version.rc == 0
 
     - name: Report current state
       ansible.builtin.debug:
@@ -87,7 +117,7 @@
 # PHASE 3 — Nodes, serialized, gateway already verified healthy
 # ============================================================
 - name: Update nodes
-  hosts: openclaw_nodes:!openclaw_optional
+  hosts: openclaw_nodes:!openclaw_optional:!openclaw_deferred
   serial: 1
   become: true
   gather_facts: false

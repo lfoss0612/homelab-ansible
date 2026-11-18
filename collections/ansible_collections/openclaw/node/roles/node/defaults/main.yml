@@ -32,6 +32,15 @@ openclaw_node_hardening: true
 # ~openclaw/.openclaw/state/, which the template grants unconditionally.
 openclaw_node_hardening_extra_rw: []
 
+# Node temp directory. 2026.9.x+ resolves a "secure temp root" at startup: it
+# prefers /tmp/openclaw and otherwise falls back to <os.tmpdir()>/openclaw-<uid>.
+# Under this unit's sandbox the fallback landed in ~/.cache (read-only via
+# ProtectHome=read-only), so the node crash-looped on 2026.9.7 (2026-11-17).
+# Pointing TMPDIR at a directory inside the already-writable ~/.openclaw fixes
+# that without widening the sandbox. Verified at rollout, not before: see
+# docs/execution-model.md "Bumping the OpenClaw pin".
+openclaw_node_tmpdir: "/home/{{ openclaw_user }}/.openclaw/tmp"
+
 # Device nodes to keep reachable inside the sandbox, beyond what is
 # auto-detected (currently /dev/zfs). Each entry costs a DeviceAllow plus a bind
 # mount -- add one only for a device a real read-plane command needs.

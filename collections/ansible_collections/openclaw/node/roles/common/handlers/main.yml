@@ -23,6 +23,16 @@
   when: item in (ansible_facts.services | default({}))
   tags: privileges
 
+# The package changed under a running node: restart so it runs the new binary.
+# Fires at the next handler flush -- on the gateway host that is after the
+# gateway's own stop/doctor/start, so the node never starts on unmigrated state.
+# Only a unit that already exists is touched (a first install starts it later).
+- name: restart openclaw-node after package change
+  ansible.builtin.systemd:
+    name: openclaw-node.service
+    state: restarted
+  when: "'openclaw-node.service' in (ansible_facts.services | default({}))"
+
 # Only notified when a DNS-block task actually edits resolved.conf or a
 # drop-in, and only reachable at all when systemd-resolved.service already
 # exists on the host (see the `when` guards in the dns tasks) — so this never
