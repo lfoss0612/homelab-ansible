@@ -31,6 +31,13 @@ ssh form; if a command is blocked, fix the command — do not route around the r
 ssh claude@cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-playbook playbooks/<play>.yml --check --diff'
 ```
 
+- **Use the committed wrappers instead of inline ssh.** The access hook rejects odd quoting (a
+  stray quote character in a comment is enough), so all quoting lives in scripts:
+  `scripts/run-working-tree.sh` runs a playbook from your uncommitted working tree and cleans up
+  after itself; `scripts/ansible-on-cockpit.sh` runs ad-hoc commands, inventory queries, the committed
+  checkout playbooks, and read-only probes (`scripts/probes/*.sh`, `probe list` shows them). To add
+  a check, add a probe file; never inline `ssh claude@cockpit "<complex command>"`. Under `--check`,
+  `command` tasks are skipped unless they set `check_mode: false`.
 - **Always `cd /opt/ansible` first.** Without it `ansible.cfg` is never discovered and
   Ansible silently uses the wrong inventory and collections path. It does not error.
 - **Dry-run first.** `--check --diff` before any real apply.

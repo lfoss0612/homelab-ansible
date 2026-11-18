@@ -87,3 +87,19 @@ scripts/run-working-tree.sh --apply playbooks/update-openclaw.yml --limit opencl
 Without `--apply` it adds `--check --diff`. `--keep` leaves the copy for debugging. Note that
 `command` tasks are skipped under `--check` unless they set `check_mode: false`, so a dry run
 of a playbook that probes with `command` can fail on an empty result.
+
+## ansible-on-cockpit.sh and probes/
+
+Runs ad-hoc Ansible, inventory queries, committed-checkout playbooks and read-only probes through
+cockpit with all quoting inside the script.
+
+```bash
+scripts/ansible-on-cockpit.sh probe list
+scripts/ansible-on-cockpit.sh probe versions            # one line per host: OS, kernel, reboot, node, openclaw, zabbix
+scripts/ansible-on-cockpit.sh probe failed-units k8s_workers
+scripts/ansible-on-cockpit.sh adhoc desktop.home.lan -m command -a "uptime"
+scripts/ansible-on-cockpit.sh inventory --graph
+```
+
+A probe is a small read-only shell script in `scripts/probes/`. Its last stdout line is the host
+result. `adhoc` only allows read-only modules unless you add `--apply`.
