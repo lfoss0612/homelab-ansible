@@ -58,6 +58,7 @@
       ansible.builtin.command:
         cmd: find /home/{{ openclaw_user }}/.openclaw -xdev ! -user {{ openclaw_user }}
       register: openclaw_node_foreign_owned
+      # lint-check-mode: ignore (inside a block that is skipped under --check)
       changed_when: false
 
     - name: Give those entries back to the service user

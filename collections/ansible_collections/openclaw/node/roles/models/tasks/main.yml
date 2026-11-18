@@ -256,6 +256,7 @@
       runuser -u {{ openclaw_models_user }} --
       {{ openclaw_models_cli }} config get agents.defaults.model.primary --json
   register: openclaw_models_verify
+  # lint-check-mode: ignore (only runs when the write above ran, never under --check)
   changed_when: false
   when:
     - not openclaw_models_converged

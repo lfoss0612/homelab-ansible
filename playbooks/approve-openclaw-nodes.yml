@@ -94,6 +94,7 @@
       ansible.builtin.command: npm prefix -g
       register: openclaw_npm_prefix
       changed_when: false
+      check_mode: false
 
     - name: Set the openclaw CLI path
       ansible.builtin.set_fact:
@@ -105,6 +106,7 @@
         {{ openclaw_cli }} nodes status --json
       register: openclaw_nodes_status_raw
       changed_when: false
+      check_mode: false
 
     - name: Parse node status
       ansible.builtin.set_fact:
@@ -170,6 +172,7 @@
         {{ openclaw_cli }} devices list --json
       register: openclaw_devices_raw
       changed_when: false
+      check_mode: false
 
     - name: Parse the device pairing queue
       ansible.builtin.set_fact:

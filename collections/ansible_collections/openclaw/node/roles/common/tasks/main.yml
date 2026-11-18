@@ -348,6 +348,7 @@
 # >=26.1.0", and the current 2026.7.1-2 pin exits 0.
 - name: Install/upgrade the openclaw CLI via npm
   ansible.builtin.command: "npm install -g --engine-strict openclaw@{{ openclaw_version }}"
+  # lint-check-mode: ignore (mutating install: skipping it under --check is correct)
   register: openclaw_cli_install
   # Running units keep the old binary in memory, and a bump can also change the
   # on-disk state schema. The gateway role migrates state (stop, doctor, start);

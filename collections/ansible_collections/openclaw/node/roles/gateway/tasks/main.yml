@@ -85,6 +85,7 @@
       {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw
       config get gateway.controlUi.dangerouslyDisableDeviceAuth --json
   register: openclaw_device_auth_bypass_verify
+  # lint-check-mode: ignore (only runs when the write above changed something, never under --check)
   changed_when: false
   when:
     - openclaw_device_auth_bypass_fix is changed
@@ -171,6 +172,7 @@
     - name: Tail the doctor log
       ansible.builtin.command: tail -n 25 /var/tmp/openclaw-doctor-{{ openclaw_migrate_stamp }}.log
       register: openclaw_doctor_log
+      # lint-check-mode: ignore (only runs when the write above changed something, never under --check)
       changed_when: false
 
     - name: Show the doctor log tail (rc {{ openclaw_doctor.rc }}; rc 1 is expected, see comment)

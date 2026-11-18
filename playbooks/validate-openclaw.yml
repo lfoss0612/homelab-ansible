@@ -54,6 +54,7 @@
       ansible.builtin.command: openclaw --version
       register: openclaw_validate_version
       changed_when: false
+      check_mode: false
 
     - name: Assert installed version matches the pin
       ansible.builtin.assert:
@@ -72,6 +73,7 @@
       ansible.builtin.command: node -v
       register: openclaw_validate_node
       changed_when: false
+      check_mode: false
 
     - name: Assert Node.js meets the floor for the pinned version
       ansible.builtin.assert:
@@ -92,6 +94,7 @@
       ansible.builtin.command: getent hosts {{ openclaw_node_gateway_host }}
       register: openclaw_gateway_resolution
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Assert this host resolves the gateway to its real address
@@ -154,6 +157,7 @@
       ansible.builtin.command: openclaw --version
       register: openclaw_validate_version
       changed_when: false
+      check_mode: false
       when: not (openclaw_optional_probe.unreachable | default(false))
 
     - name: Assert installed version matches the pin
@@ -170,6 +174,7 @@
       ansible.builtin.command: node -v
       register: openclaw_validate_node
       changed_when: false
+      check_mode: false
       when: not (openclaw_optional_probe.unreachable | default(false))
 
     - name: Assert Node.js meets the floor for the pinned version
@@ -188,6 +193,7 @@
       ansible.builtin.command: getent hosts {{ openclaw_node_gateway_host }}
       register: openclaw_gateway_resolution
       changed_when: false
+      check_mode: false
       failed_when: false
       when: not (openclaw_optional_probe.unreachable | default(false))
 
@@ -245,6 +251,7 @@
         url: "http://127.0.0.1:{{ openclaw_gateway_port }}/health"
         return_content: true
       register: openclaw_health
+      check_mode: false
 
     - name: Assert gateway reports healthy
       ansible.builtin.assert:
@@ -260,6 +267,7 @@
         - openclaw-node
       register: openclaw_gateway_services
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Assert the gateway host runs BOTH services
@@ -282,6 +290,7 @@
       ansible.builtin.command: npm prefix -g
       register: openclaw_npm_prefix
       changed_when: false
+      check_mode: false
 
     - name: Set the openclaw CLI path
       ansible.builtin.set_fact:
@@ -294,6 +303,7 @@
         {{ openclaw_cli }} nodes status --json
       register: openclaw_nodes_status_raw
       changed_when: false
+      check_mode: false
 
     - name: Parse node status
       ansible.builtin.set_fact:
@@ -380,6 +390,7 @@
           {{ openclaw_cli }} doctor --lint --json --non-interactive
       register: openclaw_doctor
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Assert doctor completed rather than being killed
