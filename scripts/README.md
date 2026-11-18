@@ -71,3 +71,19 @@ Add to your CI pipeline:
 ```
 
 This ensures configuration variables don't silently skip before the playbook runs.
+
+## run-working-tree.sh
+
+Runs a playbook from your local working tree on the control node (cockpit) without
+committing or pushing first. It ships tracked and non-ignored files to a unique
+`/tmp/ansible-run-*` directory on cockpit, points `ansible.cfg` at it, runs
+`ansible-playbook` as the `ansible` user, and always deletes the copy.
+
+```bash
+scripts/run-working-tree.sh playbooks/validate-openclaw.yml --limit desktop.home.lan   # dry run
+scripts/run-working-tree.sh --apply playbooks/update-openclaw.yml --limit openclaw_nodes
+```
+
+Without `--apply` it adds `--check --diff`. `--keep` leaves the copy for debugging. Note that
+`command` tasks are skipped under `--check` unless they set `check_mode: false`, so a dry run
+of a playbook that probes with `command` can fail on an empty result.
