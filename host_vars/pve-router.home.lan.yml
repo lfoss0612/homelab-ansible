@@ -62,3 +62,6 @@ proxmox_qm_config:
       startup: "order=1"
       protection: 1
       tags: "opnsense"
+
+# Owner decision 2026-11-17: do not create the claude automation user here.
+openclaw_manage_claude_user: false
