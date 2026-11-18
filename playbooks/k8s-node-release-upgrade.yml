@@ -181,10 +181,15 @@
       when: k8s_drain.rc != 0 and not (k8s_upgrade_force_drain | default(false) | bool)
       tags: [drain]
 
+    # Count volumes a workload is attached to on this node. Tickets of type
+    # snapshot-controller are transient (a backup or snapshot job holds them for a
+    # short while and Longhorn releases them) and must not block the wait, which
+    # volumes.status.currentNodeID did not distinguish. Ticket types seen live:
+    # csi-attacher (a pod's volume) and snapshot-controller.
     - name: Wait until no Longhorn volume is still attached to this node
       ansible.builtin.shell: >-
-        {{ k8s_kubectl }} get volumes.longhorn.io -n longhorn-system -o json
-        | python3 -c "import json,sys;n=sys.argv[1];print(sum(1 for v in json.load(sys.stdin)['items'] if v['status'].get('currentNodeID')==n))" {{ inventory_hostname }}
+        {{ k8s_kubectl }} get volumeattachments.longhorn.io -n longhorn-system -o json
+        | python3 -c "import json,sys;n=sys.argv[1];print(sum(1 for v in json.load(sys.stdin)['items'] if any(t.get('nodeID')==n and t.get('type')!='snapshot-controller' for t in (v['spec'].get('attachmentTickets') or {}).values())))" {{ inventory_hostname }}
       environment: "{{ k8s_kubectl_env }}"
       delegate_to: "{{ k8s_control_plane }}"
       register: k8s_attached
@@ -216,8 +221,15 @@
       failed_when: k8s_cordoned.stdout != 'true'
       tags: [upgrade]
 
+    # Count what apt would actually install. `apt list --upgradable` also lists
+    # Ubuntu phased updates, which apt-get holds back until the phase reaches this
+    # machine, so the guard failed on updates that could not be applied anyway.
+    # The simulated upgrade excludes phased updates by default (they show as
+    # "deferred due to phasing"), so its "Inst" lines are the real work left.
     - name: Assert the node has no pending package updates
-      ansible.builtin.shell: apt-get update -qq && apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      ansible.builtin.shell: >-
+        apt-get update -qq &&
+        apt-get -s -o APT::Get::Always-Include-Phased-Updates=false upgrade | grep -c '^Inst ' || true
       register: k8s_upgradable
       changed_when: false
       check_mode: false
