@@ -22,15 +22,126 @@
     name: openclaw.node.common
   tags: [privileges, dns, networkd]
 
+# --- Node state migration ------------------------------------------------------
+# Same idea as the gateway role's migration block, minus the legacy agent-DB
+# set-aside: stop the node, run `openclaw doctor --fix` as the service user, and
+# let "Enable and start" below bring it back. Doctor exits 1 on success here too
+# (it cannot restart a system-scope unit as the openclaw user), so only rc >= 2
+# fails; the node's own is-active health gate in the playbook is the real check.
+# Not on the gateway host: its doctor ran in the gateway role, and the gateway
+# must be stopped for doctor, which it is not here.
+- name: Look for retired node-host state
+  ansible.builtin.stat:
+    path: "/home/{{ openclaw_user }}/.openclaw/node.json"
+  register: openclaw_node_retired_state
+
+- name: Migrate node state with openclaw doctor
+  when:
+    - inventory_hostname not in groups['openclaw_gateway']
+    - openclaw_version is version(openclaw_node_doctor_min_version, '>=')
+    - >-
+      (openclaw_cli_install is defined and openclaw_cli_install is changed)
+      or openclaw_node_retired_state.stat.exists
+    - not ansible_check_mode
+  block:
+    - name: Stop the node for doctor
+      ansible.builtin.systemd:
+        name: openclaw-node.service
+        state: stopped
+      failed_when: false
+
+    # Doctor reads everything under ~/.openclaw as the service user and refuses
+    # ("Private update capture marker is unreadable ... EACCES") if anything there
+    # is root-owned. zabbix had ~/.openclaw/plugins as root:root 0700 from April
+    # 2026 (2026-11-17). Hand the service user back what is its own state dir.
+    - name: Find root-owned entries inside the openclaw state directory
+      ansible.builtin.command:
+        cmd: find /home/{{ openclaw_user }}/.openclaw -xdev ! -user {{ openclaw_user }}
+      register: openclaw_node_foreign_owned
+      changed_when: false
+
+    - name: Give those entries back to the service user
+      ansible.builtin.command:
+        cmd: chown -R {{ openclaw_user }}:{{ openclaw_group }} /home/{{ openclaw_user }}/.openclaw
+      changed_when: true
+      when: openclaw_node_foreign_owned.stdout | length > 0
+
+    # Doctor refuses an unversioned legacy exec-approvals.json ("Invalid legacy
+    # exec approvals (version: expected a supported value)") and stops before the
+    # node-host step -- on every node here, 2026-11-17: a May 2026 file of the form
+    # {"mode": "allowlist", "allowlist": ["/usr/bin/uname"]}. Its own advice is to
+    # reconcile the file with the intended policy, not delete it or broaden it. This
+    # rewrites it in the versioned shape with the SAME policy (allowlist mode, same
+    # commands, unmatched commands denied -- docs: `--agent "*"` applies to all
+    # agents), keeping the original beside it. Only a file with no "version" key
+    # is touched, and only if it has exactly the old keys, so anything unexpected
+    # still stops here for a human.
+    - name: Convert an unversioned legacy exec-approvals.json to the versioned shape
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -e
+          f=/home/{{ openclaw_user }}/.openclaw/exec-approvals.json
+          [ -f "$f" ] || exit 0
+          python3 - "$f" <<'PY'
+          import json, shutil, sys, os
+          f = sys.argv[1]
+          d = json.load(open(f))
+          if "version" in d:
+              sys.exit(0)
+          if set(d) - {"mode", "allowlist"} or d.get("mode") != "allowlist" \
+                  or not all(isinstance(x, str) for x in d.get("allowlist", [])):
+              print("UNEXPECTED legacy exec-approvals shape; leaving it for a human", file=sys.stderr)
+              sys.exit(3)
+          shutil.copy2(f, f + ".pre-versioned")
+          new = {
+              "version": 1,
+              "defaults": {"security": "allowlist", "ask": "off", "askFallback": "deny"},
+              "agents": {"*": {"allowlist": [{"pattern": p} for p in d.get("allowlist", [])]}},
+          }
+          json.dump(new, open(f, "w"), indent=2)
+          print("CONVERTED")
+          PY
+          chown {{ openclaw_user }}:{{ openclaw_group }} "$f" "$f.pre-versioned" 2>/dev/null || true
+          chmod 600 "$f"
+      register: openclaw_exec_approvals_convert
+      changed_when: "'CONVERTED' in openclaw_exec_approvals_convert.stdout"
+
+    - name: Run openclaw doctor --fix as the service user
+      ansible.builtin.shell:
+        cmd: >-
+          runuser -u {{ openclaw_user }} --
+          timeout {{ openclaw_node_doctor_timeout_seconds }}
+          {{ openclaw_npm_prefix.stdout | trim }}/bin/openclaw doctor --fix --non-interactive
+          > /var/tmp/openclaw-node-doctor.log 2>&1
+      register: openclaw_node_doctor
+      changed_when: true
+      failed_when: openclaw_node_doctor.rc >= 2
+
+    - name: Confirm the retired node state is gone
+      ansible.builtin.stat:
+        path: "/home/{{ openclaw_user }}/.openclaw/node.json"
+      register: openclaw_node_retired_after
+
+    - name: Fail if doctor left the retired node state behind
+      ansible.builtin.fail:
+        msg: >-
+          openclaw doctor ran (rc {{ openclaw_node_doctor.rc }}) but
+          ~/.openclaw/node.json is still there; see /var/tmp/openclaw-node-doctor.log.
+      when: openclaw_node_retired_after.stat.exists
+
 # Inside ~/.openclaw, which the sandbox already makes writable. 0700 because the
 # secure-temp-root check refuses a directory others can write.
-- name: Ensure the node temp directory exists
+- name: Ensure the node temp and cache directories exist
   ansible.builtin.file:
-    path: "{{ openclaw_node_tmpdir }}"
+    path: "{{ item }}"
     state: directory
     owner: "{{ openclaw_user }}"
     group: "{{ openclaw_group }}"
     mode: "0700"
+  loop:
+    - "{{ openclaw_node_tmpdir }}"
+    - "{{ openclaw_node_cache_dir }}"
 
 - name: Write environment file (token, insecure-ws flag)
   ansible.builtin.template:

@@ -45,7 +45,8 @@
 # that host generated a fresh pendingRequestId for this playbook to approve.
 #
 # Dry-run by default — prints what it would approve. Pass
-# -e openclaw_approve_confirm=true to actually approve.
+# -e openclaw_approve_confirm=true to actually approve. Hosts in [openclaw_deferred]
+# are never matched (left pending).
 #
 # Usage:
 #   ansible-playbook playbooks/approve-openclaw-nodes.yml
@@ -122,13 +123,13 @@
         openclaw_pending_matched: >-
           {{ openclaw_pending_all
              | selectattr('displayName', 'defined')
-             | selectattr('displayName', 'in', groups['openclaw_nodes'])
+             | selectattr('displayName', 'in', (groups['openclaw_nodes'] | difference(groups['openclaw_deferred'] | default([]))))
              | list }}
         openclaw_pending_unmatched: >-
           {{ (openclaw_pending_all | rejectattr('displayName', 'defined') | list)
              +
              (openclaw_pending_all | selectattr('displayName', 'defined')
-              | rejectattr('displayName', 'in', groups['openclaw_nodes']) | list) }}
+              | rejectattr('displayName', 'in', (groups['openclaw_nodes'] | difference(groups['openclaw_deferred'] | default([])))) | list) }}
 
     - name: Report pending requests with no inventory match — left pending
       ansible.builtin.debug:
@@ -179,13 +180,13 @@
         openclaw_devices_matched: >-
           {{ openclaw_devices_pending
              | selectattr('displayName', 'defined')
-             | selectattr('displayName', 'in', groups['openclaw_nodes'])
+             | selectattr('displayName', 'in', (groups['openclaw_nodes'] | difference(groups['openclaw_deferred'] | default([]))))
              | list }}
         openclaw_devices_unmatched: >-
           {{ (openclaw_devices_pending | rejectattr('displayName', 'defined') | list)
              +
              (openclaw_devices_pending | selectattr('displayName', 'defined')
-              | rejectattr('displayName', 'in', groups['openclaw_nodes']) | list) }}
+              | rejectattr('displayName', 'in', (groups['openclaw_nodes'] | difference(groups['openclaw_deferred'] | default([])))) | list) }}
 
     - name: Report pending device pairings with no inventory match — left pending
       ansible.builtin.debug:

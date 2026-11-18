@@ -5,8 +5,7 @@ openclaw_group: openclaw
 openclaw_install_dir: /opt/openclaw
 
 # npm package version to install (`npm install -g openclaw@{{ openclaw_version }}`).
-# Note the GitHub release tag for this same version is v2026.7.1.
-openclaw_version: "2026.7.1-2"
+openclaw_version: "2026.11.5"
 
 # Node.js the pinned openclaw_version needs. Two variables, always edited
 # together with openclaw_version in the same commit:
@@ -30,8 +29,8 @@ openclaw_version: "2026.7.1-2"
 # A wrong Node can't slip through: the npm install uses --engine-strict, so it
 # fails before touching the install when the host's Node doesn't satisfy the
 # package's declared engines, and validate-openclaw.yml asserts the Node floor.
-openclaw_node_major: "22"
-openclaw_node_min_version: "22.22.3"
+openclaw_node_major: "24"
+openclaw_node_min_version: "24.22.1"
 
 # What NODES dial to reach the gateway — routed through the OPNsense HAProxy
 # frontend (be-openclaw, SNI openclaw.home.lan) rather than the gateway's raw

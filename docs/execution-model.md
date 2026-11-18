@@ -321,9 +321,10 @@ attempts on 2026-11-17, all rolled back from the VM snapshot):
   system-scope unit as the `openclaw` user). On failure the gateway is left stopped with a
   message pointing at the snapshot/backup. Nothing happens when the package is unchanged.
 - *Nodes:* a changed package restarts `openclaw-node` (handler in the common role) instead
-  of leaving the old process in memory. The node gets `TMPDIR` inside `~/.openclaw`
-  (`openclaw_node_tmpdir`), because 2026.9.x falls back to `~/.cache/openclaw-<uid>` for its
-  temp dir, which `ProtectHome=read-only` blocks. The sandbox is not widened.
+  of leaving the old process in memory. The node gets `XDG_CACHE_HOME` (and `TMPDIR`) inside
+  `~/.openclaw`, because 2026.9.x falls back to `$XDG_CACHE_HOME`, else `~/.cache`, plus
+  `/openclaw-<uid>` for its temp dir, which `ProtectHome=read-only` blocks (`TMPDIR` alone
+  did not help). The sandbox is not widened.
 - *HAProxy:* `gateway.trustedProxies` (`openclaw_gateway_trusted_proxies`, 10.0.5.1) is set
   from 2026.9, otherwise a 9.x gateway answers every node behind HAProxy with HTTP 403
   `proxy_attribution_required`. This HAProxy appends its own X-Forwarded-For entry to a

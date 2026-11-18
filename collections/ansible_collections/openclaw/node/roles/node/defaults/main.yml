@@ -32,14 +32,23 @@ openclaw_node_hardening: true
 # ~openclaw/.openclaw/state/, which the template grants unconditionally.
 openclaw_node_hardening_extra_rw: []
 
-# Node temp directory. 2026.9.x+ resolves a "secure temp root" at startup: it
-# prefers /tmp/openclaw and otherwise falls back to <os.tmpdir()>/openclaw-<uid>.
-# Under this unit's sandbox the fallback landed in ~/.cache (read-only via
-# ProtectHome=read-only), so the node crash-looped on 2026.9.7 (2026-11-17).
-# Pointing TMPDIR at a directory inside the already-writable ~/.openclaw fixes
-# that without widening the sandbox. Verified at rollout, not before: see
-# docs/execution-model.md "Bumping the OpenClaw pin".
+# Node temp and cache directories. 2026.9.x+ resolves a secure temp root at
+# startup and, for the node host, falls back to <cache root>/openclaw-<uid>, where
+# the cache root is $XDG_CACHE_HOME if set (absolute) and otherwise ~/.cache.
+# Under this unit's sandbox ~/.cache is read-only (ProtectHome=read-only), so the
+# node crash-looped on 2026.9.7 with "Unable to create fallback OpenClaw temp dir"
+# (2026-11-17). TMPDIR alone did NOT fix it (tried first, same error); pointing
+# XDG_CACHE_HOME at a directory inside the already-writable ~/.openclaw does,
+# without widening the sandbox. TMPDIR is kept for the os.tmpdir() users.
 openclaw_node_tmpdir: "/home/{{ openclaw_user }}/.openclaw/tmp"
+# From this release the node migrates its own state too: 2026.11.5 refuses to run
+# while the retired ~/.openclaw/node.json exists ("retired node-host state remains
+# ...; stop the node host and run `openclaw doctor --fix`") and crash-loops until
+# doctor has been run (seen on every node 2026-11-17). Doctor runs on a package
+# change, or whenever node.json is still present on a host at/after this version.
+openclaw_node_doctor_min_version: "2026.9.0"
+openclaw_node_doctor_timeout_seconds: 300
+openclaw_node_cache_dir: "/home/{{ openclaw_user }}/.openclaw/cache"
 
 # Device nodes to keep reachable inside the sandbox, beyond what is
 # auto-detected (currently /dev/zfs). Each entry costs a DeviceAllow plus a bind

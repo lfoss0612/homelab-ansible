@@ -306,7 +306,7 @@
     - name: Identify connected+paired nodes and any managed host missing from them
       ansible.builtin.set_fact:
         openclaw_nodes_required: >-
-          {{ groups['openclaw_nodes'] | difference(groups['openclaw_optional'] | default([])) }}
+          {{ groups['openclaw_nodes'] | difference(groups['openclaw_optional'] | default([])) | difference(groups['openclaw_deferred'] | default([])) }}
         openclaw_nodes_connected_paired: >-
           {{ openclaw_nodes_status.nodes
              | selectattr('connected', 'equalto', true)
