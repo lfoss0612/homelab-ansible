@@ -13,6 +13,15 @@ openclaw_version: "2026.11.5"
 # jump is refused, and clear it again in the next bump.
 openclaw_upgrade_path: []
 
+# Around a bump (update-openclaw.yml):
+#   openclaw_pre_bump_snapshot      snapshot the gateway VM before each stage that changes it
+#                                   (pre-openclaw-<version>-<date>; prune-snapshots.yml removes them).
+#   openclaw_approve_after_update   once a run changed any host, approve the pending pairings of
+#                                   inventory hosts and fix node names (approve-openclaw-nodes.yml).
+#                                   Anything not in the inventory is only reported, never approved.
+openclaw_pre_bump_snapshot: true
+openclaw_approve_after_update: true
+
 # Node.js the pinned openclaw_version needs. Two variables, always edited
 # together with openclaw_version in the same commit:
 #

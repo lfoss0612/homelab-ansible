@@ -89,6 +89,13 @@
         - openclaw_installed_version.rc == 0
         - not (openclaw_stage_is_hop | default(false) | bool)
 
+    # Remembered across stages (set_fact persists per host) so the wrapper knows, after the last
+    # stage, whether anything in the fleet moved and approvals are worth running.
+    - name: Remember that this host was updated in this run
+      ansible.builtin.set_fact:
+        openclaw_was_updated: "{{ (openclaw_was_updated | default(false) | bool) or (openclaw_update_required | bool) }}"
+      when: not (openclaw_installed_version.unreachable | default(false))
+
     - name: Report current state
       ansible.builtin.debug:
         msg: >-
@@ -104,6 +111,23 @@
           {{ inventory_hostname }} is unreachable — assuming an update is
           required; its convergence play decides whether that is a failure.
       when: openclaw_installed_version.unreachable | default(false)
+
+# ============================================================
+# PHASE 1b — Snapshot the gateway VM before its state is migrated
+# ============================================================
+# State migration is one-way: an older build refuses the migrated state, and three rollbacks
+# on 2026-11-17 were all from a VM snapshot. Taken only when the gateway really will change in
+# this stage; a second run on the same day keeps the first snapshot. Off with
+# -e openclaw_pre_bump_snapshot=false. Remove old ones with playbooks/prune-snapshots.yml.
+- name: Snapshot the gateway before it changes
+  ansible.builtin.import_playbook: pre-change-snapshot.yml
+  vars:
+    snapshot_targets: openclaw_gateway
+    snapshot_change: "openclaw-{{ openclaw_version | replace('.', '-') }}"
+    snapshot_skip_existing: true
+  when:
+    - openclaw_pre_bump_snapshot | default(true) | bool
+    - openclaw_update_required | default(false) | bool
 
 # ============================================================
 # PHASE 2 — Gateway first

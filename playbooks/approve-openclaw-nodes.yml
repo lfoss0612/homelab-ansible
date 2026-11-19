@@ -221,3 +221,50 @@
       loop_control:
         label: "{{ item.displayName }}"
       when: openclaw_approve_confirm | bool
+
+    # --- Names: a node that came back under the wrong name --------------------
+    # After a migration a node can reconnect with a display name that is not its inventory name
+    # (2026-11-17). A node-host entry is renamed only when its remote IP is exactly one inventory
+    # host's ansible_host, the name it carries is not already an inventory name, and the target
+    # name is not taken. Anything else (phones, a proxied connection, ambiguity) is only reported.
+    - name: Read the node list again
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        {{ openclaw_cli }} nodes status --json
+      register: openclaw_nodes_after_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Work out which nodes need a different name
+      ansible.builtin.set_fact:
+        openclaw_rename_plan: >-
+          {%- set names = groups['openclaw_nodes'] | difference(groups['openclaw_deferred'] | default([])) -%}
+          {%- set nodes = (openclaw_nodes_after_raw.stdout | from_json).nodes -%}
+          {%- set taken = nodes | map(attribute='displayName') | list -%}
+          {%- set ns = namespace(plan=[]) -%}
+          {%- for n in nodes if n.clientId | default('') == 'node-host' and n.displayName | default('') not in names -%}
+          {%- set cands = [] -%}
+          {%- for h in names if hostvars[h].ansible_host | default('') == n.remoteIp | default('-') -%}{%- set _ = cands.append(h) -%}{%- endfor -%}
+          {%- if cands | length == 1 and cands[0] not in taken -%}
+          {%- set ns.plan = ns.plan + [{'nodeId': n.nodeId, 'from': n.displayName | default('(none)'), 'to': cands[0], 'ip': n.remoteIp}] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ ns.plan }}
+
+    - name: Report the renames
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Renaming' if openclaw_approve_confirm | bool else 'Would rename (dry-run)' }}
+          node '{{ item.from }}' ({{ item.ip }}) to '{{ item.to }}'
+      loop: "{{ openclaw_rename_plan }}"
+      loop_control:
+        label: "{{ item.from }}"
+
+    - name: Rename the nodes
+      ansible.builtin.command: >-
+        runuser -u {{ openclaw_user }} --
+        {{ openclaw_cli }} nodes rename --node {{ item.nodeId }} --name {{ item.to }}
+      loop: "{{ openclaw_rename_plan }}"
+      loop_control:
+        label: "{{ item.from }}"
+      when: openclaw_approve_confirm | bool

@@ -53,3 +53,35 @@
 - name: Pin
   ansible.builtin.import_playbook: openclaw-converge-stage.yml
   vars: {openclaw_stage: -1}
+
+# After a run that changed something, nodes reconnect and ask to be paired again, and a node can
+# come back under the wrong name. Approve the inventory hosts' requests and put names right
+# (the same play as approve-openclaw-nodes.yml, with its report of exactly what it approves).
+- name: Did anything change
+  hosts: openclaw_gateway
+  gather_facts: false
+  tasks:
+    - name: Work out whether any host was updated in this run
+      ansible.builtin.set_fact:
+        openclaw_fleet_updated: >-
+          {%- set ns = namespace(n=0) -%}
+          {%- for h in groups['openclaw'] -%}
+          {%- if hostvars[h].openclaw_was_updated | default(false) | bool -%}{%- set ns.n = ns.n + 1 -%}{%- endif -%}
+          {%- endfor -%}
+          {{ ns.n > 0 }}
+
+    - name: Give the nodes a moment to reconnect and file their requests
+      ansible.builtin.pause:
+        seconds: 45
+      when:
+        - openclaw_fleet_updated | bool
+        - openclaw_approve_after_update | default(true) | bool
+        - not ansible_check_mode
+
+- name: Approve pairings and fix names after the update
+  ansible.builtin.import_playbook: approve-openclaw-nodes.yml
+  vars:
+    openclaw_approve_confirm: true
+  when:
+    - openclaw_fleet_updated | default(false) | bool
+    - openclaw_approve_after_update | default(true) | bool

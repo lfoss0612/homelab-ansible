@@ -16,6 +16,10 @@
 #   vzdump    a snapshot-mode backup to PBS, for guests whose disks cannot be snapshotted
 #             (omv has passthrough disks). Slower; restore is a manual PBS restore.
 #
+# snapshot_skip_existing=true makes a name that already exists a skip with a message instead of a
+# failure, so a second run on the same day (a retry after a failed change) does not stop on the
+# snapshot taken the first time. update-openclaw.yml sets it.
+#
 # Guests are done one at a time. Snapshots use space until pruned: playbooks/prune-snapshots.yml
 # lists and removes old ones.
 
@@ -46,6 +50,21 @@
 
     - name: Read the existing snapshots
       ansible.builtin.include_tasks: tasks/pve-list-snapshots.yml
+
+    - name: Skip a guest that already has this snapshot (snapshot_skip_existing)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} already has {{ pve_snap_name }}; keeping it (snapshot_skip_existing)."
+      when:
+        - snapshot_skip_existing | default(false) | bool
+        - pve_snapshot_method | default('snapshot') == 'snapshot'
+        - pve_snap_name in (pve_snapshots | map(attribute='name') | list)
+
+    - name: Stop for this guest when the snapshot already exists
+      ansible.builtin.meta: end_host
+      when:
+        - snapshot_skip_existing | default(false) | bool
+        - pve_snapshot_method | default('snapshot') == 'snapshot'
+        - pve_snap_name in (pve_snapshots | map(attribute='name') | list)
 
     - name: Refuse to reuse a snapshot name
       ansible.builtin.assert:

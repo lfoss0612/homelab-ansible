@@ -353,7 +353,14 @@ attempts on 2026-11-17, all rolled back from the VM snapshot):
   the old per-agent database to `/var/backups` (its sessions are lost; 9.7's Doctor refuses
   its non-canonical tables one at a time otherwise). It also needs the Node variables for the
   hop's own requirement (24.x for 9.x).
-- *Pairing approvals.* Nodes on other VLANs and nodes re-pairing after the jump request a
+- *Automatic after a bump (since 2026-11-19).* When a run of `update-openclaw.yml` changes any
+  host: the gateway VM is snapshotted first (`pre-openclaw-<version>-<date>`, kept if it already
+  exists; off with `openclaw_pre_bump_snapshot=false`), and at the end the pairing queues are
+  approved for inventory hosts and a node that came back under a wrong name is renamed
+  (matched by its remote IP being exactly one inventory host's address; off with
+  `openclaw_approve_after_update=false`). Unknown devices are only reported. Nothing of this
+  runs when no host changed, so the weekly timer stays quiet.
+- *Pairing approvals (by hand).* Nodes on other VLANs and nodes re-pairing after the jump request a
   "role-upgrade" and wait for `approve-openclaw-nodes.yml -e openclaw_approve_confirm=true`
   (it handles both queues; dry-run by default; inventory hosts only).
 - Doctor also wants `/home/openclaw/.cache` not group-writable, moves `meta.lastTouchedAt`
