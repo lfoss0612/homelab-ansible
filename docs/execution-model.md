@@ -688,3 +688,20 @@ Not Ansible's to fix, recorded here only so the list is complete. Both live in
   account isolation, and audit procedures to ensure `claude` can only use the `claude`
   account (verified 2026-09-22)
 - `../README.md` — topology, playbooks, version pinning
+
+## Rebooting a host (`playbooks/fleet-reboot.yml`)
+
+`os-update.yml` never reboots. `fleet-reboot.yml` reboots **one host per run**, with the gate for its
+kind: LXC refused (the kernel is the hypervisor's), Kubernetes (cordon, drain with Longhorn instance
+managers excluded, wait for volumes to detach, reboot, wait for node and Longhorn Ready, uncordon),
+Proxmox (corosync quorum must survive the node being down; the boot pin is compared with the newest
+kernel because a pin makes the reboot land on the old one), PBS (no running tasks), omv (no NFS
+clients). It also asserts dkms covers the kernel that will boot, and checks the kernel, failed
+units and the Zabbix agent afterwards.
+
+- No host named: lists the hosts needing a reboot in the order to do them (read-only).
+- `-e reboot_host=<name>` dry run runs the pre-checks only; `--apply -e reboot_go=true` reboots.
+- Overrides, each deliberate: `reboot_allow_control_plane`, `reboot_force_drain`,
+  `reboot_allow_quorum_loss`, `reboot_allow_control_node` (the host carries cockpit: the reboot is
+  scheduled detached and checked afterwards with `-e reboot_verify_only=true` from cockpit),
+  `reboot_ignore_nfs`, `reboot_force`.

@@ -1,0 +1,431 @@
+---
+# Reboot ONE host safely, with the gate that fits its kind of host. os-update.yml never reboots;
+# this is the step that does, one host per run so the order and the go-ahead stay a human call.
+#
+# Usage (the wrapper runs a dry run unless --apply is given):
+#   scripts/run-working-tree.sh playbooks/fleet-reboot.yml
+#       no host named: lists every host that needs a reboot, in the order to do them. Read-only.
+#   scripts/run-working-tree.sh playbooks/fleet-reboot.yml -e reboot_host=vscode.home.lan
+#       dry run: runs the pre-checks only and says what it would do.
+#   scripts/run-working-tree.sh --apply playbooks/fleet-reboot.yml -e reboot_host=vscode.home.lan -e reboot_go=true
+#   ... -e reboot_verify_only=true    post-reboot checks only (use after a reboot that took cockpit down)
+#
+# Gates by kind of host (inventory groups):
+#   lxc                containers share the host's kernel: refused, with the name of the hypervisor.
+#   k8s_master/workers cordon, graceful drain (Longhorn instance managers excluded, as in
+#                      k8s-node-release-upgrade.yml), wait until no Longhorn volume is attached,
+#                      reboot, wait for the node and for Longhorn to be Ready, uncordon.
+#                      The control-plane node needs -e reboot_allow_control_plane=true (API is down).
+#                      A failed graceful drain needs -e reboot_force_drain=true (an outage for what
+#                      the PDBs protect).
+#   proxmox_hosts      corosync quorum must hold with this node gone, before and after. Lists the
+#                      guests that go down with it. The pinned boot kernel is compared with the
+#                      newest installed one, because a pin makes the reboot land on the OLD kernel.
+#                      Hosting cockpit (pve-router): needs -e reboot_allow_control_node=true; the run
+#                      is then cut off by the reboot, so it only schedules the reboot and you run
+#                      -e reboot_verify_only=true from cockpit once it is back.
+#   pbs                refuses while a backup, verify, prune or GC task is running.
+#   omv                refuses while NFS clients are connected (-e reboot_ignore_nfs=true to override).
+#   everything else    plain reboot and wait.
+# Every kind: refuses unless the running kernel is not the newest (or reboot-required is set),
+# unless -e reboot_force=true; asserts dkms covers the kernel that will boot where dkms is in use
+# (the worker-2 NVIDIA trap); and after boot checks the kernel, failed units and the Zabbix agent.
+
+- name: Which hosts need a reboot
+  hosts: "{{ 'localhost' if reboot_host is defined else 'all:!api_managed:!lxc:!cockpit.home.lan' }}"
+  gather_facts: false
+  become: true
+  vars:
+    # Do these first to last. Hypervisors last: they take their guests with them.
+    reboot_order:
+      - desktop.home.lan
+      - vscode.home.lan
+      - openclaw.home.lan
+      - zabbix.home.lan
+      - omv.home.lan
+      - k8s-worker.home.lan
+      - k8s-worker-2.home.lan
+      - k8s-master.home.lan
+      - pbs.home.lan
+      - pve.home.lan
+      - pve-ai.home.lan
+      - pve-router.home.lan
+  tasks:
+    - name: Check whether this host needs a reboot
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          newest=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+          if [ -f /var/run/reboot-required ]; then echo "YES reboot-required flag (running $(uname -r))"
+          elif [ -n "$newest" ] && [ "$newest" != "$(uname -r)" ]; then echo "YES running $(uname -r), newest installed $newest"
+          else echo no; fi
+        executable: /bin/bash
+      register: reboot_list_check
+      changed_when: false
+      check_mode: false
+      when: reboot_host is not defined
+
+    - name: List them in order
+      ansible.builtin.debug:
+        msg: |-
+          {% set ns = namespace(lines=[]) %}
+          {% for h in reboot_order if h in ansible_play_hosts_all %}
+          {% set r = hostvars[h].reboot_list_check.stdout | default('unreachable') %}
+          {% if r.startswith('YES') %}{% set ns.lines = ns.lines + [h ~ ': ' ~ r] %}{% endif %}
+          {% endfor %}
+          {{ ns.lines if ns.lines else 'no host needs a reboot' }}
+      run_once: true
+      when: reboot_host is not defined
+
+- name: Reboot one host
+  hosts: "{{ reboot_host | default('localhost') }}"
+  gather_facts: false
+  become: true
+  vars:
+    reboot_control_plane: k8s-master.home.lan
+    reboot_kubectl: /var/lib/rancher/rke2/bin/kubectl
+    reboot_kubectl_env: { KUBECONFIG: /etc/rancher/rke2/rke2.yaml }
+    reboot_drain_selector: "longhorn.io/component!=instance-manager"
+    reboot_is_k8s: "{{ inventory_hostname in groups['k8s'] | default([]) }}"
+    reboot_is_pve: "{{ inventory_hostname in groups['proxmox_hosts'] | default([]) }}"
+    reboot_is_lxc: "{{ inventory_hostname in groups['lxc'] | default([]) }}"
+  tasks:
+    - name: Nothing to do without a host (the list above is the answer)
+      ansible.builtin.meta: end_play
+      when: reboot_host is not defined
+
+    - name: Refuse a container
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} is an LXC container; its kernel is the host's
+          ({{ hostvars[inventory_hostname].pve_hypervisor | default('its hypervisor') }}).
+          Reboot that host, not this one.
+      when: reboot_is_lxc | bool
+
+    # ---------------------------------------------------------------- pre-checks
+    - name: Read what would boot next
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          running=$(uname -r)
+          newest=$(ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+          pin=""
+          [ -f /etc/kernel/proxmox-boot-pin ] && pin=$(cat /etc/kernel/proxmox-boot-pin)
+          flag=no; [ -f /var/run/reboot-required ] && flag=yes
+          echo "running=$running"; echo "newest=$newest"; echo "pin=$pin"; echo "flag=$flag"
+          echo "dkms_missing=$( (dkms status 2>/dev/null | grep -v -E 'installed' || true) | wc -l)"
+          if command -v dkms >/dev/null && [ -n "$(dkms status 2>/dev/null)" ]; then
+            target="${pin:-$newest}"
+            dkms status 2>/dev/null | grep -q "$target" && echo dkms_covers=yes || echo dkms_covers=NO
+          else echo dkms_covers=n/a; fi
+        executable: /bin/bash
+      register: reboot_state
+      changed_when: false
+      check_mode: false
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        reboot_info: "{{ dict(reboot_state.stdout_lines | map('split', '=', 1) | list) }}"
+
+    - name: Work out the kernel that will boot
+      ansible.builtin.set_fact:
+        reboot_expected_kernel: "{{ reboot_info.pin if reboot_info.pin | length > 0 else reboot_info.newest }}"
+        reboot_needed: "{{ reboot_info.flag == 'yes' or reboot_info.running != reboot_info.newest }}"
+
+    - name: Say what this reboot does to the kernel
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: running {{ reboot_info.running }}, newest installed {{ reboot_info.newest }},
+          pin '{{ reboot_info.pin }}', will boot {{ reboot_expected_kernel }}.
+          {{ 'The pin overrides the newest kernel: bump it first (see pve-router-kernel-pin-bump.yml) if the new one is wanted.'
+             if reboot_info.pin | length > 0 and reboot_info.pin != reboot_info.newest else '' }}
+
+    - name: Refuse when there is nothing to gain
+      ansible.builtin.assert:
+        that: reboot_needed | bool or (reboot_force | default(false) | bool)
+        fail_msg: >-
+          {{ inventory_hostname }} already runs {{ reboot_info.running }}, the kernel that would boot, and has
+          no reboot-required flag. Pass -e reboot_force=true to reboot anyway.
+      when: not (reboot_verify_only | default(false) | bool)
+
+    - name: Refuse when dkms has not built for the kernel that will boot
+      ansible.builtin.assert:
+        that: reboot_info.dkms_covers != 'NO'
+        fail_msg: >-
+          dkms has no module built for {{ reboot_expected_kernel }} on {{ inventory_hostname }}. Booting it
+          would come up without the driver (the k8s-worker-2 NVIDIA trap). Run dkms autoinstall first.
+      when: not (reboot_verify_only | default(false) | bool)
+
+    - name: Proxmox host pre-checks
+      when: reboot_is_pve | bool and not (reboot_verify_only | default(false) | bool)
+      block:
+        - name: Read quorum and the guests on this host
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              pvecm status | awk '/Expected votes|Total votes|Quorate|Node ID/{print}'
+              echo "--- running guests"
+              (qm list 2>/dev/null | awk '$3=="running"{print "vm", $1, $2}'; pct list 2>/dev/null | awk '$2=="running"{print "ct", $1, $3}') || true
+              echo "--- this node votes"
+              pvecm status | awk '/\(local\)/{print}'
+            executable: /bin/bash
+          register: reboot_pve
+          changed_when: false
+          check_mode: false
+
+        - name: Compute whether quorum survives this node going away
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              total=$(pvecm status | awk '/Total votes/{print $3}')
+              expected=$(pvecm status | awk '/Expected votes/{print $3}')
+              mine=$(pvecm nodes | awk '/\(local\)/{print $2}')
+              need=$(( expected / 2 + 1 ))
+              echo "total=$total expected=$expected mine=${mine:-1} need=$need left=$(( total - ${mine:-1} ))"
+              [ $(( total - ${mine:-1} )) -ge "$need" ] && echo QUORUM_OK || echo QUORUM_LOST
+            executable: /bin/bash
+          register: reboot_quorum
+          changed_when: false
+          check_mode: false
+
+        - name: Show quorum and guests
+          ansible.builtin.debug:
+            msg: "{{ reboot_pve.stdout_lines + reboot_quorum.stdout_lines }}"
+
+        - name: Require that the cluster keeps quorum, or an explicit override
+          ansible.builtin.assert:
+            that: "'QUORUM_OK' in reboot_quorum.stdout or (reboot_allow_quorum_loss | default(false) | bool)"
+            fail_msg: >-
+              Quorum would be lost with {{ inventory_hostname }} down. Pass -e reboot_allow_quorum_loss=true
+              only if that is intended (cluster file system goes read-only until it returns).
+
+        - name: Require an explicit go-ahead for hosting cockpit
+          ansible.builtin.assert:
+            that: >-
+              (reboot_allow_control_node | default(false) | bool)
+              or not (groups['lxc'] | default([]) | map('extract', hostvars, 'pve_hypervisor') | select('equalto', inventory_hostname) | list | length > 0)
+            fail_msg: >-
+              {{ inventory_hostname }} hosts the control node (cockpit) and the network. This run will be cut
+              off by the reboot. Pass -e reboot_allow_control_node=true to schedule it detached, then verify
+              with -e reboot_verify_only=true from cockpit when it is back.
+
+    - name: PBS pre-check
+      when: inventory_hostname == 'pbs.home.lan' and not (reboot_verify_only | default(false) | bool)
+      block:
+        - name: Running Backup Server tasks
+          ansible.builtin.command: proxmox-backup-manager task list
+          register: reboot_pbs_tasks
+          changed_when: false
+          check_mode: false
+
+        - name: Refuse while a backup, verify, prune or garbage collection is running
+          ansible.builtin.assert:
+            that: reboot_pbs_tasks.stdout | trim | length == 0
+            fail_msg: "PBS has running tasks, wait for them: {{ reboot_pbs_tasks.stdout | truncate(300) }}"
+
+    - name: omv pre-check
+      when: inventory_hostname == 'omv.home.lan' and not (reboot_verify_only | default(false) | bool)
+      block:
+        - name: NFS clients connected to omv
+          ansible.builtin.shell: "ss -Htn state established '( sport = :2049 )' | awk '{print $4}' | cut -d: -f1 | sort -u"
+          register: reboot_nfs
+          changed_when: false
+          check_mode: false
+
+        - name: Refuse while NFS clients are connected
+          ansible.builtin.assert:
+            that: reboot_nfs.stdout | trim | length == 0 or (reboot_ignore_nfs | default(false) | bool)
+            fail_msg: >-
+              NFS clients are connected from {{ reboot_nfs.stdout_lines | join(', ') }}. Their mounts
+              hang while omv is down. Pass -e reboot_ignore_nfs=true to go ahead.
+
+    - name: Kubernetes pre-checks and drain
+      when: reboot_is_k8s | bool and not (reboot_verify_only | default(false) | bool)
+      block:
+        - name: Refuse the control-plane node unless allowed
+          ansible.builtin.assert:
+            that: inventory_hostname != reboot_control_plane or (reboot_allow_control_plane | default(false) | bool)
+            fail_msg: >-
+              {{ inventory_hostname }} is the only control-plane and etcd node; the API is down while it
+              reboots. Pass -e reboot_allow_control_plane=true.
+
+        - name: Every node must be Ready before one is taken away
+          ansible.builtin.shell: >-
+            {{ reboot_kubectl }} get nodes --no-headers | awk '$2!="Ready"{print}'
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_notready
+          changed_when: false
+          check_mode: false
+          failed_when: reboot_notready.stdout | trim | length > 0
+
+        - name: Every Longhorn volume must be healthy (a degraded one would lose a replica)
+          ansible.builtin.shell: >-
+            {{ reboot_kubectl }} get volumes.longhorn.io -n longhorn-system -o json
+            | python3 -c "import json,sys;print(sum(1 for v in json.load(sys.stdin)['items'] if v['status'].get('state')=='attached' and v['status'].get('robustness')!='healthy'))"
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_lh_degraded
+          changed_when: false
+          check_mode: false
+          failed_when: reboot_lh_degraded.stdout | trim != '0'
+
+        - name: Cordon
+          ansible.builtin.command: "{{ reboot_kubectl }} cordon {{ inventory_hostname }}"
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          changed_when: true
+
+        - name: Graceful drain (Longhorn instance managers excluded)
+          ansible.builtin.command: >-
+            {{ reboot_kubectl }} drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+            --pod-selector={{ reboot_drain_selector }} --timeout=300s
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_drain
+          failed_when: false
+          changed_when: true
+
+        - name: Forced drain of what the PDBs blocked (gated)
+          ansible.builtin.command: >-
+            {{ reboot_kubectl }} drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+            --force --disable-eviction --pod-selector={{ reboot_drain_selector }} --timeout=300s
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          when: reboot_drain.rc != 0 and (reboot_force_drain | default(false) | bool)
+          changed_when: true
+
+        - name: Stop if the drain failed and forcing was not authorised
+          ansible.builtin.fail:
+            msg: >-
+              Graceful drain failed ({{ reboot_drain.stderr | default('') | truncate(300) }}). The node is
+              cordoned; uncordon it or pass -e reboot_force_drain=true.
+          when: reboot_drain.rc != 0 and not (reboot_force_drain | default(false) | bool)
+
+        - name: Wait until no Longhorn volume is attached to this node
+          ansible.builtin.shell: >-
+            {{ reboot_kubectl }} get volumeattachments.longhorn.io -n longhorn-system -o json
+            | python3 -c "import json,sys;n=sys.argv[1];print(sum(1 for v in json.load(sys.stdin)['items'] if any(t.get('nodeID')==n and t.get('type')!='snapshot-controller' for t in (v['spec'].get('attachmentTickets') or {}).values())))" {{ inventory_hostname }}
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_attached
+          until: reboot_attached.stdout | trim == '0'
+          retries: 40
+          delay: 15
+          changed_when: false
+          check_mode: false
+
+    # ---------------------------------------------------------------- the reboot
+    - name: Require the go-ahead
+      ansible.builtin.assert:
+        that: reboot_go | default(false) | bool
+        fail_msg: >-
+          Pre-checks passed for {{ inventory_hostname }}. Confirm the window and pass -e reboot_go=true to
+          reboot it{{ ' (drained already: uncordon with kubectl if you stop here)' if reboot_is_k8s | bool else '' }}.
+      when: not (reboot_verify_only | default(false) | bool)
+
+    - name: Reboot, detached because this run depends on the host (control node)
+      ansible.builtin.command: systemd-run --on-active=20 --unit=fleet-reboot systemctl reboot
+      changed_when: true
+      when: >-
+        not (reboot_verify_only | default(false) | bool)
+        and reboot_is_pve | bool and (reboot_allow_control_node | default(false) | bool)
+
+    - name: Stop here, this run is about to lose its connection
+      ansible.builtin.meta: end_host
+      when: >-
+        not (reboot_verify_only | default(false) | bool)
+        and reboot_is_pve | bool and (reboot_allow_control_node | default(false) | bool)
+
+    - name: Reboot and wait for it to come back
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ 1800 if reboot_is_pve | bool else 900 }}"
+        msg: "fleet-reboot.yml"
+      when: not (reboot_verify_only | default(false) | bool)
+
+    # ---------------------------------------------------------------- post-checks
+    - name: Post-boot kernel and state
+      ansible.builtin.shell:
+        cmd: |
+          echo "kernel=$(uname -r)"
+          echo "failed_units=$(systemctl list-units --state=failed --no-legend | awk '{print $1}' | paste -sd, -)"
+          systemctl is-active zabbix-agent2 2>/dev/null | sed 's/^/zabbix_agent2=/' || true
+          [ -f /var/run/reboot-required ] && echo reboot_still_required=yes || echo reboot_still_required=no
+        executable: /bin/bash
+      register: reboot_after
+      changed_when: false
+      check_mode: false
+
+    - name: Show it
+      ansible.builtin.debug:
+        msg: "{{ reboot_after.stdout_lines }}"
+
+    - name: Check it booted the kernel it should have
+      ansible.builtin.assert:
+        that: "('kernel=' ~ reboot_expected_kernel) in reboot_after.stdout_lines"
+        fail_msg: >-
+          Expected {{ reboot_expected_kernel }}, got
+          {{ reboot_after.stdout_lines | select('match', '^kernel=') | first }}. Check the boot pin and the ESP.
+      when: not (reboot_verify_only | default(false) | bool)
+
+    - name: Proxmox host post-checks
+      when: reboot_is_pve | bool
+      block:
+        - name: Wait for quorum and the guests
+          ansible.builtin.shell: "pvecm status | awk '/Quorate/{print $2}'; (qm list; pct list) 2>/dev/null | awk '$3==\"running\"||$2==\"running\"' | wc -l"
+          register: reboot_pve_after
+          until: reboot_pve_after.stdout_lines[0] | default('') == 'Yes'
+          retries: 30
+          delay: 10
+          changed_when: false
+          check_mode: false
+
+        - name: Show it
+          ansible.builtin.debug:
+            msg: "quorate={{ reboot_pve_after.stdout_lines[0] }}, running guests={{ reboot_pve_after.stdout_lines[1] | default('?') }}"
+
+    - name: Kubernetes post-checks and uncordon
+      when: reboot_is_k8s | bool
+      block:
+        - name: Wait for the node to be Ready
+          ansible.builtin.shell: "{{ reboot_kubectl }} get node {{ inventory_hostname }} --no-headers | awk '{print $2}'"
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_node_ready
+          until: reboot_node_ready.stdout | trim is match('^Ready')
+          retries: 40
+          delay: 15
+          changed_when: false
+          check_mode: false
+
+        - name: Wait for Longhorn to report the node Ready
+          ansible.builtin.shell: >-
+            {{ reboot_kubectl }} get nodes.longhorn.io -n longhorn-system {{ inventory_hostname }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_lh_ready
+          until: reboot_lh_ready.stdout == 'True'
+          retries: 40
+          delay: 15
+          changed_when: false
+          check_mode: false
+
+        - name: Uncordon
+          ansible.builtin.command: "{{ reboot_kubectl }} uncordon {{ inventory_hostname }}"
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          changed_when: true
+
+        - name: Wait for every Longhorn volume to be healthy again
+          ansible.builtin.shell: >-
+            {{ reboot_kubectl }} get volumes.longhorn.io -n longhorn-system -o json
+            | python3 -c "import json,sys;print(sum(1 for v in json.load(sys.stdin)['items'] if v['status'].get('state')=='attached' and v['status'].get('robustness')!='healthy'))"
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_lh_after
+          until: reboot_lh_after.stdout | trim == '0'
+          retries: 60
+          delay: 20
+          changed_when: false
+          check_mode: false
