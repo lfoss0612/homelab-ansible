@@ -112,6 +112,16 @@ if [ "$OUTCOME" = ok ] && [ -r "$NEWER_FILE" ]; then
   log "newer OpenClaw release: $newer_latest (pinned $newer_pinned)"
 fi
 
+# Node end-of-life warning, written by openclaw-fleet-update when under 180 days away.
+NODE_EOL_FILE="$STATE_DIR/node-eol"
+if [ "$OUTCOME" = ok ] && [ -r "$NODE_EOL_FILE" ]; then
+  eol_major=$(sed -n 's/^major=//p' "$NODE_EOL_FILE")
+  eol_days=$(sed -n 's/^days=//p' "$NODE_EOL_FILE")
+  eol_end=$(sed -n 's/^end=//p' "$NODE_EOL_FILE")
+  summary="$summary. Node $eol_major reaches end of life $eol_end ($eol_days days)"
+  log "Node $eol_major end of life $eol_end ($eol_days days)"
+fi
+
 # --- Channel: Zabbix trapper ------------------------------------------------
 {% if openclaw_control_notify_zabbix %}
 zabbix_key={{ openclaw_control_notify_zabbix_key }}

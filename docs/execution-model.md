@@ -353,6 +353,12 @@ attempts on 2026-11-17, all rolled back from the VM snapshot):
   the old per-agent database to `/var/backups` (its sessions are lost; 9.7's Doctor refuses
   its non-canonical tables one at a time otherwise). It also needs the Node variables for the
   hop's own requirement (24.x for 9.x).
+- *Node.js-only bump.* A security patch inside the pinned major is one commit to
+  `openclaw_node_min_version`, then `update-openclaw.yml`: the common role upgrades `nodejs` and
+  (since 2026-11-19) restarts `openclaw-node` even when the OpenClaw package did not change.
+  `fleet-versions.yml` shows the candidate. A **major** Node bump is handled like an OS release
+  upgrade: canary node first, gateway last, `validate-openclaw.yml` after; check the "Other Node
+  users" section of the fleet-versions report first.
 - *Automatic after a bump (since 2026-11-19).* When a run of `update-openclaw.yml` changes any
   host: the gateway VM is snapshotted first (`pre-openclaw-<version>-<date>`, kept if it already
   exists; off with `openclaw_pre_bump_snapshot=false`), and at the end the pairing queues are

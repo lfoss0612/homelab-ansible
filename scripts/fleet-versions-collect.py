@@ -111,6 +111,31 @@ def version_of(cmd):
     return first_line(out or err) or None
 
 
+def node_candidate():
+    """The version apt would install for nodejs (what a Node-only bump would land on)."""
+    if not shutil.which("apt-cache"):
+        return None
+    rc, out, _ = run(["apt-cache", "policy", "nodejs"])
+    m = re.search(r"Candidate:\s*(\d+\.\d+\.\d+)", out) if rc == 0 else None
+    return m.group(1) if m else None
+
+
+def node_global_packages():
+    """Global npm packages other than the ones that come with Node or OpenClaw.
+
+    These are the Node users a major Node bump could break (language servers, CLIs).
+    """
+    if not shutil.which("npm"):
+        return None
+    rc, out, _ = run(["npm", "ls", "-g", "--depth=0", "--json"], timeout=90)
+    try:
+        deps = json.loads(out).get("dependencies", {})
+    except ValueError:
+        return None
+    skip = {"npm", "corepack", "openclaw"}
+    return sorted("%s@%s" % (k, v.get("version", "?")) for k, v in deps.items() if k not in skip)
+
+
 def failed_units():
     rc, out, _ = run(["systemctl", "--failed", "--no-legend", "--plain"])
     return sorted({l.split()[0] for l in out.splitlines() if l.strip()}) if rc == 0 else []
@@ -149,6 +174,8 @@ def main():
         "openclaw": m.group(0) if m else None,
         "node": node.lstrip("v") if node else None,
         "nodesource": nodesource(repos),
+        "node_candidate": node_candidate() if node else None,
+        "node_global_packages": node_global_packages() if node else None,
         "zabbix_agent2": ma.group(0) if ma else None,
         "zabbix_repo": zrepo,
         "zabbix_repo_enabled": zenabled,

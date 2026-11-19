@@ -78,6 +78,15 @@
           {%- endfor -%}
           {{ ns.d | to_json }}
 
+    - name: Read the Node.js release schedule (LTS and end-of-life dates)
+      ansible.builtin.uri:
+        url: https://raw.githubusercontent.com/nodejs/Release/main/schedule.json
+        return_content: true
+        timeout: 20
+      register: fleet_versions_node_schedule
+      check_mode: false
+      failed_when: false
+
     - name: Look up the latest OpenClaw release on npm
       ansible.builtin.command: npm view openclaw version
       register: fleet_versions_npm
@@ -103,6 +112,7 @@
                 'node_min_version': hostvars['cockpit.home.lan'].openclaw_node_min_version | default(none),
                 'openclaw_latest_npm': (fleet_versions_npm.stdout | default('') | trim) or none,
                 'latest_os': fleet_latest_os,
+                'node_schedule': (fleet_versions_node_schedule.content | from_json) if fleet_versions_node_schedule.status | default(0) == 200 else {},
                 'ignore_units': fleet_versions_ignore_units},
               'hosts': fleet_versions_all | from_json}
              | to_nice_json }}

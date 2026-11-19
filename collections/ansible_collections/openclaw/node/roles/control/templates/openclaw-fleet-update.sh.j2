@@ -151,3 +151,29 @@ PY
     log "OpenClaw pin ${pin:-unknown} vs npm latest $latest: nothing newer (check result: $newer)"
   fi
 fi
+
+# --- Node.js end of life for the pinned major --------------------------------
+# So an end-of-life date is seen weeks ahead instead of by accident. Warns under 180 days.
+NODE_EOL_FILE="$STATE_DIR/node-eol"
+node_major=$(sed -n 's/^openclaw_node_major:[[:space:]]*"\?\([0-9]*\)"\?.*/\1/p' group_vars/openclaw.yml | head -1)
+eol=$(curl -fsS -m 20 https://raw.githubusercontent.com/nodejs/Release/main/schedule.json 2>/dev/null \
+  | python3 -c '
+import datetime, json, sys
+major = sys.argv[1]
+d = json.load(sys.stdin).get("v" + major, {})
+end = datetime.date.fromisoformat(d["end"])
+print((end - datetime.date.today()).days, d["end"])
+' "${node_major:-0}" 2>/dev/null || true)
+if [ -z "$eol" ]; then
+  log "WARNING: could not work out the end of life of Node ${node_major:-?}; leaving $NODE_EOL_FILE as it was"
+else
+  eol_days=${eol%% *}
+  eol_date=${eol##* }
+  if [ "$eol_days" -lt 180 ]; then
+    printf 'major=%s\ndays=%s\nend=%s\nchecked=%s\n' "$node_major" "$eol_days" "$eol_date" "$(date -Iseconds)" > "$NODE_EOL_FILE"
+    log "NODE END OF LIFE SOON: Node $node_major ends $eol_date ($eol_days days). Plan the next major."
+  else
+    rm -f "$NODE_EOL_FILE"
+    log "Node $node_major end of life $eol_date ($eol_days days away)"
+  fi
+fi

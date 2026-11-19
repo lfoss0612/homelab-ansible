@@ -99,6 +99,8 @@
   ansible.builtin.apt:
     name: nodejs
     state: latest
+  # A running openclaw-node keeps the old Node in memory; restart it when only nodejs changed.
+  notify: restart openclaw-node after package change
   when: openclaw_node_needs_upgrade
 
 - name: Re-read the installed Node.js version
