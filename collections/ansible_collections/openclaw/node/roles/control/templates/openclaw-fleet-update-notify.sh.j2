@@ -99,6 +99,19 @@ if [ "$OUTCOME" = failed ]; then
     || log "WARNING: could not write $record_file"
 fi
 
+# --- A newer OpenClaw release than the pin? ---------------------------------
+# Written by openclaw-fleet-update (only ever informational). Added to the summary so
+# the webhook says it, and pushed to its own Zabbix key below.
+NEWER_FILE="$STATE_DIR/newer-release"
+newer_release=0
+if [ "$OUTCOME" = ok ] && [ -r "$NEWER_FILE" ]; then
+  newer_release=1
+  newer_latest=$(sed -n 's/^latest=//p' "$NEWER_FILE")
+  newer_pinned=$(sed -n 's/^pinned=//p' "$NEWER_FILE")
+  summary="$summary. Newer OpenClaw available: $newer_latest (pinned $newer_pinned); rehearse with playbooks/openclaw-bump-rehearsal.yml before bumping the pin"
+  log "newer OpenClaw release: $newer_latest (pinned $newer_pinned)"
+fi
+
 # --- Channel: Zabbix trapper ------------------------------------------------
 {% if openclaw_control_notify_zabbix %}
 zabbix_key={{ openclaw_control_notify_zabbix_key }}
@@ -139,6 +152,17 @@ else
       log "WARNING: Zabbix discarded the value — is trapper item '$zabbix_key' defined on host '${zabbix_host:-$host}'? See README."
       ;;
   esac
+
+  # Newer-release flag: only after a successful run, so a failed run does not claim
+  # there is nothing newer. Own key, own trigger (playbooks/zabbix-fleet-newer-release-item.yml).
+  if [ "$OUTCOME" = ok ]; then
+    newer_out=$(zabbix_sender -c "$zabbix_conf" -k {{ openclaw_control_notify_zabbix_newer_key }} -o "$newer_release" 2>&1)
+    log "zabbix_sender({{ openclaw_control_notify_zabbix_newer_key }}=$newer_release): $newer_out"
+    case "$newer_out" in
+      *"failed: 0"*) : ;;
+      *) log "WARNING: Zabbix discarded the newer-release value; create the item with playbooks/zabbix-fleet-newer-release-item.yml" ;;
+    esac
+  fi
 
   # --- Per-host breakdown ---------------------------------------------------
   # The aggregate above says the fleet run failed; this says WHICH host, so the

@@ -1,0 +1,132 @@
+---
+# Create the Zabbix trapper item + information trigger that the weekly fleet-update timer
+# pushes to when npm has an OpenClaw release newer than the pin in group_vars/openclaw.yml.
+# Companion to zabbix-fleet-update-item.yml (same host, same token, same conventions).
+#
+# The timer never bumps the pin; it only says "there is something newer", so a bump is a
+# conscious weekly decision with the rehearsal run first
+# (playbooks/openclaw-bump-rehearsal.yml). The value is pushed after every successful run:
+# 1 = npm latest is newer than the pin, 0 = it is not. The trigger is self-clearing and
+# only Information severity, because it is a to-do and not an outage.
+#
+# Idempotent. Dry run is the wrapper default; apply changes the Zabbix server configuration:
+#   scripts/run-working-tree.sh playbooks/zabbix-fleet-newer-release-item.yml
+#   scripts/run-working-tree.sh --apply playbooks/zabbix-fleet-newer-release-item.yml
+#
+# The control role must be redeployed (playbooks/openclaw-automation.yml) for the timer to
+# start sending the value; until then the item exists and simply has no data.
+
+- name: Create the newer-release trapper item and trigger in Zabbix
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+    # Must match openclaw_control_notify_zabbix_newer_key and the agent Hostname= on cockpit.
+    target_host: cockpit.home.lan
+    newer_key: openclaw.fleet.newer_release
+    newer_name: "OpenClaw fleet update: newer release than the pin available"
+    newer_trigger: "OpenClaw fleet update: a newer OpenClaw release is available"
+  tasks:
+    - name: Look up the Zabbix host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params: {output: [hostid, host], filter: {host: ["{{ target_host }}"]}}
+          id: 1
+      register: nr_host
+      check_mode: false
+      failed_when: nr_host.json.error is defined or nr_host.json.result | length != 1
+
+    - name: Check whether the item exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: [itemid, key_]
+            hostids: ["{{ nr_host.json.result[0].hostid }}"]
+            filter: {key_: ["{{ newer_key }}"]}
+          id: 2
+      register: nr_item
+      check_mode: false
+      failed_when: nr_item.json.error is defined
+
+    - name: Create the trapper item
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ nr_host.json.result[0].hostid }}"
+            name: "{{ newer_name }}"
+            key_: "{{ newer_key }}"
+            type: 2          # Zabbix trapper
+            value_type: 3    # numeric unsigned
+            history: "400d"
+            trends: "0"
+            description: >-
+              Pushed by openclaw-fleet-update-notify after a successful weekly run:
+              1 = npm has an OpenClaw newer than openclaw_version in group_vars, 0 = not.
+          id: 3
+      register: nr_item_create
+      when: nr_item.json.result | length == 0
+      failed_when: nr_item_create.json.error is defined
+      changed_when: nr_item_create.json.result is defined
+
+    - name: Check whether the trigger exists
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: [triggerid, description]
+            hostids: ["{{ nr_host.json.result[0].hostid }}"]
+            filter: {description: ["{{ newer_trigger }}"]}
+          id: 4
+      register: nr_trigger
+      check_mode: false
+      failed_when: nr_trigger.json.error is defined
+
+    - name: Create the trigger (needs the item, so it follows a real item create)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.create
+          params:
+            description: "{{ newer_trigger }}"
+            expression: "last(/{{ target_host }}/{{ newer_key }})=1"
+            priority: 1      # Information
+            manual_close: 0
+            comments: >-
+              The weekly timer found an OpenClaw release newer than the pin. Read the release
+              notes, run playbooks/openclaw-bump-rehearsal.yml, then bump openclaw_version.
+              Clears itself on the next run that finds nothing newer.
+          id: 5
+      register: nr_trigger_create
+      when: nr_trigger.json.result | length == 0
+      failed_when: nr_trigger_create.json.error is defined
+      changed_when: nr_trigger_create.json.result is defined

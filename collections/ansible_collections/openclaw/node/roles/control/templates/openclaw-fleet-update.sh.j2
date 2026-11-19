@@ -116,3 +116,38 @@ printf 'timestamp=%s\ncommit=%s\nopenclaw_version=%s\n' \
   "$(date -Iseconds)" "$after" "${pin:-unknown}" > "$SUCCESS_FILE"
 
 log "fleet converged and validated at ${after:0:7}; recorded $SUCCESS_FILE"
+
+# --- Informational steps: report, never bump, never fatal --------------------
+# The pin is a human decision. What the timer can do for that decision is keep the
+# evidence fresh: refresh the fleet-versions report and say when upstream has a newer
+# OpenClaw than the pin, so the bump is made on purpose (rehearsal first, see
+# playbooks/openclaw-bump-rehearsal.yml). Both steps run after the success record and
+# are guarded: neither can turn a good run into a failed one.
+log "refreshing the fleet-versions report"
+if ! ansible-playbook playbooks/fleet-versions.yml > "$STATE_DIR/last-fleet-versions.log" 2>&1; then
+  log "WARNING: fleet-versions.yml failed (see $STATE_DIR/last-fleet-versions.log); the report is stale"
+fi
+
+NEWER_FILE="$STATE_DIR/newer-release"
+latest=$(curl -fsS -m 20 https://registry.npmjs.org/openclaw/latest 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)
+if [ -z "$latest" ]; then
+  log "WARNING: could not read the latest OpenClaw version from the npm registry; leaving $NEWER_FILE as it was"
+else
+  newer=$(python3 - "${pin:-}" "$latest" <<'PY' 2>/dev/null || echo unknown
+import re, sys
+def key(v):
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)(?:-(\d+))?$", v)
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+a, b = key(sys.argv[1]), key(sys.argv[2])
+print("yes" if a and b and b > a else "no" if a and b else "unknown")
+PY
+)
+  if [ "$newer" = yes ]; then
+    printf 'pinned=%s\nlatest=%s\nchecked=%s\n' "${pin:-unknown}" "$latest" "$(date -Iseconds)" > "$NEWER_FILE"
+    log "NEWER OPENCLAW RELEASE: pin is ${pin:-unknown}, npm latest is $latest. Rehearse before bumping: playbooks/openclaw-bump-rehearsal.yml"
+  else
+    rm -f "$NEWER_FILE"
+    log "OpenClaw pin ${pin:-unknown} vs npm latest $latest: nothing newer (check result: $newer)"
+  fi
+fi
