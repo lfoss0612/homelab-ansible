@@ -7,6 +7,12 @@ openclaw_install_dir: /opt/openclaw
 # npm package version to install (`npm install -g openclaw@{{ openclaw_version }}`).
 openclaw_version: "2026.11.5"
 
+# Releases to pass through on the way to openclaw_version, oldest first (max 3), when a state
+# migration refuses to jump, e.g. ["2026.9.7"]. update-openclaw.yml walks them, running doctor at
+# each, skipping hosts already past a hop. Leave empty unless openclaw-bump-rehearsal.yml says the
+# jump is refused, and clear it again in the next bump.
+openclaw_upgrade_path: []
+
 # Node.js the pinned openclaw_version needs. Two variables, always edited
 # together with openclaw_version in the same commit:
 #

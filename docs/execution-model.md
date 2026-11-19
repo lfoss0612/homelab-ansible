@@ -297,6 +297,11 @@ needs a newer Node.js (2026.9.3 moved the floor from Node 22 to 24):
    `/etc/apt/sources.list.d/nodesource.sources` at `node_<major>.x` (and re-enables it
    if a release upgrade left it `Enabled: no`) and upgrades `nodejs`, refusing if apt
    would remove anything, before it installs the CLI.
+   **If the rehearsal says the jump is refused** (`playbooks/openclaw-bump-rehearsal.yml`
+   returns FAIL with "unreleased session schema"), put the release to pass through in
+   `openclaw_upgrade_path` (for example `["2026.9.7"]`, oldest first, max 3). `update-openclaw.yml`
+   then converges the whole fleet to each hop in turn (the roles run doctor after every package
+   change) before the pin; hosts already past a hop are skipped. Clear the list in the next bump.
 3. **Do not push yet.** The timer pulls `main` weekly (Sun 03:00) and would roll the
    bump out unattended. Roll out by hand first, then push.
 4. **Before touching the gateway:** snapshot its VM and confirm the gateway role's

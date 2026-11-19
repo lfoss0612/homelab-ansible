@@ -1,160 +1,55 @@
 ---
-# Fleet convergence: bring every OpenClaw host to the version pinned in
-# group_vars/openclaw.yml. Verify before mutating, gateway first, nodes
-# serialized with a per-host health gate, and end_host early wherever a host
-# is already at the pin. There is no build any more — the gate compares
-# `openclaw --version` against openclaw_version, not a build hash.
+# Fleet convergence: bring every OpenClaw host to the version pinned in group_vars/openclaw.yml.
+# Verify before mutating, gateway first, nodes serialized with a per-host health gate, and end_host
+# early wherever a host is already at the target. The work is in openclaw-converge-stage.yml; this
+# file runs it once per intermediate release in openclaw_upgrade_path (up to 3), then for the pin.
 #
-# The gateway is a member of openclaw_nodes (it manages its own VM), so it
-# is converged by the gateway play below, then converged again by the node
-# play for its own openclaw-node.service — same as deploy-openclaw.yml.
+# openclaw_upgrade_path (group_vars/openclaw.yml, default []) lists releases to pass through on
+# the way up, oldest first, for example ["2026.9.7"]. It exists because a state migration can
+# refuse to jump (2026.7.1-2 state needs 2026.9.7 before 2026.11.5). Each hop is a full gateway +
+# nodes convergence with doctor run by the role, so a hop that fails stops the run before the next
+# one. A host already at or past a hop is skipped for it. Once the fleet is at the pin the path is
+# inert, but delete the entry in the next bump so the weekly timer never walks it. Discarding a
+# legacy agent database stays a separate opt-in (-e openclaw_migrate_discard_legacy_agent_db=true).
 #
-# Hosts in [openclaw_optional] are legitimately powered off part of the time.
-# This playbook runs unattended from the weekly openclaw-fleet-update timer, so
-# it must not go red because a desktop is switched off — those hosts are split
-# into their own play with ignore_unreachable, and are otherwise converged
-# identically.
+# Dry run, shows each stage:
+#   scripts/run-working-tree.sh playbooks/update-openclaw.yml
+# One-off path without a commit:
+#   ... -e '{"openclaw_upgrade_path": ["2026.9.7"]}'
 
-# ============================================================
-# PHASE 1 — Verify: compare installed version against the pin
-# ============================================================
-- name: Detect installed OpenClaw versions
+- name: Record the pin
   hosts: openclaw:!openclaw_deferred
   gather_facts: false
-  become: true
-  # A host that cannot be reached here is not marked failed, so it is still
-  # tried in its own convergence play below — where a *required* host failing
-  # is loud, and an optional one is skipped. Suppressing it here loses nothing.
-  #
-  # It does NOT skip the rest of this play for that host, though: the two tasks
-  # below read `openclaw_installed_version`, which on an unreachable host is a
-  # dict with no `.rc`/`.stdout`. Both are therefore guarded, leaving
-  # openclaw_update_required undefined — which the convergence plays read as
-  # `| default(true)`.
   ignore_unreachable: true
-
   tasks:
-    - name: Check installed openclaw CLI version
-      ansible.builtin.command: openclaw --version
-      register: openclaw_installed_version
-      changed_when: false
-      failed_when: false
-      # Read-only, so it must run in --check too. Skipped there, every host
-      # reads as "update required" and the downgrade guard below has no version
-      # to compare, so a bump dry-run showed the whole fleet changing.
-      check_mode: false
-
-    - name: Determine whether this host needs updating
-      ansible.builtin.set_fact:
-        openclaw_update_required: >-
-          {{ openclaw_installed_version.rc != 0 or
-             openclaw_version not in openclaw_installed_version.stdout }}
-      when: not (openclaw_installed_version.unreachable | default(false))
-
-    # A gateway that has already been migrated to a newer release cannot be
-    # taken back: an older build refuses the newer SQLite schema ("unreleased
-    # session schema"), and doctor does not downgrade. The weekly timer only
-    # reads the pin in git, so a gateway bumped by hand ahead of a commit (or a
-    # pin reverted after a rollback) would otherwise be "converged" into a
-    # broken state. Versions compare as [year, minor, patch, suffix].
-    - name: Refuse to downgrade the gateway
+    - name: Check the path
       ansible.builtin.assert:
-        that: >-
-          openclaw_downgrade_ok | default(false) | bool or
-          (openclaw_installed_version.stdout | regex_findall('(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\d+))?') | first | default(['0','0','0',''])
-           | map('int') | list)
-          <= (openclaw_version | regex_findall('(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\d+))?') | first
-              | map('int') | list)
-        fail_msg: >-
-          The gateway is on '{{ openclaw_installed_version.stdout }}', NEWER than
-          the pin {{ openclaw_version }}. Refusing to downgrade it (older builds
-          cannot read the newer state). Raise openclaw_version in
-          group_vars/openclaw.yml, or pass -e openclaw_downgrade_ok=true after
-          restoring state from backup.
+        that:
+          - openclaw_upgrade_path | default([]) | length <= 3
+          - openclaw_upgrade_path | default([]) | map('string') | reject('match', '^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?$') | list | length == 0
+        fail_msg: "openclaw_upgrade_path must hold at most 3 versions like 2026.9.7."
         quiet: true
-      when:
-        - inventory_hostname in groups['openclaw_gateway']
-        - not (openclaw_installed_version.unreachable | default(false))
-        - openclaw_installed_version.rc == 0
+      run_once: true
 
-    - name: Report current state
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          {{ openclaw_installed_version.stdout | default('not installed') }}
-          -> update {{ 'required' if openclaw_update_required else 'not required' }}
-      when: not (openclaw_installed_version.unreachable | default(false))
+    - name: Remember the pin before stages override openclaw_version
+      ansible.builtin.set_fact:
+        openclaw_pin: "{{ openclaw_version }}"
 
-    - name: Report an unreachable host
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} is unreachable — assuming an update is
-          required; its convergence play decides whether that is a failure.
-      when: openclaw_installed_version.unreachable | default(false)
+- name: Hop 1
+  ansible.builtin.import_playbook: openclaw-converge-stage.yml
+  vars: {openclaw_stage: 0}
+  when: openclaw_upgrade_path | length > 0
 
-# ============================================================
-# PHASE 2 — Gateway first
-# ============================================================
-- name: Update gateway
-  hosts: openclaw_gateway
-  serial: 1
-  become: true
-  gather_facts: true
+- name: Hop 2
+  ansible.builtin.import_playbook: openclaw-converge-stage.yml
+  vars: {openclaw_stage: 1}
+  when: openclaw_upgrade_path | length > 1
 
-  tasks:
-    # default(true) covers a host that was unreachable in Phase 1: assume it
-    # needs updating rather than silently treating an undefined fact as
-    # "converged".
-    - name: Skip — gateway already at the pinned version
-      ansible.builtin.meta: end_host
-      when: not (openclaw_update_required | default(true))
+- name: Hop 3
+  ansible.builtin.import_playbook: openclaw-converge-stage.yml
+  vars: {openclaw_stage: 2}
+  when: openclaw_upgrade_path | length > 2
 
-    - name: Converge gateway to the pinned version
-      ansible.builtin.include_role:
-        name: openclaw.node.gateway
-
-# ============================================================
-# PHASE 3 — Nodes, serialized, gateway already verified healthy
-# ============================================================
-- name: Update nodes
-  hosts: openclaw_nodes:!openclaw_optional:!openclaw_deferred
-  serial: 1
-  become: true
-  gather_facts: false
-
-  tasks:
-    - name: Converge this node unless it is already at the pin
-      ansible.builtin.include_tasks: tasks/converge-openclaw-node.yml
-      when: openclaw_update_required | default(true)
-
-# ============================================================
-# PHASE 4 — Intermittently-powered nodes; offline is a skip, not a failure
-# ============================================================
-- name: Update intermittently-powered nodes
-  hosts: openclaw_optional
-  serial: 1
-  become: true
-  gather_facts: false
-  ignore_unreachable: true
-
-  tasks:
-    # ignore_unreachable keeps a powered-off host out of the failed list but
-    # does not stop it entering the tasks below, so gate on an explicit probe
-    # rather than letting the role fail task by task.
-    - name: Probe reachability — this host is allowed to be powered off
-      ansible.builtin.ping:
-      register: openclaw_optional_probe
-      changed_when: false
-
-    - name: Report a powered-off optional host
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} is unreachable — expected for an
-          [openclaw_optional] host; it converges on the next run while up.
-      when: openclaw_optional_probe.unreachable | default(false)
-
-    - name: Converge this node unless it is already at the pin
-      ansible.builtin.include_tasks: tasks/converge-openclaw-node.yml
-      when:
-        - not (openclaw_optional_probe.unreachable | default(false))
-        - openclaw_update_required | default(true)
+- name: Pin
+  ansible.builtin.import_playbook: openclaw-converge-stage.yml
+  vars: {openclaw_stage: -1}
