@@ -1,0 +1,184 @@
+---
+# Read-only audit of the Zabbix server and the monitoring of the fleet, for use right after a
+# Zabbix or agent upgrade and at the start of any update cycle.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/zabbix-audit.yml                 (uncommitted changes)
+#   scripts/ansible-on-cockpit.sh playbook playbooks/zabbix-audit.yml      (committed checkout)
+#
+# It asks the Zabbix API (token from hostvars['zabbix.home.lan'], like every other zabbix-*
+# playbook) and reports PASS / WARN / FAIL for:
+#   * every inventory host exists in Zabbix, and its agent interface IP matches inventory.ini
+#     (a stale IP shows as a host that is silently unreachable: desktop did this)
+#   * the os.update.* and openclaw.version items exist, are enabled and supported, and have
+#     reported recently (zabbix_audit_stale_hours, default 3)
+#   * agent version versus the server's major.minor
+#   * the server's internal caches (config, value, history and trend write caches) are below
+#     zabbix_audit_cache_warn_pct, and an enabled trigger watches the config cache so an
+#     exhausted CacheSize pages someone instead of blinding monitoring for hours
+#
+# Nothing is changed. The report is printed and saved on the control node as
+# {{ zabbix_audit_report_dir }}/latest.md. To make a dashboard fresh right away use
+# playbooks/zabbix-execute-now.yml.
+#
+# api_managed hosts (opnsense, litellm) are checked for existence and IP only: they have no
+# agent here.
+
+- name: Audit Zabbix
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+    zabbix_audit_report_dir: /var/tmp/zabbix-audit
+    zabbix_audit_stale_hours: 3
+    zabbix_audit_cache_warn_pct: 80
+    # Hosts that legitimately differ from the generic rules.
+    zabbix_audit_optional_hosts: [litellm.home.lan]      # no Zabbix host expected
+    zabbix_audit_loopback_ok: [zabbix.home.lan]          # monitors itself over 127.0.0.1
+    zabbix_audit_item_keys:
+      - os.update.pending.count
+      - os.update.reboot.required
+      - openclaw.version
+      - agent.version
+    # Hosts that are expected NOT to have the os.update items (see os-update-status-monitor.yml:
+    # the k8s nodes are monitored through the DaemonSet instead).
+    zabbix_audit_no_os_update_items: "{{ groups['k8s'] | default([]) }}"
+    zabbix_audit_cache_keys:
+      - "zabbix[rcache,buffer,pused]"
+      - "zabbix[vcache,buffer,pused]"
+      - "zabbix[wcache,history,pused]"
+      - "zabbix[wcache,trend,pused]"
+  tasks:
+    - name: Ask the server for its version
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        body: {jsonrpc: "2.0", method: apiinfo.version, params: [], id: 1}
+      register: zbx_version
+      check_mode: false
+
+    - name: Read every host with its interfaces
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: [hostid, host, name, status]
+            selectInterfaces: [ip, dns, type, main, useip, available, error]
+          id: 2
+      register: zbx_hosts
+      check_mode: false
+      failed_when: zbx_hosts.json.error is defined
+
+    - name: Read the audited items on every host
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: [itemid, hostid, key_, status, state, lastclock, lastvalue, error, delay]
+            selectPreprocessing: [type, params]
+            filter: {key_: "{{ zabbix_audit_item_keys }}"}
+          id: 3
+      register: zbx_items
+      check_mode: false
+      failed_when: zbx_items.json.error is defined
+
+    - name: Read the server's internal cache items (found by key, on whichever host carries them)
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: [hostid, key_, status, state, lastclock, lastvalue, error]
+            filter: {key_: "{{ zabbix_audit_cache_keys }}"}
+          id: 4
+      register: zbx_cache_items
+      check_mode: false
+      failed_when: zbx_cache_items.json.error is defined
+
+    - name: Read the triggers of the host(s) that carry those items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: trigger.get
+          params:
+            output: [description, expression, status, value, priority]
+            selectHosts: [hostid]
+            hostids: "{{ zbx_cache_items.json.result | map(attribute='hostid') | unique | list }}"
+            expandExpression: true
+          id: 5
+      register: zbx_triggers
+      check_mode: false
+      failed_when: zbx_triggers.json.error is defined
+      when: zbx_cache_items.json.result | length > 0
+
+    - name: Make the report directory
+      ansible.builtin.file:
+        path: "{{ zabbix_audit_report_dir }}"
+        state: directory
+        mode: "0755"
+      check_mode: false
+
+    - name: Stage the raw data
+      ansible.builtin.copy:
+        dest: "{{ zabbix_audit_report_dir }}/latest.json"
+        mode: "0644"
+        content: >-
+          {{ {'server_version': zbx_version.json.result,
+              'now': lookup('pipe', 'date +%s') | int,
+              'stale_hours': zabbix_audit_stale_hours,
+              'cache_warn_pct': zabbix_audit_cache_warn_pct,
+              'inventory': inventory_for_audit,
+              'no_os_update_items': zabbix_audit_no_os_update_items,
+              'optional_hosts': zabbix_audit_optional_hosts,
+              'loopback_ok': zabbix_audit_loopback_ok,
+              'hosts': zbx_hosts.json.result,
+              'items': zbx_items.json.result,
+              'cache_items': zbx_cache_items.json.result | default([]),
+              'triggers': zbx_triggers.json.result | default([])} | to_nice_json }}
+      vars:
+        inventory_for_audit: >-
+          {%- set ns = namespace(d={}) -%}
+          {%- for h in groups['all'] -%}
+          {%- set ns.d = ns.d | combine({h: {'ip': hostvars[h].ansible_host | default(''), 'api_managed': h in groups['api_managed']}}) -%}
+          {%- endfor -%}
+          {{ ns.d }}
+      check_mode: false
+
+    - name: Render the report
+      ansible.builtin.command: "python3 {{ playbook_dir }}/../scripts/zabbix-audit-report.py {{ zabbix_audit_report_dir }}/latest.json"
+      register: zbx_report
+      changed_when: false
+      check_mode: false
+
+    - name: Save the report
+      ansible.builtin.copy:
+        dest: "{{ zabbix_audit_report_dir }}/latest.md"
+        mode: "0644"
+        content: "{{ zbx_report.stdout }}\n"
+      check_mode: false
+
+    - name: Show the report
+      ansible.builtin.debug:
+        msg: "{{ zbx_report.stdout_lines }}"

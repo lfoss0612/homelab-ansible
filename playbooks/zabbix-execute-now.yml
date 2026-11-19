@@ -1,0 +1,120 @@
+---
+# Ask Zabbix to poll items right now ("Execute now"), so a dashboard or an audit can be checked
+# the same hour instead of waiting for the next hourly poll.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/zabbix-execute-now.yml \
+#       -e '{"zbx_hosts": ["desktop.home.lan", "vscode.home.lan"]}' -e zbx_key_prefix=os.update
+#       lists the items it would poll and changes nothing (dry run is the wrapper default).
+#   scripts/run-working-tree.sh --apply playbooks/zabbix-execute-now.yml -e '{"zbx_hosts": [...]}' ...
+#       queues the polls (API task.create, type 6).
+#
+# zbx_hosts is a required list of Zabbix host names (the FQDNs). zbx_key_prefix narrows the items
+# to those whose key starts with it; leave it out to poll every pollable item on the hosts, which
+# can be hundreds on a Kubernetes node, so a prefix is the usual choice. Only item types that
+# Zabbix allows for Execute now are polled (agent passive, simple, internal, external, HTTP and so
+# on); trapper, active-agent and dependent items are skipped by Zabbix itself.
+#
+# It only queues the polls. Results arrive within a minute or so; re-run
+# playbooks/zabbix-audit.yml afterwards. The token cannot do host.update-style changes here and
+# does not need to.
+
+- name: Queue "Execute now" for Zabbix items
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+    zbx_key_prefix: ""
+    # Item types that accept Execute now.
+    zbx_pollable_types: [0, 3, 5, 10, 12, 13, 14, 15, 16, 17, 19, 21]
+  tasks:
+    - name: Check the request
+      ansible.builtin.assert:
+        that:
+          - zbx_hosts is defined
+          - zbx_hosts is sequence
+          - zbx_hosts is not string
+          - zbx_hosts | length > 0
+        fail_msg: >-
+          Give a list of Zabbix host names as JSON, for example
+          -e '{"zbx_hosts": ["host.home.lan"]}'.
+
+    - name: Look up the hosts
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: [hostid, host]
+            filter: {host: "{{ zbx_hosts }}"}
+          id: 1
+      register: zbx_host_lookup
+      check_mode: false
+      failed_when: zbx_host_lookup.json.error is defined or zbx_host_lookup.json.result | length != zbx_hosts | length
+
+    - name: Find the items
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: [itemid, key_, hostid, type]
+            hostids: "{{ zbx_host_lookup.json.result | map(attribute='hostid') | list }}"
+            monitored: true
+            filter: {type: "{{ zbx_pollable_types }}"}
+          id: 1
+      register: zbx_items
+      check_mode: false
+      failed_when: zbx_items.json.error is defined
+
+    - name: Keep the items that match the prefix
+      ansible.builtin.set_fact:
+        zbx_selected: "{{ zbx_items.json.result | selectattr('key_', 'match', '^' ~ (zbx_key_prefix | regex_escape)) | list }}"
+
+    - name: Build the task list
+      ansible.builtin.set_fact:
+        zbx_tasks: >-
+          {%- set ns = namespace(l=[]) -%}
+          {%- for i in zbx_selected -%}
+          {%- set ns.l = ns.l + [{'type': 6, 'request': {'itemid': i.itemid}}] -%}
+          {%- endfor -%}
+          {{ ns.l }}
+
+    - name: Say what will be polled
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'DRY RUN, would queue' if ansible_check_mode else 'Queueing' }}
+          {{ zbx_selected | length }} item(s) on {{ zbx_hosts | join(', ') }}
+          (prefix '{{ zbx_key_prefix }}'): {{ zbx_selected | map(attribute='key_') | unique | sort | list | truncate(300) }}
+
+    - name: Stop if there is nothing to poll
+      ansible.builtin.assert:
+        that: zbx_selected | length > 0
+        fail_msg: "No pollable monitored items matched on {{ zbx_hosts }} with prefix '{{ zbx_key_prefix }}'."
+
+    - name: Queue the polls
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers: {Authorization: "Bearer {{ zabbix_api_token }}"}
+        body:
+          jsonrpc: "2.0"
+          method: task.create
+          params: "{{ zbx_tasks }}"
+          id: 2
+      register: zbx_task
+      when: not ansible_check_mode
+      failed_when: zbx_task.json.error is defined
+      changed_when: true
