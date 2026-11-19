@@ -1,0 +1,101 @@
+---
+# Rehearse an OpenClaw version bump on COPIES of the state before touching production.
+#
+# Usage (nothing on the host is changed, so a dry run and a real run do the same thing):
+#   scripts/run-working-tree.sh playbooks/openclaw-bump-rehearsal.yml -e rehearsal_version=2026.12.1
+#   ... -e rehearsal_hosts=openclaw_gateway,pve.home.lan,k8s-worker.home.lan
+#   ... -e rehearsal_state_tarball=/var/backups/openclaw-state-20261117T204737.tar.gz
+#
+# What it does, per host (scripts/openclaw-rehearsal-host.sh, run as root on the host itself so
+# no state ever leaves the machine):
+#   1. copies ~/.openclaw (or extracts rehearsal_state_tarball) into a private scratch dir
+#   2. installs openclaw@rehearsal_version into a private npm prefix with --engine-strict
+#      (the same refusal a real install gives when Node is too old)
+#   3. runs `doctor --fix --non-interactive` with HOME and OPENCLAW_STATE_DIR in the scratch dir
+#   4. reports the doctor exit code, files added or removed, every line that looks like a
+#      refusal (agent DB, legacy exec-approvals, node.json, ownership, schema), and checks that
+#      the real openclaw.json did not change
+#   5. removes the scratch dir (rehearsal_keep=true keeps it for a look)
+# It also lists the lines of the target's CHANGELOG.md (shipped inside the package) that mention
+# state or migration, and prints what Node the package declares next to what the pin in
+# group_vars/openclaw.yml says.
+#
+# Pick hosts by shape. The shapes that behave differently are the gateway (the agent DB and
+# pairing stores), a Proxmox host (sandbox, root-owned plugins) and a k8s node. One of each is
+# enough; the default is the gateway only.
+#
+# Known-bad replay: the gateway role takes /var/backups/openclaw-state-<stamp>.tar.gz before it
+# changes anything, so a tarball from before the 2026-11-17 migration plus rehearsal_version
+# 2026.11.5 must come back REVIEW or FAIL (the legacy agent DB refusal). If it comes back PASS
+# the rehearsal is not detecting what really failed.
+
+- name: Rehearse the OpenClaw bump
+  hosts: "{{ rehearsal_hosts | default('openclaw_gateway') }}"
+  gather_facts: false
+  become: true
+  vars:
+    rehearsal_keep: false
+    rehearsal_doctor_timeout: 300
+    rehearsal_state_tarball: ""
+  tasks:
+    - name: Check the request
+      ansible.builtin.assert:
+        that:
+          - rehearsal_version is defined
+          - rehearsal_version is match('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$')
+        fail_msg: "Pass -e rehearsal_version=<npm version>, for example 2026.12.1."
+        quiet: true
+      run_once: true
+
+    - name: Copy the rehearsal script to the host
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/openclaw-rehearsal-host.sh"
+        dest: /var/tmp/openclaw-rehearsal-host.sh
+        mode: "0700"
+      # Writes one file outside any scratch dir; a dry run would otherwise skip the rehearsal.
+      check_mode: false
+      # lint-check-mode: ignore (stages a helper script, the rehearsal itself is read-only on state)
+
+    - name: Run the rehearsal
+      ansible.builtin.command:
+        argv:
+          - /var/tmp/openclaw-rehearsal-host.sh
+          - "{{ rehearsal_version }}"
+          - "{{ rehearsal_state_tarball }}"
+      environment:
+        OPENCLAW_USER: "{{ openclaw_user }}"
+        DOCTOR_TIMEOUT: "{{ rehearsal_doctor_timeout }}"
+        KEEP: "{{ '1' if rehearsal_keep | bool else '0' }}"
+      register: rehearsal
+      changed_when: false
+      failed_when: rehearsal.rc not in [0, 2]
+      check_mode: false
+
+    - name: Remove the rehearsal script
+      ansible.builtin.file:
+        path: /var/tmp/openclaw-rehearsal-host.sh
+        state: absent
+      check_mode: false
+      # lint-check-mode: ignore (removes the helper staged above)
+
+    - name: Show the rehearsal
+      ansible.builtin.debug:
+        msg: "{{ rehearsal.stdout_lines }}"
+
+    - name: Compare the declared Node range with the pin
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: openclaw@{{ rehearsal_version }} declares Node
+          '{{ (rehearsal.stdout_lines | select('match', '^NODE_REQUIRES=') | first | default('NODE_REQUIRES=?')).split('=', 1)[1] }}';
+          host has {{ (rehearsal.stdout_lines | select('match', '^NODE=') | first | default('NODE=?')).split('=', 1)[1] }};
+          group_vars/openclaw.yml pins major {{ openclaw_node_major }}, floor {{ openclaw_node_min_version }}.
+          Raise the pin together with openclaw_version if the range or the release notes need more.
+
+    - name: Fail the play when the rehearsal did not pass
+      ansible.builtin.assert:
+        that: rehearsal.stdout_lines | select('match', '^RESULT=PASS') | list | length > 0
+        fail_msg: >-
+          {{ inventory_hostname }}: rehearsal did not pass
+          ({{ rehearsal.stdout_lines | select('match', '^RESULT=') | first | default('RESULT=unknown') }}).
+          Read the lines above before bumping; nothing on the host was changed.
+        quiet: true
