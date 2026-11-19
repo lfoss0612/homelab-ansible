@@ -1,0 +1,63 @@
+---
+# List the pre-change snapshots of Proxmox guests and optionally delete the old ones.
+#
+# Usage:
+#   scripts/ansible-on-cockpit.sh playbook playbooks/prune-snapshots.yml
+#       lists every pre-* snapshot with its age and marks those past the limit. Nothing is deleted.
+#   scripts/run-working-tree.sh --apply playbooks/prune-snapshots.yml \
+#       -e prune_older_than_days=14 -e prune_confirm=true -e snapshot_targets=openclaw.home.lan
+#       deletes the pre-* snapshots older than 14 days on those guests.
+#
+# Only snapshots whose name starts with pre- are ever touched; snapshots you made by hand under
+# other names are left alone. Deletion needs BOTH --apply on the wrapper and prune_confirm=true.
+# Guests that use the vzdump method have no snapshots here (their backups live on PBS, with their
+# own retention) and are skipped.
+
+- name: List and prune pre-change snapshots
+  hosts: "{{ snapshot_targets | default('all:!api_managed') }}"
+  gather_facts: false
+  become: false
+  vars:
+    prune_older_than_days: 14
+    prune_confirm: false
+  tasks:
+    - name: Skip hosts that are not Proxmox guests with snapshots
+      ansible.builtin.meta: end_host
+      when: pve_vmid is not defined or pve_snapshot_method | default('snapshot') != 'snapshot'
+
+    - name: Read the snapshots
+      ansible.builtin.include_tasks: tasks/pve-list-snapshots.yml
+
+    - name: Work out the age of each pre-change snapshot
+      ansible.builtin.set_fact:
+        pve_pre_snapshots: >-
+          {%- set now = lookup('pipe', 'date +%s') | int -%}
+          {%- set out = [] -%}
+          {%- for s in pve_snapshots if s.name.startswith('pre-') -%}
+          {%- set age = ((now - (s.snaptime | default(now))) / 86400) | round(1) -%}
+          {%- set _ = out.append({'name': s.name, 'age_days': age, 'old': age > (prune_older_than_days | int)}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ pve_kind }} {{ pve_vmid }}):
+          {% for s in pve_pre_snapshots %}{{ s.name }} {{ s.age_days }}d{{ ' OLD' if s.old else '' }}{{ '; ' if not loop.last else '' }}{% endfor %}
+          (limit {{ prune_older_than_days }} days)
+      when: pve_pre_snapshots | length > 0
+
+    - name: Delete the old pre-change snapshots
+      ansible.builtin.command:
+        argv:
+          - "{{ 'qm' if pve_kind == 'qemu' else 'pct' }}"
+          - delsnapshot
+          - "{{ pve_vmid }}"
+          - "{{ item.name }}"
+      delegate_to: "{{ pve_hypervisor }}"
+      become: true
+      loop: "{{ pve_pre_snapshots | selectattr('old') | list }}"
+      loop_control:
+        label: "{{ inventory_hostname }} {{ item.name }} ({{ item.age_days }} days)"
+      when: prune_confirm | bool
+      changed_when: true

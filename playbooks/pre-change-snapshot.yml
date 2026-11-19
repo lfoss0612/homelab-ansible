@@ -1,0 +1,106 @@
+---
+# Take a named safety snapshot of Proxmox guests before a risky change.
+#
+# Usage (dry run is the default through the wrappers):
+#   scripts/run-working-tree.sh playbooks/pre-change-snapshot.yml \
+#       -e snapshot_targets=openclaw.home.lan -e snapshot_change=openclaw-2026-11-5
+#   scripts/run-working-tree.sh --apply playbooks/pre-change-snapshot.yml \
+#       -e snapshot_targets=k8s_workers -e snapshot_change=os-patch
+#
+# The snapshot is called pre-<snapshot_change>-<YYYYMMDD>. snapshot_targets is an inventory host
+# or group (required, so nothing is snapshotted by accident). Each guest's hypervisor, VMID and
+# kind come from the inventory (pve_hypervisor, pve_vmid, pve_kind, pve_snapshot_method).
+#
+# Methods, set per guest by pve_snapshot_method:
+#   snapshot  qm/pct snapshot, no RAM state. Instant and rolled back with rollback-vm.yml.
+#   vzdump    a snapshot-mode backup to PBS, for guests whose disks cannot be snapshotted
+#             (omv has passthrough disks). Slower; restore is a manual PBS restore.
+#
+# Guests are done one at a time. Snapshots use space until pruned: playbooks/prune-snapshots.yml
+# lists and removes old ones.
+
+- name: Take a pre-change snapshot
+  hosts: "{{ snapshot_targets | default('') }}"
+  gather_facts: false
+  become: false
+  serial: 1
+  vars:
+    snapshot_stamp: "{{ lookup('pipe', 'date +%Y%m%d') }}"
+    pve_backup_storage: "{{ pve_backup_storage_override | default('pbs_pve') }}"
+  tasks:
+    - name: Check the required variables
+      ansible.builtin.assert:
+        that:
+          - snapshot_change is defined
+          - snapshot_change is match('^[a-z0-9][a-z0-9-]{0,24}$')
+          - pve_hypervisor is defined
+          - pve_vmid is defined
+          - pve_kind in ['qemu', 'lxc']
+        fail_msg: >-
+          Give -e snapshot_change=<lowercase-slug up to 25 characters> and target a host that has
+          pve_hypervisor/pve_vmid/pve_kind in inventory.ini ({{ inventory_hostname }}).
+
+    - name: Work out the snapshot name
+      ansible.builtin.set_fact:
+        pve_snap_name: "pre-{{ snapshot_change }}-{{ snapshot_stamp }}"
+
+    - name: Read the existing snapshots
+      ansible.builtin.include_tasks: tasks/pve-list-snapshots.yml
+
+    - name: Refuse to reuse a snapshot name
+      ansible.builtin.assert:
+        that: pve_snap_name not in (pve_snapshots | map(attribute='name') | list)
+        fail_msg: >-
+          {{ inventory_hostname }} already has {{ pve_snap_name }}. Use a different
+          snapshot_change, or delete the old one first (prune-snapshots.yml).
+      when: pve_snapshot_method | default('snapshot') == 'snapshot'
+
+    - name: Say what will happen
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'DRY RUN: would take' if ansible_check_mode else 'Taking' }}
+          {{ pve_snapshot_method | default('snapshot') }} {{ pve_snap_name }} of
+          {{ inventory_hostname }} ({{ pve_kind }} {{ pve_vmid }} on {{ pve_hypervisor }}).
+
+    - name: Take the snapshot
+      ansible.builtin.command:
+        argv:
+          - "{{ 'qm' if pve_kind == 'qemu' else 'pct' }}"
+          - snapshot
+          - "{{ pve_vmid }}"
+          - "{{ pve_snap_name }}"
+          - --description
+          - "pre-change snapshot for {{ snapshot_change }} (ansible)"
+      delegate_to: "{{ pve_hypervisor }}"
+      become: true
+      when: pve_snapshot_method | default('snapshot') == 'snapshot'
+      changed_when: true
+
+    - name: Take a snapshot-mode backup to PBS
+      ansible.builtin.command:
+        argv:
+          - vzdump
+          - "{{ pve_vmid }}"
+          - --mode
+          - snapshot
+          - --storage
+          - "{{ pve_backup_storage }}"
+          - --notes-template
+          - "pre-change {{ snapshot_change }} {{ snapshot_stamp }}"
+      delegate_to: "{{ pve_hypervisor }}"
+      become: true
+      when: pve_snapshot_method | default('snapshot') == 'vzdump'
+      changed_when: true
+      async: 7200
+      poll: 30
+
+    - name: Read the snapshots again to confirm
+      ansible.builtin.include_tasks: tasks/pve-list-snapshots.yml
+      when: pve_snapshot_method | default('snapshot') == 'snapshot' and not ansible_check_mode
+
+    - name: Confirm the snapshot exists
+      ansible.builtin.assert:
+        that: pve_snap_name in (pve_snapshots | map(attribute='name') | list)
+        fail_msg: "{{ pve_snap_name }} is not in the snapshot list of {{ inventory_hostname }} after taking it."
+        success_msg: "{{ inventory_hostname }}: {{ pve_snap_name }} exists."
+      when: pve_snapshot_method | default('snapshot') == 'snapshot' and not ansible_check_mode

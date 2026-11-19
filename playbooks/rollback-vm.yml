@@ -1,0 +1,112 @@
+---
+# Roll one Proxmox guest back to a snapshot taken by pre-change-snapshot.yml.
+#
+# THIS DISCARDS everything the guest did since the snapshot (data, state, logs). Use it only
+# when a change went wrong and you have decided to undo it. It is one guest at a time.
+#
+# Usage:
+#   scripts/ansible-on-cockpit.sh playbook playbooks/rollback-vm.yml \
+#       -e rollback_target=openclaw.home.lan -e snapshot_name=pre-openclaw-2026-11-5-20261117
+#       shows the guest, the snapshot and what would happen. Changes nothing.
+#   scripts/run-working-tree.sh --apply playbooks/rollback-vm.yml \
+#       -e rollback_target=openclaw.home.lan -e snapshot_name=<name> -e rollback_confirm=true
+#       shuts the guest down, rolls it back, and starts it again.
+#
+# Guests listed in proxmox_protected_vmids on their hypervisor (OPNsense, which carries the
+# house network) additionally need -e confirm_protected_vmids=true. Guests on the vzdump method
+# (omv) have no snapshot to roll back to; restore them from PBS by hand.
+
+- name: Roll a guest back to a snapshot
+  hosts: "{{ rollback_target | default('') }}"
+  gather_facts: false
+  become: false
+  serial: 1
+  vars:
+    rollback_confirm: false
+    confirm_protected_vmids: false
+  tasks:
+    - name: Check the request
+      ansible.builtin.assert:
+        that:
+          - snapshot_name is defined
+          - pve_hypervisor is defined
+          - pve_vmid is defined
+          - pve_kind in ['qemu', 'lxc']
+          - pve_snapshot_method | default('snapshot') == 'snapshot'
+        fail_msg: >-
+          Give -e snapshot_name=<name> and a rollback_target that is a snapshot-method guest in
+          inventory.ini. Guests on the vzdump method are restored from PBS by hand.
+
+    - name: Refuse a protected guest unless it was explicitly unlocked
+      ansible.builtin.assert:
+        that: >-
+          (pve_vmid | int) not in (hostvars[pve_hypervisor].proxmox_protected_vmids | default([]))
+          or (confirm_protected_vmids | bool)
+        fail_msg: >-
+          {{ inventory_hostname }} (VMID {{ pve_vmid }}) is protected on {{ pve_hypervisor }}.
+          Pass -e confirm_protected_vmids=true if you really mean it.
+
+    - name: Read the snapshots
+      ansible.builtin.include_tasks: tasks/pve-list-snapshots.yml
+
+    - name: Check the snapshot exists
+      ansible.builtin.assert:
+        that: snapshot_name in (pve_snapshots | map(attribute='name') | list)
+        fail_msg: >-
+          {{ inventory_hostname }} has no snapshot {{ snapshot_name }}. It has:
+          {{ pve_snapshots | map(attribute='name') | list }}
+
+    - name: Show the plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Will' if (rollback_confirm | bool and not ansible_check_mode) else 'DRY RUN, would' }}
+          shut down {{ inventory_hostname }} ({{ pve_kind }} {{ pve_vmid }} on {{ pve_hypervisor }}),
+          roll it back to {{ snapshot_name }} (taken {{ '%Y-%m-%d %H:%M' | strftime((pve_snapshots | selectattr('name', 'equalto', snapshot_name) | first).snaptime | default(0) | int) }}),
+          and start it. Everything the guest did since is discarded.
+
+    - name: Stop here unless the rollback was confirmed
+      ansible.builtin.meta: end_host
+      when: not (rollback_confirm | bool) or ansible_check_mode
+
+    - name: Shut the guest down (forced after two minutes)
+      ansible.builtin.command:
+        argv:
+          - "{{ 'qm' if pve_kind == 'qemu' else 'pct' }}"
+          - shutdown
+          - "{{ pve_vmid }}"
+          - --timeout
+          - "120"
+          - --forceStop
+          - "1"
+      delegate_to: "{{ pve_hypervisor }}"
+      become: true
+      changed_when: true
+
+    - name: Roll back
+      ansible.builtin.command:
+        argv:
+          - "{{ 'qm' if pve_kind == 'qemu' else 'pct' }}"
+          - rollback
+          - "{{ pve_vmid }}"
+          - "{{ snapshot_name }}"
+      delegate_to: "{{ pve_hypervisor }}"
+      become: true
+      changed_when: true
+
+    - name: Start the guest again
+      ansible.builtin.command:
+        argv:
+          - "{{ 'qm' if pve_kind == 'qemu' else 'pct' }}"
+          - start
+          - "{{ pve_vmid }}"
+      delegate_to: "{{ pve_hypervisor }}"
+      become: true
+      changed_when: true
+
+    - name: Say what to check next
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} was rolled back to {{ snapshot_name }} and started. Wait for it to
+          boot, then run playbooks/fleet-versions.yml and the relevant validate playbook. Also check
+          services that keep state elsewhere (Longhorn volumes, Zabbix history, the OpenClaw gateway
+          pairing) and set the pin in git back to match.

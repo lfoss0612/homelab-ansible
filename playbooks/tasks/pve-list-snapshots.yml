@@ -1,0 +1,26 @@
+---
+# List the snapshots of one Proxmox guest and set `pve_snapshots`.
+#
+# Include from a play whose hosts are guests with pve_hypervisor / pve_vmid / pve_kind in the
+# inventory (see inventory.ini). The task delegates to the hypervisor, so the guest itself is
+# never contacted. Read-only; runs under --check.
+#
+# Sets pve_snapshots: a list of {name, snaptime, description, parent}. The "current" pseudo
+# entry that Proxmox returns is removed. snaptime is an epoch; may be absent on old entries.
+- name: Read the guest's snapshots from the hypervisor
+  ansible.builtin.command:
+    argv:
+      - pvesh
+      - get
+      - "/nodes/{{ pve_hypervisor.split('.')[0] }}/{{ pve_kind }}/{{ pve_vmid }}/snapshot"
+      - --output-format
+      - json
+  delegate_to: "{{ pve_hypervisor }}"
+  become: true
+  register: pve_snapshot_raw
+  changed_when: false
+  check_mode: false
+
+- name: Set the snapshot list
+  ansible.builtin.set_fact:
+    pve_snapshots: "{{ pve_snapshot_raw.stdout | from_json | rejectattr('name', 'equalto', 'current') | list }}"
