@@ -1,0 +1,271 @@
+---
+# One entry point for an OS RELEASE upgrade (Ubuntu LTS to LTS, Debian stable to stable) of ONE host:
+# the checks that were learned the hard way on 2026-11-15, then the detached upgrade unit.
+# It does not reboot, drain, or touch Proxmox hosts. Afterwards run post-release-upgrade-check.yml.
+#
+# Usage (one host per run; the wrapper dry-runs unless --apply is given):
+#   scripts/run-working-tree.sh playbooks/release-upgrade.yml -e release_host=zabbix.home.lan
+#       pre-checks only, read-only: says exactly what blocks the upgrade
+#   scripts/run-working-tree.sh --apply playbooks/release-upgrade.yml -e release_host=zabbix.home.lan -e release_go=true
+#       records the baseline, then starts the upgrade as a detached systemd unit and returns
+#
+# Which path runs, from the OS found on the host:
+#   Ubuntu            do-release-upgrade as a detached unit (survives an SSH drop).
+#   Debian + OMV      omv-release-upgrade.yml (its own repo and keyring handling; --tags run).
+#   Proxmox hosts     refused: upgrade them with their own playbook and a window (they carry corosync
+#                     votes and the guests).
+#   Kubernetes nodes  the pre-checks here plus the node must already be cordoned and drained; use
+#                     k8s-node-release-upgrade.yml for the drain and the post steps, which gates the same.
+#   LXC               refused: the kernel is the host's and the container is upgraded from its own
+#                     distro tools; do it by hand with a snapshot.
+#
+# Pre-checks (all must hold, each says what to do when it does not):
+#   a recent restore point of the guest (Proxmox snapshot, or a vzdump to PBS), newer than
+#   release_max_backup_age_h (default 24); nothing left to patch and no reboot pending (the release
+#   tool refuses otherwise); enough free space; a release is actually offered (Ubuntu); the nodes of a
+#   Kubernetes host are cordoned; the AppArmor drop-in is in place on RKE2 nodes (AppArmor 5 plus the
+#   containerd profile denied signals and ptrace on 2026-11-15); MongoDB is paused when the cluster is
+#   about to move to a kernel it cannot run on (release_mongodb_paused_ok=true acknowledges this).
+#   Third-party apt repositories are listed: the release tool disables them, and the post-upgrade
+#   check flags the ones still pointing at the old release.
+#
+# The baseline (interface names, DNS, third-party repo lines, running kernel, codename) is written to
+# /var/lib/release-upgrade/before.json at start, so post-release-upgrade-check.yml can compare.
+
+- name: Release upgrade, pre-checks and start
+  hosts: "{{ release_host | default('localhost') }}"
+  become: true
+  gather_facts: false
+  vars:
+    release_max_backup_age_h: 24
+    release_min_free_gib: 8
+    release_unit: release-upgrade
+    release_control_plane: k8s-master.home.lan
+    release_kubectl: /var/lib/rancher/rke2/bin/kubectl
+    release_kubectl_env: { KUBECONFIG: /etc/rancher/rke2/rke2.yaml }
+    release_is_k8s: "{{ inventory_hostname in groups['k8s'] | default([]) }}"
+    release_hyp: "{{ hostvars[inventory_hostname].pve_hypervisor | default('') }}"
+  tasks:
+    - name: Nothing to do without a host
+      ansible.builtin.meta: end_play
+      when: release_host is not defined
+
+    - name: Read the OS
+      ansible.builtin.shell:
+        cmd: |
+          . /etc/os-release
+          echo "id=$ID"; echo "codename=$VERSION_CODENAME"; echo "version=$VERSION_ID"
+          echo "virt=$(systemd-detect-virt 2>/dev/null || echo none)"
+          echo "free_gib=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)"
+          echo "pve=$([ -x /usr/bin/pveversion ] && echo yes || echo no)"
+          echo "omv=$([ -x /usr/sbin/omv-release-upgrade ] && echo yes || echo no)"
+        executable: /bin/bash
+      register: release_os_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        release_os: "{{ dict(release_os_raw.stdout_lines | map('split', '=', 1) | list) }}"
+
+    - name: Choose the path or refuse
+      ansible.builtin.set_fact:
+        release_path: >-
+          {{ 'refuse-pve' if release_os.pve == 'yes'
+             else 'refuse-lxc' if release_os.virt in ['lxc', 'container-other', 'systemd-nspawn', 'docker']
+             else 'omv' if release_os.omv == 'yes'
+             else 'ubuntu' if release_os.id == 'ubuntu'
+             else 'refuse-other' }}
+
+    - name: Say which path this is
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ release_os.id }} {{ release_os.version }} ({{ release_os.codename }}) -> path {{ release_path }}"
+
+    - name: Refuse what this wrapper does not do
+      ansible.builtin.fail:
+        msg: >-
+          {{ {'refuse-pve': 'Proxmox hosts carry corosync votes and the guests: upgrade them with their own playbook in a window.',
+              'refuse-lxc': 'A container shares the host kernel; upgrade it by hand from a snapshot.',
+              'refuse-other': 'No upgrade path is coded for ' ~ release_os.id ~ '.'}[release_path] }}
+      when: release_path is match('refuse')
+
+    # ------------------------------------------------------------ restore point
+    - name: Find the newest restore point of this guest
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          id={{ hostvars[inventory_hostname].pve_vmid }}
+          if [ "{{ hostvars[inventory_hostname].pve_snapshot_method | default('snapshot') }}" = vzdump ]; then
+            best=0
+            for s in $(pvesh get /storage --output-format json | python3 -c "import json,sys;print(' '.join(x['storage'] for x in json.load(sys.stdin) if x.get('type')=='pbs'))"); do
+              t=$(pvesh get /nodes/$(hostname)/storage/$s/content --content backup --vmid $id --output-format json 2>/dev/null \
+                  | python3 -c "import json,sys;d=json.load(sys.stdin);print(max([x.get('ctime',0) for x in d] or [0]))")
+              [ "$t" -gt "$best" ] && best=$t
+            done
+            echo "$best"
+          else
+            cmd=qm; [ "{{ hostvars[inventory_hostname].pve_kind | default('qemu') }}" = lxc ] && cmd=pct
+            $cmd listsnapshot $id | awk '/pre-/ {print $3" "$4}' | while read -r d t; do date -d "$d $t" +%s; done | sort -n | tail -1
+          fi
+        executable: /bin/bash
+      delegate_to: "{{ release_hyp }}"
+      register: release_restore
+      changed_when: false
+      check_mode: false
+      when: release_hyp | length > 0
+
+    - name: Require a recent restore point
+      ansible.builtin.assert:
+        that: >-
+          (release_restore.stdout | trim | default('0') | int) > 0
+          and (now(utc=true).strftime('%s') | int) - (release_restore.stdout | trim | int) < release_max_backup_age_h * 3600
+        fail_msg: >-
+          No restore point of {{ inventory_hostname }} newer than {{ release_max_backup_age_h }} h
+          (newest: {{ release_restore.stdout | default('none') | trim }}). Take one first:
+          playbooks/pre-change-snapshot.yml -e snapshot_targets={{ inventory_hostname }} -e snapshot_change=release-upgrade
+          (vzdump hosts such as omv: playbooks/release-upgrade-prep.yml).
+        success_msg: "Restore point found, newest {{ release_restore.stdout | trim }}"
+      when: release_hyp | length > 0
+
+    # ------------------------------------------------------------ host state
+    - name: Require enough free space
+      ansible.builtin.assert:
+        that: release_os.free_gib | int >= release_min_free_gib
+        fail_msg: "Only {{ release_os.free_gib }} GiB free on /, need {{ release_min_free_gib }}."
+
+    - name: Count what apt would still install, and look for a pending reboot
+      ansible.builtin.shell: >-
+        apt-get update -qq &&
+        echo "pending=$(apt-get -s -o APT::Get::Always-Include-Phased-Updates=false upgrade | grep -c '^Inst ' || true)";
+        echo "reboot=$([ -f /var/run/reboot-required ] && echo yes || echo no)"
+      register: release_apt
+      changed_when: false
+      check_mode: false
+
+    - name: Require a fully patched host with no pending reboot
+      ansible.builtin.assert:
+        that:
+          - "'pending=0' in release_apt.stdout"
+          - "'reboot=no' in release_apt.stdout"
+        fail_msg: >-
+          {{ release_apt.stdout_lines | join(', ') }}. Patch (os-update.yml) and reboot
+          (fleet-reboot.yml) first: the release tools refuse otherwise.
+
+    - name: Ubuntu, check a release is offered
+      ansible.builtin.shell: do-release-upgrade -c 2>&1 | tail -3
+      register: release_offer
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      when: release_path == 'ubuntu'
+
+    - name: Show what is offered
+      ansible.builtin.debug:
+        msg: "{{ release_offer.stdout | default('n/a') }}"
+      when: release_path == 'ubuntu'
+
+    - name: Require a new release to be offered
+      ansible.builtin.assert:
+        that: "'New release' in release_offer.stdout and 'available' in release_offer.stdout"
+        fail_msg: "do-release-upgrade offers nothing: {{ release_offer.stdout }}"
+      when: release_path == 'ubuntu'
+
+    - name: List third-party apt repositories (the release tool disables these)
+      ansible.builtin.shell: "grep -rhE '^(deb |Suites:|URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | grep -viE 'ubuntu.com|debian.org' || true"
+      register: release_repos
+      changed_when: false
+      check_mode: false
+
+    - name: Show them
+      ansible.builtin.debug:
+        msg: "{{ release_repos.stdout_lines | default([]) or ['none'] }}"
+
+    # ------------------------------------------------------------ Kubernetes
+    - name: Kubernetes node checks
+      when: release_is_k8s | bool
+      block:
+        - name: Require the node to be cordoned
+          ansible.builtin.shell: "{{ release_kubectl }} get node {{ inventory_hostname }} -o jsonpath='{.spec.unschedulable}'"
+          environment: "{{ release_kubectl_env }}"
+          delegate_to: "{{ release_control_plane }}"
+          register: release_cordon
+          changed_when: false
+          check_mode: false
+          failed_when: release_cordon.stdout != 'true'
+
+        - name: Require the AppArmor drop-in for containerd
+          ansible.builtin.shell: >-
+            grep -rlE 'disable_apparmor|apparmor' /var/lib/rancher/rke2/agent/etc/containerd/ /etc/rancher/rke2/ 2>/dev/null | head -3
+          register: release_apparmor
+          changed_when: false
+          check_mode: false
+          failed_when: release_apparmor.stdout | trim | length == 0
+
+        - name: Is MongoDB paused
+          ansible.builtin.shell: "{{ release_kubectl }} get statefulset -A --no-headers | awk '/mongodb/{print $1, $2, $3}'"
+          environment: "{{ release_kubectl_env }}"
+          delegate_to: "{{ release_control_plane }}"
+          register: release_mongo
+          changed_when: false
+          check_mode: false
+
+        - name: Require MongoDB to be paused or acknowledged
+          ansible.builtin.assert:
+            that: >-
+              release_mongo.stdout | trim | length == 0
+              or (release_mongo.stdout | regex_search('0/0'))
+              or (release_mongodb_paused_ok | default(false) | bool)
+            fail_msg: >-
+              MongoDB is running ({{ release_mongo.stdout }}). MongoDB 8 (tcmalloc rseq) cannot run on kernel
+              6.19 or newer. Scale it to 0 first or pass -e release_mongodb_paused_ok=true.
+
+    # ------------------------------------------------------------ go
+    - name: Require the go-ahead
+      ansible.builtin.assert:
+        that: release_go | default(false) | bool
+        fail_msg: "All pre-checks passed for {{ inventory_hostname }} ({{ release_path }}). Pass -e release_go=true to start the upgrade."
+
+    - name: Record the baseline for the post-upgrade check
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          install -d -m 755 /var/lib/release-upgrade
+          python3 - <<'PY' > /var/lib/release-upgrade/before.json
+          import json, subprocess, platform
+          def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout.strip()
+          print(json.dumps({
+              "codename": sh(". /etc/os-release; echo $VERSION_CODENAME"),
+              "version": sh(". /etc/os-release; echo $VERSION_ID"),
+              "kernel": platform.release(),
+              "interfaces": sorted(sh("ls /sys/class/net").split()),
+              "nameservers": sh("grep ^nameserver /etc/resolv.conf | awk '{print $2}'").split(),
+              "repos": sh("grep -rhE '^(deb |Suites:|URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null").splitlines(),
+              "dkms": sh("dkms status 2>/dev/null"),
+              "taken": sh("date -Is"),
+          }, indent=1))
+          PY
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Ubuntu, start do-release-upgrade as a detached unit
+      ansible.builtin.command: >-
+        systemd-run --unit={{ release_unit }} --collect
+        --setenv=DEBIAN_FRONTEND=noninteractive --setenv=TERM=dumb
+        do-release-upgrade -f DistUpgradeViewNonInteractive
+      changed_when: true
+      when: release_path == 'ubuntu'
+
+    - name: OMV, hand over to its own playbook
+      ansible.builtin.debug:
+        msg: >-
+          Baseline recorded. Now run: scripts/run-working-tree.sh --apply playbooks/omv-release-upgrade.yml
+          --tags run -e omv_release_upgrade_go=true (it repoints the Proxmox client repo and keyring itself).
+      when: release_path == 'omv'
+
+    - name: Say how to follow it
+      ansible.builtin.debug:
+        msg: >-
+          journalctl -u {{ release_unit }} on {{ inventory_hostname }}. systemd is upgraded mid-run, so the unit can
+          look inactive; the end is "Cleanup" in the journal and a clean dpkg --audit. Then reboot with
+          fleet-reboot.yml (-e reboot_force=true if no flag is set) and run post-release-upgrade-check.yml.
+      when: release_path == 'ubuntu'

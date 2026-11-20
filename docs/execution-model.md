@@ -705,3 +705,18 @@ units and the Zabbix agent afterwards.
   `reboot_allow_quorum_loss`, `reboot_allow_control_node` (the host carries cockpit: the reboot is
   scheduled detached and checked afterwards with `-e reboot_verify_only=true` from cockpit),
   `reboot_ignore_nfs`, `reboot_force`.
+
+## Release upgrades (`release-upgrade.yml`, `post-release-upgrade-check.yml`)
+
+`release-upgrade.yml -e release_host=<host>` is the one entry point for an Ubuntu or Debian (OMV)
+release upgrade of one host. Dry run = pre-checks only: a restore point newer than 24 h (snapshot or
+vzdump, looked up on the hypervisor), nothing left to patch and no reboot pending, free space, a release
+offered, third-party repos listed, and on RKE2 nodes: cordoned, the AppArmor drop-in present, MongoDB
+paused. `--apply -e release_go=true` records a baseline (`/var/lib/release-upgrade/before.json`) and
+starts `do-release-upgrade` as a detached unit (OMV hands over to `omv-release-upgrade.yml`). It refuses
+Proxmox hosts and containers and never reboots; use `fleet-reboot.yml` after.
+
+`post-release-upgrade-check.yml` is read-only and safe on any host at any time: codename, `dpkg --audit`,
+interface names against the baseline, DNS, third-party repos left disabled or on the old release, dkms
+modules built for the running kernel, needrestart, failed units, Zabbix agent, pending reboot. It fails
+a host that has a problem, so a run over the fleet ends red where something needs attention.

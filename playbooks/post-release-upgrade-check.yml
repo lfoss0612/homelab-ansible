@@ -1,0 +1,93 @@
+---
+# Read-only checklist after a release upgrade (or any kernel change): the things that broke or nearly
+# broke on 2026-11-15. Safe to run on any host at any time; it changes nothing.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/post-release-upgrade-check.yml -e check_hosts=k8s-worker.home.lan
+#   scripts/run-working-tree.sh playbooks/post-release-upgrade-check.yml             (every host except opnsense)
+#
+# Checks, each reported as ok or PROBLEM with what to do:
+#   release       the codename is what you expect (-e expect_codename=resolute); no half-configured packages
+#   interfaces    network interface names against the baseline release-upgrade.yml wrote before the
+#                 upgrade (a renamed NIC, enp6s18 to ens18, leaves the static network config orphaned)
+#   dns           the host resolves a name and a local one
+#   repos         third-party apt repositories still naming the OLD release, and .distUpgrade/.disabled/.save
+#                 files the release tool left (Zabbix and NodeSource are the usual ones to re-enable)
+#   dkms          every dkms module is built for the RUNNING kernel (the NVIDIA driver on k8s-worker-2)
+#   needrestart   services still running old libraries (only when needrestart is installed)
+#   units         failed systemd units
+#   agent         the Zabbix agent is active and its log shows no recent connection errors
+#   reboot        a reboot is still pending
+# A host with no baseline file is checked for everything that does not need one.
+
+- name: Post release-upgrade checks
+  hosts: "{{ check_hosts | default('all:!api_managed') }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect the facts
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          . /etc/os-release
+          echo "codename=$VERSION_CODENAME"
+          echo "kernel=$(uname -r)"
+          echo "audit=$(dpkg --audit 2>&1 | wc -l)"
+          echo "interfaces=$(ls /sys/class/net | sort | paste -sd, -)"
+          echo "dns_public=$(getent hosts deb.debian.org >/dev/null 2>&1 && echo yes || echo NO)"
+          echo "dns_local=$(getent hosts cockpit.home.lan >/dev/null 2>&1 && echo yes || echo NO)"
+          echo "stale_repo_files=$(ls /etc/apt/sources.list.d/ 2>/dev/null | grep -E '\.(distUpgrade|disabled|save|dpkg-old)$' | paste -sd, -)"
+          echo "repo_lines=$(grep -rhE '^(deb |Suites:|URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | paste -sd'|' -)"
+          if command -v dkms >/dev/null && [ -n "$(dkms status 2>/dev/null)" ]; then
+            echo "dkms_bad=$(dkms status 2>/dev/null | grep -v "$(uname -r)" | grep -c . || true)"
+            echo "dkms_running=$(dkms status 2>/dev/null | grep "$(uname -r)" | grep -c installed || true)"
+          else echo "dkms_bad=n/a"; echo "dkms_running=n/a"; fi
+          if command -v needrestart >/dev/null; then
+            echo "needrestart=$(needrestart -b -r l 2>/dev/null | grep -c 'NEEDRESTART-SVC' || true)"
+          else echo "needrestart=n/a"; fi
+          echo "failed=$(systemctl list-units --state=failed --no-legend --plain | awk '{print $1}' | paste -sd, -)"
+          for a in zabbix-agent2 zabbix-agent; do systemctl cat $a >/dev/null 2>&1 && { echo "agent=$a:$(systemctl is-active $a)"; break; }; done
+          echo "agent_errors=$(journalctl -u zabbix-agent2 -u zabbix-agent --since '-30min' --no-pager 2>/dev/null | grep -ciE 'cannot connect|connection refused|failed' || true)"
+          echo "reboot=$([ -f /var/run/reboot-required ] && echo yes || echo no)"
+          if [ -f /var/lib/release-upgrade/before.json ]; then python3 -c "
+          import json;b=json.load(open('/var/lib/release-upgrade/before.json'))
+          print('base_codename='+b['codename']);print('base_interfaces='+','.join(b['interfaces']));print('base_nameservers='+','.join(b['nameservers']))"
+          fi
+        executable: /bin/bash
+      register: post_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse and judge
+      ansible.builtin.set_fact:
+        post_info: "{{ dict(post_raw.stdout_lines | select('search', '=') | map('split', '=', 1) | list) }}"
+
+    - name: Work out the problems
+      ansible.builtin.set_fact:
+        post_problems: >-
+          {{ ([] +
+              (['codename is ' ~ post_info.codename ~ ', expected ' ~ expect_codename] if expect_codename is defined and post_info.codename != expect_codename else []) +
+              (['dpkg --audit reports problems: run dpkg --configure -a'] if post_info.audit | int > 0 else []) +
+              (['interfaces changed from ' ~ post_info.base_interfaces ~ ' to ' ~ post_info.interfaces ~ ': fix the network config'] if post_info.base_interfaces is defined and post_info.base_interfaces != post_info.interfaces else []) +
+              (['DNS does not resolve a public name'] if post_info.dns_public != 'yes' else []) +
+              (['DNS does not resolve a local name'] if post_info.dns_local != 'yes' else []) +
+              (['apt files left by the release tool: ' ~ post_info.stale_repo_files ~ ' (re-enable the repo for the new suite)'] if post_info.stale_repo_files | length > 0 else []) +
+              (['apt repo lines still name the old release ' ~ post_info.base_codename] if post_info.base_codename is defined and post_info.base_codename != post_info.codename and (post_info.repo_lines | regex_search('\b' ~ post_info.base_codename ~ '\b')) else []) +
+              (['dkms modules exist for another kernel but not all are built for ' ~ post_info.kernel ~ ': run dkms autoinstall'] if post_info.dkms_bad not in ['n/a', '0'] and post_info.dkms_running | int == 0 else []) +
+              (['needrestart lists ' ~ post_info.needrestart ~ ' service(s) on old libraries: restart them'] if post_info.needrestart not in ['n/a', '0'] else []) +
+              (['failed units: ' ~ post_info.failed] if post_info.failed | length > 0 else []) +
+              (['zabbix agent not active (' ~ post_info.agent ~ ')'] if post_info.agent is defined and not post_info.agent.endswith(':active') else []) +
+              (['zabbix agent logged ' ~ post_info.agent_errors ~ ' connection error(s) in 30 minutes'] if post_info.agent_errors | int > 0 else []) +
+              (['a reboot is still pending'] if post_info.reboot == 'yes' else [])) }}
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ post_info.codename }}, kernel {{ post_info.kernel }}):
+          {{ 'ok' if post_problems | length == 0 else 'PROBLEM: ' ~ (post_problems | join('; ')) }}
+
+    - name: Fail the host when there are problems (so a run over many hosts ends red)
+      ansible.builtin.assert:
+        that: post_problems | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ post_problems | join('; ') }}"
+        quiet: true
