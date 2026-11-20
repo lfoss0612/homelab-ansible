@@ -1,0 +1,201 @@
+---
+# Upgrade RKE2 on ONE node, drained, with the gates the system-upgrade-controller plan lacked (its drain
+# hung on Longhorn's instance-manager PDB on 2026-11-15, so nodes were drained by hand). Control plane
+# first, then workers, one node per run.
+#
+#   scripts/run-working-tree.sh playbooks/rke2-node-upgrade.yml -e rke2_node=k8s-worker.home.lan -e rke2_target=v1.36.7+rke2r1
+#       dry run: pre-checks only
+#   scripts/run-working-tree.sh --apply playbooks/rke2-node-upgrade.yml -e rke2_node=... -e rke2_target=... -e rke2_go=true
+#   -e rke2_allow_control_plane=true   needed for k8s-master (single etcd: the API is down while it restarts)
+#   -e rke2_force_drain=true           bypass PDBs the graceful drain could not satisfy (an outage for what they protect)
+#
+# Steps: pre-checks (target is the same or the next minor, every node Ready, a recent etcd snapshot on
+# the control plane, Longhorn volumes healthy), label rke2-upgrade=disabled so the SUC plan leaves the
+# node alone, cordon and drain (Longhorn instance managers excluded), wait until no Longhorn volume is
+# attached, install the new RKE2 with the official script pinned to the target version, restart the
+# right unit (rke2-server on the control plane, rke2-agent elsewhere; the other is masked there), wait
+# for the node to report the target version and Ready and for Longhorn to be Ready, uncordon, remove the
+# label. It does not reboot. Run the RKE2/Rancher checklist (docs/rke2-rancher-upgrade-checklist.md) first.
+- name: Upgrade RKE2 on one node
+  hosts: "{{ rke2_node | default('localhost') }}"
+  become: true
+  gather_facts: false
+  vars:
+    cp: k8s-master.home.lan
+    kubectl: /var/lib/rancher/rke2/bin/kubectl
+    kenv: { KUBECONFIG: /etc/rancher/rke2/rke2.yaml }
+    selector: "longhorn.io/component!=instance-manager"
+    is_cp: "{{ inventory_hostname in groups['k8s_master'] }}"
+    unit: "{{ 'rke2-server' if inventory_hostname in groups['k8s_master'] else 'rke2-agent' }}"
+    snap_dir: /var/lib/rancher/rke2/server/db/snapshots
+  tasks:
+    - name: Nothing to do without a node
+      ansible.builtin.meta: end_play
+      when: rke2_node is not defined
+
+    - name: Require a target version
+      ansible.builtin.assert:
+        that: rke2_target is defined and rke2_target is match('^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$')
+        fail_msg: "Pass -e rke2_target=vX.Y.Z+rke2rN."
+
+    - name: Refuse the control plane unless allowed
+      ansible.builtin.assert:
+        that: not (is_cp | bool) or (rke2_allow_control_plane | default(false) | bool)
+        fail_msg: "{{ inventory_hostname }} is the only control-plane/etcd node. Pass -e rke2_allow_control_plane=true."
+
+    - name: Read the node's version and cluster state
+      ansible.builtin.shell: >-
+        {{ kubectl }} get node {{ inventory_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'; echo;
+        {{ kubectl }} get nodes --no-headers | awk '$2!="Ready"{print $1" "$2}'
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      register: rk_state
+      changed_when: false
+      check_mode: false
+
+    - name: Parse
+      ansible.builtin.set_fact:
+        rk_current: "{{ rk_state.stdout_lines[0] }}"
+        rk_notready: "{{ rk_state.stdout_lines[1:] }}"
+
+    - name: Check the version step
+      ansible.builtin.assert:
+        that:
+          - rk_current != rke2_target
+          - (rke2_target[1:].split('.')[1] | int) - (rk_current[1:].split('.')[1] | int) in [0, 1]
+          - rke2_target.split('+')[0][1:] is version(rk_current.split('+')[0][1:], '>=')
+        fail_msg: >-
+          {{ inventory_hostname }} is {{ rk_current }}; {{ rke2_target }} is not a forward step of at most one minor
+          (RKE2 does not skip minors) or it is already installed.
+
+    - name: Every node must be Ready
+      ansible.builtin.assert:
+        that: rk_notready | length == 0
+        fail_msg: "Not Ready: {{ rk_notready | join(', ') }}"
+
+    - name: Control plane, a recent etcd snapshot
+      ansible.builtin.shell: "find {{ snap_dir }} -type f -mmin -90 | head -1"
+      delegate_to: "{{ cp }}"
+      register: rk_snap
+      changed_when: false
+      check_mode: false
+      failed_when: rk_snap.stdout | trim | length == 0
+      when: is_cp | bool
+
+    - name: Longhorn volumes must be healthy
+      ansible.builtin.shell: >-
+        {{ kubectl }} get volumes.longhorn.io -n longhorn-system -o json
+        | python3 -c "import json,sys;print(sum(1 for v in json.load(sys.stdin)['items'] if v['status'].get('state')=='attached' and v['status'].get('robustness')!='healthy'))"
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      register: rk_lh
+      changed_when: false
+      check_mode: false
+      failed_when: rk_lh.stdout | trim != '0'
+
+    - name: Say the plan
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ rk_current }} -> {{ rke2_target }}, restart {{ unit }}"
+
+    - name: Require the go-ahead
+      ansible.builtin.assert:
+        that: rke2_go | default(false) | bool
+        fail_msg: "Pre-checks passed. Pass -e rke2_go=true to drain and upgrade {{ inventory_hostname }}."
+
+    - name: Keep the SUC plan off this node
+      ansible.builtin.command: "{{ kubectl }} label node {{ inventory_hostname }} rke2-upgrade=disabled --overwrite"
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      changed_when: true
+
+    - name: Cordon
+      ansible.builtin.command: "{{ kubectl }} cordon {{ inventory_hostname }}"
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      changed_when: true
+
+    - name: Graceful drain
+      ansible.builtin.command: >-
+        {{ kubectl }} drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+        --pod-selector={{ selector }} --timeout=300s
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      register: rk_drain
+      failed_when: false
+      changed_when: true
+
+    - name: Forced drain, only if allowed
+      ansible.builtin.command: >-
+        {{ kubectl }} drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+        --force --disable-eviction --pod-selector={{ selector }} --timeout=300s
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      when: rk_drain.rc != 0 and (rke2_force_drain | default(false) | bool)
+      changed_when: true
+
+    - name: Stop if the drain failed and forcing was not allowed
+      ansible.builtin.fail:
+        msg: "Drain failed ({{ rk_drain.stderr | default('') | truncate(300) }}). Node is cordoned and labelled; undo with kubectl uncordon and unlabel, or pass -e rke2_force_drain=true."
+      when: rk_drain.rc != 0 and not (rke2_force_drain | default(false) | bool)
+
+    - name: Wait until no Longhorn volume is attached to this node
+      ansible.builtin.shell: >-
+        {{ kubectl }} get volumeattachments.longhorn.io -n longhorn-system -o json
+        | python3 -c "import json,sys;n=sys.argv[1];print(sum(1 for v in json.load(sys.stdin)['items'] if any(t.get('nodeID')==n and t.get('type')!='snapshot-controller' for t in (v['spec'].get('attachmentTickets') or {}).values())))" {{ inventory_hostname }}
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      register: rk_attached
+      until: rk_attached.stdout | trim == '0'
+      retries: 40
+      delay: 15
+      changed_when: false
+      check_mode: false
+
+    - name: Fetch the official RKE2 install script
+      ansible.builtin.get_url:
+        url: https://get.rke2.io
+        dest: /var/tmp/rke2-install.sh
+        mode: "0700"
+
+    - name: Install the target version
+      ansible.builtin.command: /var/tmp/rke2-install.sh
+      environment:
+        INSTALL_RKE2_VERSION: "{{ rke2_target }}"
+        INSTALL_RKE2_TYPE: "{{ 'server' if is_cp | bool else 'agent' }}"
+      changed_when: true
+
+    - name: Restart the RKE2 service
+      ansible.builtin.systemd:
+        name: "{{ unit }}"
+        state: restarted
+
+    - name: Wait for the node to report the target version and be Ready
+      ansible.builtin.shell: >-
+        {{ kubectl }} get node {{ inventory_hostname }} --no-headers -o custom-columns=V:.status.nodeInfo.kubeletVersion,R:.status.conditions[-1].type
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      register: rk_after
+      until: "rke2_target in rk_after.stdout and 'Ready' in rk_after.stdout"
+      retries: 60
+      delay: 15
+      changed_when: false
+      check_mode: false
+
+    - name: Wait for Longhorn to report the node Ready
+      ansible.builtin.shell: >-
+        {{ kubectl }} get nodes.longhorn.io -n longhorn-system {{ inventory_hostname }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      register: rk_lhr
+      until: rk_lhr.stdout == 'True'
+      retries: 40
+      delay: 15
+      changed_when: false
+      check_mode: false
+
+    - name: Uncordon and remove the label
+      ansible.builtin.shell: "{{ kubectl }} uncordon {{ inventory_hostname }} && {{ kubectl }} label node {{ inventory_hostname }} rke2-upgrade-"
+      environment: "{{ kenv }}"
+      delegate_to: "{{ cp }}"
+      changed_when: true
