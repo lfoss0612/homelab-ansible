@@ -4,6 +4,9 @@ Control-node repo for the homelab's Ansible-managed hosts. Lives at `/opt/ansibl
 `cockpit.home.lan`, the control node; this checkout is a clone relayed to GitHub from a
 workstation, since cockpit has no push credentials.
 
+**Doing a full update?** Follow [`docs/update-cycle.md`](docs/update-cycle.md): the order, the tool for
+each step, what to verify and what stays a human call.
+
 ## Topology
 
 14 inventory hosts total (`inventory.ini`):
