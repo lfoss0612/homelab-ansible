@@ -1,0 +1,25 @@
+---
+# Read-only: show every apt source file on the chosen hosts, with the lines that matter, so repos left
+# disabled by a release upgrade (.disabled, .dpkg-old, .save, .distUpgrade) can be judged one by one.
+#   scripts/run-working-tree.sh playbooks/apt-sources-report.yml -e apt_hosts=zabbix.home.lan
+- name: Report apt sources
+  hosts: "{{ apt_hosts | default('all:!api_managed:!lxc') }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect
+      ansible.builtin.shell:
+        cmd: |
+          . /etc/os-release; echo "release=$VERSION_CODENAME"
+          cd /etc/apt/sources.list.d || exit 0
+          for f in *; do [ -f "$f" ] || continue
+            echo "## $f"; grep -vE '^(#|$)' "$f" | cut -c1-200 | head -8
+          done
+        executable: /bin/bash
+      register: apt_report
+      changed_when: false
+      check_mode: false
+
+    - name: Show
+      ansible.builtin.debug:
+        msg: "{{ apt_report.stdout_lines }}"

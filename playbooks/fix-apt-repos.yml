@@ -1,0 +1,141 @@
+---
+# Put third-party apt repositories back in order after an Ubuntu release upgrade (found 2026-11-19 by
+# post-release-upgrade-check.yml on the three RKE2 nodes and zabbix). do-release-upgrade comments out
+# every repository it does not know, and leaves backups and old copies behind; packages installed from
+# them silently stop updating.
+#
+#   scripts/run-working-tree.sh playbooks/fix-apt-repos.yml -e apt_hosts=k8s-worker-2.home.lan          dry run
+#   scripts/run-working-tree.sh --apply playbooks/fix-apt-repos.yml -e apt_hosts=k8s-worker-2.home.lan
+#
+# What it does, per host (the data is in apt_fix below; hosts not listed get only the tidy-up):
+#   * repoints Zabbix repo files from `noble` to `resolute` (all zabbix*.sources, including disabled ones)
+#   * enables Docker and NVIDIA container toolkit repositories where listed, for the new release
+#     (CUDA waits for NVIDIA's new signing key, see the note in the plan below)
+#   * removes AMD repository files on hosts where no amdgpu/rocm package is installed
+#   * backs up /etc/apt/sources.list.d to /var/backups/apt-sources-<stamp>.tar.gz, then deletes the
+#     stale leftovers apt ignores anyway (*.disabled, *.dpkg-old, *.dpkg-dist, *.save, *~ backups)
+#   * runs apt-get update and prints any error line. It does NOT upgrade anything: packages newly
+#     offered by a re-enabled repo are listed, to be taken in the normal os-update run.
+- name: Fix apt repositories after a release upgrade
+  hosts: "{{ apt_hosts | default('localhost') }}"
+  become: true
+  gather_facts: false
+  vars:
+    apt_fix:
+      k8s-worker-2.home.lan:
+        files:
+          docker.list: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu resolute stable"
+          nvidia-container-toolkit.list: "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /"
+          # CUDA is not here on purpose: the ubuntu2604 repository is signed with a newer key than the
+          # cuda-archive-keyring.gpg on the host ("repository is not signed"). Install NVIDIA's current
+          # cuda-keyring package first (verify the fingerprint), then add
+          # deb [signed-by=...] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/ /
+        remove_amd: false
+      k8s-master.home.lan: { files: {}, remove_amd: true }
+      k8s-worker.home.lan: { files: {}, remove_amd: true }
+    apt_stale_patterns: ["*.disabled", "*.dpkg-old", "*.dpkg-dist", "*.save", "*~"]
+  tasks:
+    - name: Nothing to do without a host
+      ansible.builtin.meta: end_play
+      when: apt_hosts is not defined
+
+    - name: Read this host's plan
+      ansible.builtin.set_fact:
+        apt_plan: "{{ apt_fix[inventory_hostname] | default({'files': {}, 'remove_amd': false}) }}"
+
+    - name: Confirm the release and the keyrings the new files need
+      ansible.builtin.shell: |
+        . /etc/os-release; echo "$VERSION_CODENAME"
+      register: apt_release
+      changed_when: false
+      check_mode: false
+      failed_when: apt_release.stdout != 'resolute'
+
+    - name: AMD packages still installed
+      ansible.builtin.shell: "dpkg-query -W -f='${Package}\\n' | grep -E '^(rocm|amdgpu|hip)' | grep -v '^amdgpu-install$' | wc -l"
+      register: apt_amd
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Refuse to drop AMD repositories while AMD packages remain
+      ansible.builtin.assert:
+        that: apt_amd.stdout | trim == '0'
+        fail_msg: "{{ apt_amd.stdout }} AMD package(s) still installed; keep their repository."
+      when: apt_plan.remove_amd
+
+    - name: Back up the source files
+      ansible.builtin.shell: "tar -czf /var/backups/apt-sources-$(date +%Y%m%dT%H%M%S).tar.gz -C /etc/apt sources.list.d sources.list"
+      changed_when: true
+
+    - name: Find the Zabbix repository files on the host
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: ["zabbix*.sources"]
+      register: apt_zabbix
+
+    - name: Repoint them from noble to resolute
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '^(Suites:\s*)noble\s*$'
+        replace: '\1resolute'
+      loop: "{{ apt_zabbix.files }}"
+      loop_control: { label: "{{ item.path }}" }
+
+    - name: Write the repositories to enable
+      ansible.builtin.copy:
+        dest: "/etc/apt/sources.list.d/{{ item.key }}"
+        content: "{{ item.value }}\n"
+        mode: "0644"
+      loop: "{{ apt_plan.files | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    - name: Find the AMD repository files
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: ["amdgpu*", "rocm*"]
+      register: apt_amd_files
+      when: apt_plan.remove_amd
+
+    - name: Remove them
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ apt_amd_files.files | default([]) }}"
+      loop_control: { label: "{{ item.path }}" }
+
+    - name: Find the stale leftovers apt ignores
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: "{{ apt_stale_patterns }}"
+      register: apt_stale
+
+    - name: Delete them
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ apt_stale.files }}"
+      loop_control: { label: "{{ item.path }}" }
+
+    - name: Refresh the package lists and show any error
+      ansible.builtin.shell: "apt-get update 2>&1 | grep -E '^(Err|E:|W:)' || echo 'apt-get update clean'"
+      register: apt_update
+      changed_when: false
+      when: not ansible_check_mode
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode; nothing to refresh in a dry run)
+
+    - name: Show it
+      ansible.builtin.debug:
+        msg: "{{ apt_update.stdout_lines | default(['dry run: apt-get update not run']) }}"
+
+    - name: Packages the re-enabled repositories now offer
+      ansible.builtin.shell: "apt-get -s upgrade | grep '^Inst ' | awk '{print $2, $3, $4}' | head -20"
+      register: apt_offer
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Show what is offered (not installed)
+      ansible.builtin.debug:
+        msg: "{{ apt_offer.stdout_lines | default([]) or ['nothing'] }}"
+      when: not ansible_check_mode
