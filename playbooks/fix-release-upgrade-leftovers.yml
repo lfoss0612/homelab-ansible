@@ -1,0 +1,72 @@
+---
+# Clean up two kinds of leftovers a release upgrade left on 2026-11-15, both of which show up as failed
+# systemd units (found 2026-11-19 by post-release-upgrade-check.yml):
+#   * pcp is "removed, config remains" (state rc): its old init scripts /etc/init.d/pm* are conffiles that
+#     outlive the package, and systemd turns them into failing pmcd/pmie/pmlogger/pmproxy units that
+#     read a /etc/pcp.conf that is gone. Purging the already-removed package deletes them.
+#   * /etc/logrotate.d/cloud-init is an OBSOLETE conffile (dpkg says so) now duplicated by
+#     cloud-init-base, so logrotate fails with "duplicate log entry for /var/log/cloud-init.log".
+# Also reports, without touching them, every other package left in rc state and every other obsolete
+# conffile, so they can be judged.
+#
+#   scripts/run-working-tree.sh playbooks/fix-release-upgrade-leftovers.yml -e leftovers_hosts=vscode.home.lan   dry run
+#   scripts/run-working-tree.sh --apply playbooks/fix-release-upgrade-leftovers.yml -e leftovers_hosts=...
+- name: Clean release-upgrade leftovers
+  hosts: "{{ leftovers_hosts | default('localhost') }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Nothing to do without a host
+      ansible.builtin.meta: end_play
+      when: leftovers_hosts is not defined
+
+    - name: Read the state
+      ansible.builtin.shell:
+        cmd: |
+          echo "pcp_state=$(dpkg-query -W -f='${db:Status-Abbrev}' pcp 2>/dev/null | tr -d ' ')"
+          echo "rc=$(dpkg -l | awk '/^rc/{print $2}' | paste -sd, -)"
+          echo "obsolete=$(for p in $(dpkg-query -W -f='${Package}\n'); do dpkg-query -W -f='${Conffiles}\n' $p 2>/dev/null | awk -v p=$p '/obsolete$/{print $1}'; done | paste -sd, -)"
+        executable: /bin/bash
+      register: lo_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse
+      ansible.builtin.set_fact:
+        lo: "{{ dict(lo_raw.stdout_lines | map('split', '=', 1) | list) }}"
+
+    - name: Say what is there
+      ansible.builtin.debug:
+        msg:
+          - "pcp state: {{ lo.pcp_state | default('absent') | default('absent', true) }}"
+          - "other packages in rc state: {{ (lo.rc.split(',') | reject('equalto', 'pcp') | reject('equalto', '') | list) or 'none' }}"
+          - "obsolete conffiles: {{ lo.obsolete | default('none', true) }}"
+
+    - name: Purge pcp, already removed, to delete its leftover init scripts
+      ansible.builtin.command: dpkg --purge pcp
+      changed_when: true
+      when: lo.pcp_state == 'rc'
+
+    - name: Remove the obsolete duplicate cloud-init logrotate file
+      ansible.builtin.file:
+        path: /etc/logrotate.d/cloud-init
+        state: absent
+      when: "'/etc/logrotate.d/cloud-init' in lo.obsolete.split(',')"
+
+    - name: Clear the failed state of the units this fixes
+      ansible.builtin.command: systemctl reset-failed
+      changed_when: true
+      # lint-check-mode: ignore (clears a status flag only; nothing to preview)
+
+    - name: Run logrotate once to prove it is clean
+      ansible.builtin.command: logrotate /etc/logrotate.conf
+      changed_when: false
+      failed_when: false
+      register: lo_rot
+      when: not ansible_check_mode
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode)
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: "logrotate: {{ 'clean' if (lo_rot.rc | default(0)) == 0 else lo_rot.stderr | default('') }}"
+      when: not ansible_check_mode
