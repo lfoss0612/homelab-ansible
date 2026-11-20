@@ -56,6 +56,11 @@
   become: false
   gather_facts: false
   vars:
+    # [all:vars] in the inventory sets ansible_become=true, which outranks `become: false` above. That is
+    # harmless interactively, but the weekly timer's systemd unit runs with NoNewPrivileges, where sudo
+    # cannot work: the first live timer run (2026-11-20) failed here with "no new privileges flag is set".
+    # This play only touches local files the ansible user owns, so it must not try to become root.
+    ansible_become: false
     fleet_versions_report_dir: /var/tmp/fleet-versions
     fleet_latest_os:
       debian: "13"
