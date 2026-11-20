@@ -70,7 +70,8 @@ def main(path):
             flag(name, f"OS {osid} {osv} is behind the latest {latest_os[osid]}")
         if h.get("reboot_required"):
             flag(name, "reboot required")
-        if h.get("kernel_newest_installed") and h["kernel_newest_installed"] != h.get("kernel_running"):
+        # A container shares its host's kernel; its own /boot says nothing about what will run.
+        if h.get("virt") not in ("lxc", "container-other", "systemd-nspawn", "docker") and h.get("kernel_newest_installed") and h["kernel_newest_installed"] != h.get("kernel_running"):
             flag(name, f"running kernel {h.get('kernel_running')} but {h['kernel_newest_installed']} is installed (reboot)")
         if h.get("pending_updates"):
             flag(name, f"{h['pending_updates']} package(s) pending, e.g. {', '.join(h.get('pending_sample', [])[:3])}")

@@ -81,7 +81,9 @@ def zabbix_repo(repos):
     found = None
     for path, text in sorted(repos.items()):
         m = re.search(r"repo\.zabbix\.com/zabbix/(\d+\.\d+)", text)
-        if not m or text.lstrip().startswith("#"):
+        # A file is commented out only when EVERY line is; deb822 files often start with a comment
+        # ("# Managed by ...") and must still count.
+        if not m or all(l.lstrip().startswith("#") for l in text.splitlines() if l.strip()):
             continue
         # deb822: "Suites: noble"; one-line: "deb [..] https://repo.zabbix.com/zabbix/7.4/ubuntu noble main"
         sm = re.search(r"^Suites:\s*(\S+)", text, re.M) or re.search(r"repo\.zabbix\.com/\S+\s+(\S+)\s+main", text)
@@ -168,6 +170,7 @@ def main():
         "os_id": osr.get("ID"),
         "os_version": osr.get("VERSION_ID"),
         "os_codename": osr.get("VERSION_CODENAME"),
+        "virt": (run(["systemd-detect-virt"])[1] or "").strip() or None,
         "kernel_running": running,
         "kernel_newest_installed": newest,
         "reboot_required": os.path.exists("/var/run/reboot-required"),
