@@ -1,0 +1,56 @@
+---
+# The CUDA part of updating k8s-worker-2: make the CUDA apt repository for its release trusted (the new
+# signing key after the 26.04 upgrade), then say which NVIDIA/CUDA packages could be upgraded and whether
+# DKMS covers the kernel that would boot. Run it whenever the kernel or CUDA is about to be updated, and
+# after a release upgrade (it is part of that checklist). It installs NO CUDA packages itself: the toolkit
+# upgrade is a separate, deliberate step (see homelab-vault TODO: CUDA 13.3 to 13.4.2, once Rancher is stable).
+#
+#   scripts/run-working-tree.sh playbooks/k8s-worker-2-cuda-update.yml           dry run: nothing is written or downloaded
+#   scripts/run-working-tree.sh --apply playbooks/k8s-worker-2-cuda-update.yml   writes the repo file, refreshes the keyring if needed
+#
+# Replaces the one-off 2026-08 bump playbooks for the repository part; those two
+# (fix-k8s-worker-2-nvidia.yml, k8s-worker-2-nvidia-latest.yml) remain as history for the driver moves.
+- name: CUDA repository and package status on k8s-worker-2
+  hosts: k8s-worker-2.home.lan
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ensure the CUDA repository is configured and trusted
+      ansible.builtin.include_tasks: tasks/cuda-repo.yml
+
+    - name: Refresh package lists (not in a dry run)
+      ansible.builtin.command: apt-get update -qq
+      changed_when: false
+      when: not ansible_check_mode
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode)
+
+    - name: CUDA and NVIDIA packages that could be upgraded
+      ansible.builtin.shell: >-
+        apt-get -s upgrade | awk '/^Inst / && ($2 ~ /cuda|nvidia|libnvidia/){print $2, $3, "->", $4}' | head -30
+      register: cuda_offer
+      changed_when: false
+      check_mode: false
+
+    - name: Installed toolkit and driver
+      ansible.builtin.shell: "dpkg-query -W -f='${Package} ${Version}\\n' 'cuda-toolkit-*' nvidia-driver-615-open nvidia-container-toolkit 2>/dev/null | head"
+      register: cuda_installed
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: dkms against the newest installed kernel
+      ansible.builtin.shell: |
+        newest=$(ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+        echo "newest kernel $newest, running $(uname -r)"
+        dkms status | grep -q "$newest" && echo "dkms: built for $newest" || echo "dkms: NOT built for $newest (run dkms autoinstall before rebooting)"
+      args: { executable: /bin/bash }
+      register: cuda_dkms
+      changed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "installed: {{ cuda_installed.stdout_lines }}"
+          - "upgradable: {{ cuda_offer.stdout_lines or ['nothing from NVIDIA or CUDA repos'] }}"
+          - "{{ cuda_dkms.stdout_lines }}"

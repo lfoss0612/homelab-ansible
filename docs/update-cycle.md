@@ -50,6 +50,9 @@ Longhorn detach, Ready, uncordon), Proxmox (quorum survives, boot pin versus new
 running tasks), omv (no NFS clients), dkms built for the kernel that will boot. Order: guests, workers,
 control plane, PBS, then the hypervisors, pve-router last.
 Verify after each: kernel is the expected one, no new failed units, `post-release-upgrade-check.yml`.
+Before a kernel or CUDA update on k8s-worker-2 run `k8s-worker-2-cuda-update.yml`: it makes the CUDA apt repo
+trusted for the release (refreshing NVIDIA's keyring after a release upgrade, verified before install), and
+reports upgradable NVIDIA/CUDA packages and whether DKMS covers the kernel that will boot.
 Human judgment: the window for anything that takes the network down (pve-router carries OPNsense,
 Zabbix, cockpit and 3 of 5 corosync votes), and a pinned boot kernel that should be moved.
 

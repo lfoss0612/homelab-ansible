@@ -1,0 +1,107 @@
+---
+# Make sure the NVIDIA CUDA apt repository for THIS host's Ubuntu release is configured and trusted.
+# Included by k8s-worker-2-cuda-update.yml (and usable from any update that touches CUDA or the kernel).
+#
+# Why this exists (2026-11-19): after the 24.04 to 26.04 upgrade the CUDA repo was left disabled, and
+# re-pointing it at ubuntu2604 failed with "repository is not signed": the new path is signed with a
+# newer key than the cuda-archive-keyring.gpg installed in 2024. NVIDIA's documented fix is its
+# cuda-keyring package from the same repository path.
+#
+# What it does (nothing is downloaded or changed in a dry run):
+#   1. writes /etc/apt/sources.list.d/cuda-<path>-x86_64.list pointing at the right path for the release
+#   2. runs apt-get update on that repo alone; if apt says it is not signed, it
+#        - downloads cuda-keyring_1.1-1_all.deb from the same HTTPS path into /var/tmp,
+#        - extracts it WITHOUT installing and checks the extracted key really verifies the repo's
+#          InRelease (gpgv), so a wrong or tampered package is never installed,
+#        - installs the package only if that check passes,
+#        - removes the temporary files.
+# Variables: cuda_repo_release_map (codename to repo path). Needs become.
+- name: Work out the CUDA repository path for this release
+  ansible.builtin.shell: ". /etc/os-release; echo $VERSION_CODENAME"
+  register: cuda_codename
+  changed_when: false
+  check_mode: false
+
+- name: Choose the path
+  ansible.builtin.set_fact:
+    cuda_path: "{{ cuda_repo_release_map[cuda_codename.stdout] }}"
+    cuda_base: "https://developer.download.nvidia.com/compute/cuda/repos/{{ cuda_repo_release_map[cuda_codename.stdout] }}/x86_64"
+  vars:
+    cuda_repo_release_map: { noble: ubuntu2404, resolute: ubuntu2604 }
+
+- name: Write the repository file for this release
+  ansible.builtin.copy:
+    dest: "/etc/apt/sources.list.d/cuda-{{ cuda_path }}-x86_64.list"
+    content: "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] {{ cuda_base }}/ /\n"
+    mode: "0644"
+  register: cuda_list
+
+- name: Check whether apt trusts it (this repository alone)
+  # lint-check-mode: ignore (only reached outside a dry run; nothing is downloaded or trusted in --check)
+  ansible.builtin.shell: >-
+    apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cuda-{{ cuda_path }}-x86_64.list
+    -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 2>&1 | grep -E '^(Err|E:|W:)' || echo trusted
+  register: cuda_trust
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Say what is needed
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Dry run: would write the repo file and check trust; if apt says not signed, would fetch and verify cuda-keyring.'
+         if ansible_check_mode else
+         ('CUDA repo is trusted already.' if cuda_trust.stdout | trim == 'trusted'
+          else 'Not trusted (' ~ cuda_trust.stdout | truncate(160) ~ '): refreshing the keyring.') }}
+
+- name: Refresh the keyring when apt does not trust the repository
+  when: not ansible_check_mode and cuda_trust.stdout | trim != 'trusted'
+  block:
+    - name: Download cuda-keyring from the same repository path
+      ansible.builtin.get_url:
+        url: "{{ cuda_base }}/cuda-keyring_1.1-1_all.deb"
+        dest: /var/tmp/cuda-keyring.deb
+        mode: "0600"
+
+    - name: Extract it without installing, and fetch the repository's signed release file
+      # lint-check-mode: ignore (only reached outside a dry run; nothing is downloaded or trusted in --check)
+      ansible.builtin.shell: |
+        set -e
+        rm -rf /var/tmp/cuda-keyring-x && mkdir -p /var/tmp/cuda-keyring-x
+        dpkg-deb -x /var/tmp/cuda-keyring.deb /var/tmp/cuda-keyring-x
+        curl -fsS -m 30 -o /var/tmp/cuda-InRelease {{ cuda_base }}/InRelease
+        echo "key: $(gpg --show-keys --with-colons /var/tmp/cuda-keyring-x/usr/share/keyrings/cuda-archive-keyring.gpg | awk -F: '/^fpr/{print $10; exit}')"
+      args: { executable: /bin/bash }
+      register: cuda_extract
+      changed_when: false
+
+    - name: Verify the extracted key signs the repository (gpgv)
+      # lint-check-mode: ignore (only reached outside a dry run; nothing is downloaded or trusted in --check)
+      ansible.builtin.command: >-
+        gpgv --keyring /var/tmp/cuda-keyring-x/usr/share/keyrings/cuda-archive-keyring.gpg /var/tmp/cuda-InRelease
+      register: cuda_verify
+      changed_when: false
+      failed_when: cuda_verify.rc != 0
+
+    - name: Show the key that will be trusted
+      ansible.builtin.debug:
+        msg: "{{ cuda_extract.stdout_lines }} (verified against {{ cuda_base }}/InRelease)"
+
+    - name: Install the keyring package
+      ansible.builtin.command: dpkg -i /var/tmp/cuda-keyring.deb
+      changed_when: true
+
+    - name: Confirm apt now trusts the repository
+      # lint-check-mode: ignore (only reached outside a dry run; nothing is downloaded or trusted in --check)
+      ansible.builtin.shell: >-
+        apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cuda-{{ cuda_path }}-x86_64.list
+        -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 2>&1 | grep -E '^(Err|E:|W:)' || echo trusted
+      register: cuda_trust2
+      changed_when: false
+      failed_when: cuda_trust2.stdout | trim != 'trusted'
+
+  always:
+    - name: Remove the temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/var/tmp/cuda-keyring.deb, /var/tmp/cuda-keyring-x, /var/tmp/cuda-InRelease]

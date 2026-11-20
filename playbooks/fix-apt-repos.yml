@@ -27,8 +27,8 @@
           docker.list: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu resolute stable"
           nvidia-container-toolkit.list: "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /"
           # CUDA is not here on purpose: the ubuntu2604 repository is signed with a newer key than the
-          # cuda-archive-keyring.gpg on the host ("repository is not signed"). Install NVIDIA's current
-          # cuda-keyring package first (verify the fingerprint), then add
+          # cuda-archive-keyring.gpg on the host ("repository is not signed"). Use k8s-worker-2-cuda-update.yml,
+          # which refreshes NVIDIA's keyring (verified before install) and writes
           # deb [signed-by=...] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/ /
         remove_amd: false
       k8s-master.home.lan: { files: {}, remove_amd: true }
