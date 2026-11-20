@@ -150,6 +150,8 @@
       delay: 15
       changed_when: false
       check_mode: false
+      # lint-check-mode: ignore (the drain is skipped in a dry run, so waiting for detach would only time out)
+      when: not ansible_check_mode
 
     - name: Fetch the official RKE2 install script
       ansible.builtin.get_url:
