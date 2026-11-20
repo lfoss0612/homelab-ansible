@@ -60,12 +60,10 @@
     fleet_latest_os:
       debian: "13"
       ubuntu: "26.04"
-    # Failed units that are known cosmetic leftovers (see the 2026-11-15 incident note).
-    fleet_versions_ignore_units:
-      - '^pm(cd|ie|logger|proxy)\.service$'
-      - '^hd-idle\.service$'
-      - '^quotaon@'
-      - '^zfs-load-module\.service$'
+    # Failed units to leave out of the report. Empty on purpose: the pcp, hd-idle, quotaon and ZFS leftovers that
+    # used to be listed here were fixed on 2026-11-19 (fix-release-upgrade-leftovers.yml, fix-failed-units.yml),
+    # so a return of any of them should show.
+    fleet_versions_ignore_units: []
   tasks:
     - name: Gather the per-host results
       ansible.builtin.set_fact:
@@ -112,6 +110,7 @@
                 'node_min_version': hostvars['cockpit.home.lan'].openclaw_node_min_version | default(none),
                 'openclaw_latest_npm': (fleet_versions_npm.stdout | default('') | trim) or none,
                 'latest_os': fleet_latest_os,
+                'zabbix_repo_major': zabbix_agent_repo_major | default(none),
                 'node_schedule': (fleet_versions_node_schedule.content | from_json) if fleet_versions_node_schedule.status | default(0) == 200 else {},
                 'ignore_units': fleet_versions_ignore_units},
               'hosts': fleet_versions_all | from_json}

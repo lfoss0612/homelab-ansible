@@ -31,6 +31,7 @@ def main(path):
     node_major = str(pins.get("node_major", ""))
     node_min = pins.get("node_min_version")
     oc_latest = pins.get("openclaw_latest_npm")
+    zabbix_major = pins.get("zabbix_repo_major")
     sched = pins.get("node_schedule") or {}
     today = datetime.date.today()
 
@@ -96,6 +97,10 @@ def main(path):
                 flag(name, f"zabbix agent {h['zabbix_agent2']} vs server {server}")
         if h.get("zabbix_agent2") and h.get("zabbix_repo_enabled") is False:
             flag(name, "Zabbix apt repo is disabled")
+        if h.get("zabbix_agent2") and h.get("zabbix_repo") and zabbix_major and h["zabbix_repo"] != zabbix_major:
+            flag(name, f"Zabbix apt repo is {h['zabbix_repo']}, inventory says {zabbix_major}")
+        if h.get("zabbix_repo_suite") and h.get("os_codename") and h["zabbix_repo_suite"] != h["os_codename"]:
+            flag(name, f"Zabbix repo suite is {h['zabbix_repo_suite']} but the host is {h['os_codename']}")
         if h.get("claude_expected") and not h.get("claude_user"):
             flag(name, "claude user missing")
         if failed:

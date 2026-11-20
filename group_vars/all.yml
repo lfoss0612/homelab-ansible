@@ -6,3 +6,11 @@ openclaw_install_dir: "/opt/openclaw"
 
 # Safety: deterministic installs unless tag changes
 openclaw_force_reinstall: false
+
+# -----------------------
+# Zabbix agent repository
+# -----------------------
+# The Zabbix release every host's apt repository should be on (major.minor). fleet-versions flags a
+# host whose repo differs, and a repo suite that does not match the host's release (a `noble` suite
+# left on a `resolute` host after a release upgrade). Bump together with the server.
+zabbix_agent_repo_major: "7.4"

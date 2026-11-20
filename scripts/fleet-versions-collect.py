@@ -77,17 +77,20 @@ def repo_files():
 
 
 def zabbix_repo(repos):
-    """Return (release, enabled): the first enabled Zabbix repo, else a disabled one."""
+    """Return (release, enabled, suite): the first enabled Zabbix repo, else a disabled one."""
     found = None
     for path, text in sorted(repos.items()):
         m = re.search(r"repo\.zabbix\.com/zabbix/(\d+\.\d+)", text)
         if not m or text.lstrip().startswith("#"):
             continue
+        # deb822: "Suites: noble"; one-line: "deb [..] https://repo.zabbix.com/zabbix/7.4/ubuntu noble main"
+        sm = re.search(r"^Suites:\s*(\S+)", text, re.M) or re.search(r"repo\.zabbix\.com/\S+\s+(\S+)\s+main", text)
+        suite = sm.group(1) if sm else None
         enabled = not re.search(r"^Enabled:\s*no", text, re.M | re.I)
         if enabled:
-            return m.group(1), True
-        found = found or (m.group(1), False)
-    return found if found else (None, None)
+            return m.group(1), True, suite
+        found = found or (m.group(1), False, suite)
+    return found if found else (None, None, None)
 
 
 def nodesource(repos):
@@ -146,7 +149,7 @@ def main():
     running, newest = kernels()
     pending, sample = pending_updates()
     repos = repo_files()
-    zrepo, zenabled = zabbix_repo(repos)
+    zrepo, zenabled, zsuite = zabbix_repo(repos)
     openclaw = version_of(["openclaw", "--version"])
     m = re.search(r"\d{4}\.\d+\.\d+(?:-\d+)?", openclaw or "")
     node = version_of(["node", "--version"])
@@ -179,6 +182,7 @@ def main():
         "zabbix_agent2": ma.group(0) if ma else None,
         "zabbix_repo": zrepo,
         "zabbix_repo_enabled": zenabled,
+        "zabbix_repo_suite": zsuite,
         "zabbix_server": ms.group(0) if ms else None,
         "claude_user": rc == 0,
         "failed_units": failed_units(),
