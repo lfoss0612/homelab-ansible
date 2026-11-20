@@ -1,0 +1,52 @@
+---
+# Read-only drift check of the containerd configuration on every RKE2 node, for the 26.04 AppArmor fix
+# (k8s-containerd-apparmor.yml) and the hand-made template trap found on k8s-worker-2 on 2026-11-15.
+#   scripts/run-working-tree.sh playbooks/k8s-containerd-drift-check.yml
+# Per node it reports PROBLEM or ok for:
+#   * the drop-in 10-disable-apparmor.toml exists (Ubuntu resolute nodes only)
+#   * a hand-made config.toml.tmpl, if any, still has the `imports = [...config-v3.toml.d/*.toml]` line,
+#     otherwise the drop-in is silently ignored
+#   * the RUNNING containerd reports disableApparmor true (crictl info), which is what counts: the drop-in is
+#     merged at runtime, so the rendered config.toml itself does not show it
+#   * leftover backup copies of the template (informational)
+#   * the unit that should run is active (rke2-server on the control plane, rke2-agent elsewhere; the
+#     other one is expected to be masked on the control plane)
+- name: Check containerd configuration on RKE2 nodes
+  hosts: k8s
+  become: true
+  gather_facts: false
+  vars:
+    cdir: /var/lib/rancher/rke2/agent/etc/containerd
+    expected_unit: "{{ 'rke2-server' if inventory_hostname in groups['k8s_master'] else 'rke2-agent' }}"
+  tasks:
+    - name: Collect
+      ansible.builtin.shell:
+        cmd: |
+          . /etc/os-release; echo "codename=$VERSION_CODENAME"
+          echo "dropin=$([ -f {{ cdir }}/config-v3.toml.d/10-disable-apparmor.toml ] && echo yes || echo no)"
+          t={{ cdir }}/config-v3.toml.tmpl; [ -f $t ] || t={{ cdir }}/config.toml.tmpl
+          if [ -f $t ]; then echo "template=$t"; echo "template_imports=$(grep -c 'config-v3.toml.d' $t)"; else echo "template=none"; echo "template_imports=n/a"; fi
+          echo "effective_noapparmor=$(/var/lib/rancher/rke2/bin/crictl --runtime-endpoint unix:///run/k3s/containerd/containerd.sock info 2>/dev/null | grep -c '"disableApparmor": true')"
+          echo "backups=$(ls {{ cdir }} | grep -c '~$')"
+          echo "unit=$(systemctl is-active {{ expected_unit }})"
+          echo "other_unit_state=$(systemctl is-enabled {{ 'rke2-agent' if inventory_hostname in groups['k8s_master'] else 'rke2-server' }} 2>&1 | head -1)"
+        executable: /bin/bash
+      register: cd_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Judge
+      ansible.builtin.set_fact:
+        cd: "{{ dict(cd_raw.stdout_lines | map('split', '=', 1) | list) }}"
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {% set p = [] %}
+          {% if cd.codename == 'resolute' and cd.dropin != 'yes' %}{% set _ = p.append('apparmor drop-in missing') %}{% endif %}
+          {% if cd.template != 'none' and cd.template_imports | int == 0 %}{% set _ = p.append('hand-made ' ~ cd.template ~ ' has no imports line, drop-ins are ignored') %}{% endif %}
+          {% if cd.codename == 'resolute' and cd.effective_noapparmor | int == 0 %}{% set _ = p.append('containerd is running with its AppArmor profile on (restart pending?)') %}{% endif %}
+          {% if cd.unit != 'active' %}{% set _ = p.append(expected_unit ~ ' is ' ~ cd.unit) %}{% endif %}
+          {{ 'PROBLEM: ' ~ (p | join('; ')) if p | length > 0 else 'ok' }}
+          ({{ cd.backups }} template backup copies lying around; {{ 'the other rke2 unit is ' ~ cd.other_unit_state }})
