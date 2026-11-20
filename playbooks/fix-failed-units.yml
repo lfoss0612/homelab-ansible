@@ -1,0 +1,144 @@
+---
+# Fix the failed systemd units found on 2026-11-19 by post-release-upgrade-check.yml, each decided with
+# the owner. Hosts not named below are untouched.
+#
+#   scripts/run-working-tree.sh playbooks/fix-failed-units.yml -e units_hosts=pve-ai.home.lan,pve-router.home.lan,omv.home.lan,cockpit.home.lan
+#   scripts/run-working-tree.sh --apply playbooks/fix-failed-units.yml -e units_hosts=...
+#
+#   pve-ai       dead NFS entry 192.168.0.100:/srv/nfs/backups in /etc/fstab (old subnet, failing since Nov 9)
+#   pve-router   stale NFS entry 10.0.5.5:/mnt/backups/scripts in /etc/fstab (PBS denies it since Sep 27)
+#   both         systemd-networkd-wait-online is enabled but the hosts use ifupdown2, so it always fails
+#   omv          openmediavault-zfs and the ZFS packages: no pool ever existed, the module cannot build for
+#                kernel 7.2.x, zfs-load-module fails every boot
+#   cockpit      openclaw-fleet-update.service has sat in "failed" since the 2026-11-15 run; reset it so a
+#                new failure is visible
+# Each fstab edit keeps a backup (fstab.<timestamp>) and refuses if the path is used by a Proxmox storage.
+- name: Fix failed units
+  hosts: "{{ units_hosts | default('localhost') }}"
+  become: true
+  gather_facts: false
+  vars:
+    fstab_fix:
+      pve-ai.home.lan: { path: /mnt/backups, regexp: '^192\.168\.0\.100:/srv/nfs/backups\s+/mnt/backups\s' }
+      pve-router.home.lan: { path: /mnt/scripts, regexp: '^10\.0\.5\.5:/mnt/backups/scripts\s+/mnt/scripts\s' }
+    zfs_family: '^(openmediavault-zfs|zfs-|zfsutils|libzfs|libzpool|libnvpair|libuutil|spl)'
+  tasks:
+    - name: Nothing to do without a host
+      ansible.builtin.meta: end_play
+      when: units_hosts is not defined
+
+    # ------------------------------------------------------------ stale NFS entries
+    - name: Stale fstab entry
+      when: inventory_hostname in fstab_fix
+      block:
+        - name: Refuse if a Proxmox storage uses the path
+          ansible.builtin.command: "grep -c -F {{ fstab_fix[inventory_hostname].path }} /etc/pve/storage.cfg"
+          register: fx_storage
+          changed_when: false
+          check_mode: false
+          failed_when: fx_storage.stdout | trim != '0'
+
+        - name: Refuse if something is mounted there and in use
+          ansible.builtin.command: "findmnt -n {{ fstab_fix[inventory_hostname].path }}"
+          register: fx_mounted
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Show the mount state
+          ansible.builtin.debug:
+            msg: "{{ 'mounted: ' ~ fx_mounted.stdout if fx_mounted.rc == 0 else 'not mounted (as expected)' }}"
+
+        - name: Remove the entry (backup kept)
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: "{{ fstab_fix[inventory_hostname].regexp }}"
+            state: absent
+            backup: true
+          register: fx_fstab
+
+        - name: Reload systemd so the generated mount unit goes away
+          ansible.builtin.systemd:
+            daemon_reload: true
+          when: fx_fstab.changed
+
+        - name: Clear the failed state of that mount
+          ansible.builtin.command: "systemctl reset-failed {{ fstab_fix[inventory_hostname].path | regex_replace('^/', '') | replace('/', '-') }}.mount"
+          changed_when: true
+          failed_when: false
+          # lint-check-mode: ignore (clears a status flag only)
+
+    # ------------------------------------------------------------ networkd wait-online
+    - name: Disable systemd-networkd-wait-online where ifupdown2 owns the network
+      ansible.builtin.systemd:
+        name: systemd-networkd-wait-online.service
+        enabled: false
+      when: inventory_hostname in fstab_fix
+
+    - name: Clear its failed state
+      ansible.builtin.command: systemctl reset-failed systemd-networkd-wait-online.service
+      changed_when: true
+      failed_when: false
+      when: inventory_hostname in fstab_fix
+      # lint-check-mode: ignore (clears a status flag only)
+
+    # ------------------------------------------------------------ omv ZFS
+    - name: Remove the unused ZFS packages
+      when: inventory_hostname == 'omv.home.lan'
+      block:
+        - name: Refuse if a pool exists or is configured
+          ansible.builtin.shell: "ls /etc/zfs/zpool.cache 2>/dev/null; grep -c zfs /etc/fstab; zpool list -H 2>/dev/null | wc -l"
+          register: fx_zfs_state
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Assert no pool evidence
+          ansible.builtin.assert:
+            that:
+              - "'zpool.cache' not in fx_zfs_state.stdout"
+              - "fx_zfs_state.stdout_lines | select('match', '^[0-9]+$') | map('int') | sum == 0"
+            fail_msg: "Pool evidence found: {{ fx_zfs_state.stdout_lines }}"
+
+        - name: List the installed ZFS packages
+          ansible.builtin.shell: "dpkg-query -W -f='${Package}\\n' | grep -E '{{ zfs_family }}' | sort"
+          register: fx_zfs_pkgs
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Simulate the purge
+          ansible.builtin.shell: "apt-get -s purge {{ fx_zfs_pkgs.stdout_lines | join(' ') }} | awk '/^Purg /{print $2}' | sort"
+          register: fx_zfs_sim
+          changed_when: false
+          check_mode: false
+          when: fx_zfs_pkgs.stdout_lines | length > 0
+
+        - name: Refuse if it would take anything beyond ZFS
+          ansible.builtin.assert:
+            that: (fx_zfs_sim.stdout_lines | reject('match', zfs_family) | list | length) == 0
+            fail_msg: "Would also remove: {{ fx_zfs_sim.stdout_lines | reject('match', zfs_family) | join(' ') }}"
+          when: fx_zfs_pkgs.stdout_lines | length > 0
+
+        - name: Say what goes
+          ansible.builtin.debug:
+            msg: "{{ fx_zfs_sim.stdout_lines | default([]) }}"
+
+        - name: Purge them
+          ansible.builtin.apt:
+            name: "{{ fx_zfs_pkgs.stdout_lines }}"
+            state: absent
+            purge: true
+          when: fx_zfs_pkgs.stdout_lines | length > 0
+
+        - name: Clear failed units
+          ansible.builtin.command: systemctl reset-failed
+          changed_when: true
+          # lint-check-mode: ignore (clears a status flag only)
+
+    # ------------------------------------------------------------ cockpit
+    - name: Reset the stale failed state of the fleet-update service
+      ansible.builtin.command: systemctl reset-failed openclaw-fleet-update.service
+      changed_when: true
+      when: inventory_hostname == 'cockpit.home.lan'
+      # lint-check-mode: ignore (clears a status flag only)
