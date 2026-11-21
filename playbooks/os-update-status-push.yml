@@ -96,8 +96,16 @@
         daemon_reload: true
       when: not ansible_check_mode
 
+    # An earlier version exited 1 on a refused value and left the unit failed; clear that state.
+    - name: Clear a failed state left by an earlier run
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode; clears a status flag only)
+      ansible.builtin.command: systemctl reset-failed os-update-push.service
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
     # Not run during the dry run, and only after the Zabbix items exist (otherwise the first push is
-    # discarded and the script exits 1, which is the point: it says so).
+    # refused: the script logs a warning and still exits 0, see its comment).
     - name: Run one push now
       # lint-check-mode: ignore (guarded by when: not ansible_check_mode; the script is not installed yet in a dry run)
       ansible.builtin.command: /usr/local/bin/os-update-push

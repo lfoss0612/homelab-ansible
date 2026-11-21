@@ -39,8 +39,12 @@ log "zabbix_sender: $(echo "$res" | grep -E 'processed|failed|Sending' | tr '\n'
 case "$res" in
   *"processed: 1;"*) exit 0 ;;
   *)
+    # Exit 0 on purpose: a refusal is usually temporary (a proxy applies a new item only at its next
+    # config sync, up to an hour) and must not leave a failed unit that post-release-upgrade-check
+    # reports as a problem. The warning is in the journal, and the dashboard shows "No data" if it persists.
+    # Local failures (no zabbix_sender, apt simulation failing) still exit 1.
     log "WARNING: Zabbix did not accept the value. Check that the trapper item exists on host '$ZABBIX_HOST'"
     log "         (playbooks/os-update-status-zabbix-setup.yml) and, for a proxy-monitored host, that ZABBIX_SERVER is the proxy."
-    exit 1
+    exit 0
     ;;
 esac
