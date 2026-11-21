@@ -1,0 +1,138 @@
+---
+# Remove superseded CUDA toolkits from k8s-worker-2 (the RTX 5090 host), keeping the current one.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/remove-old-cuda.yml                  # dry run
+#   scripts/run-working-tree.sh --apply playbooks/remove-old-cuda.yml
+#
+# Background: every CUDA minor installs side by side (/usr/local/cuda-13.0, -13.3, -13.4, about 17 GB
+# together). /usr/local/cuda is managed by update-alternatives in auto mode and points at the
+# newest, so the older trees only cost disk. Kept: cuda_keep. Removed: the packages whose names end in
+# -13-0 or -13-3 (cuda_remove), plus the versioned Nsight tools only those toolkits used.
+#
+# Guards (the play stops before touching anything if one fails):
+#   * the kept toolkit is installed with a working nvcc, and /usr/local/cuda points at it
+#   * no running process has a removed toolkit mapped
+#   * an apt simulation shows that ONLY the planned packages would be removed (no cascade into the
+#     driver, the container toolkit or anything else)
+# Deliberately NOT --auto-remove: the host has older orphans (nvidia-modprobe and the 580 driver
+# libraries) that a blanket autoremove would take along; those are a separate decision.
+#
+# Afterwards run ../homelab-gitops/scripts/gpu-check.sh to confirm the GPU stack is unchanged.
+
+- name: Remove superseded CUDA toolkits
+  hosts: k8s-worker-2.home.lan
+  become: true
+
+  vars:
+    cuda_keep: "13-4"
+    cuda_keep_dotted: "13.4"
+    cuda_remove: ["13-0", "13-3"]
+    # Versioned Nsight packages that belong to the removed toolkits only (the kept toolkit uses
+    # nsight-compute 2026.3.1 and nsight-systems 2026.3.2).
+    extra_remove:
+      - nsight-compute-2025.3.1
+      - nsight-compute-2026.2.1
+      - nsight-systems-2025.3.2
+      - nsight-systems-2026.1.3
+    family_regex: "-({{ cuda_remove | join('|') }})(-|$)"
+
+  tasks:
+    - name: Read the installed packages
+      ansible.builtin.command: dpkg-query -W -f '${db:Status-Abbrev} ${Package}\n'
+      register: dpkg_list
+      changed_when: false
+      check_mode: false
+
+    - name: Work out the packages to remove
+      ansible.builtin.set_fact:
+        installed: "{{ dpkg_list.stdout_lines | select('match', '^ii\\s') | map('regex_replace', '^ii\\s+', '') | list }}"
+
+    - name: Build the removal list
+      ansible.builtin.set_fact:
+        to_remove: >-
+          {{ (installed | select('search', family_regex) | list)
+             + (installed | select('in', extra_remove) | list) }}
+
+    - name: Read the kept toolkit's nvcc and the alternatives link
+      ansible.builtin.shell: |
+        /usr/local/cuda-{{ cuda_keep_dotted }}/bin/nvcc --version | tail -1
+        readlink -f /usr/local/cuda
+      register: keep_state
+      changed_when: false
+      check_mode: false
+
+    - name: Check whether any process has a removed toolkit mapped
+      ansible.builtin.shell: >-
+        grep -l -E '/usr/local/cuda-({{ cuda_remove | map('regex_replace', '-', '\.') | join('|') }})/'
+        /proc/[0-9]*/maps 2>/dev/null | head -5
+      register: in_use
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Simulate the removal
+      ansible.builtin.command: "apt-get -s purge {{ to_remove | join(' ') }}"
+      register: sim
+      changed_when: false
+      check_mode: false
+      when: to_remove | length > 0
+
+    - name: Guard the plan
+      ansible.builtin.assert:
+        that:
+          - keep_state.stdout_lines | length == 2
+          - keep_state.stdout_lines[1] == '/usr/local/cuda-' ~ cuda_keep_dotted
+          - in_use.stdout | trim == ''
+          - to_remove | length > 0
+          # nothing outside the plan may be removed or upgraded away
+          - unexpected | length == 0
+        fail_msg: >-
+          Refusing: kept toolkit {{ keep_state.stdout_lines | default([]) }},
+          processes using a removed toolkit: {{ in_use.stdout | default('') | trim }},
+          unexpected removals: {{ unexpected }}
+      vars:
+        removing: "{{ sim.stdout_lines | select('match', '^(Remv|Purg) ') | map('split', ' ') | map(attribute=1) | list }}"
+        unexpected: "{{ removing | difference(to_remove) }}"
+      when: to_remove | length > 0
+
+    - name: Show the plan
+      ansible.builtin.debug:
+        msg:
+          - "kept: {{ keep_state.stdout_lines[0] | default('?') }}"
+          - "removing {{ to_remove | length }} packages from {{ cuda_remove }}"
+          - "extra nsight: {{ to_remove | select('in', extra_remove) | list }}"
+          - "simulated removals: {{ sim.stdout_lines | select('match', '^(Remv|Purg) ') | list | length }}, outside plan: {{ sim.stdout_lines | select('match', '^(Remv|Purg) ') | map('split', ' ') | map(attribute=1) | list | difference(to_remove) }}"
+
+    - name: Purge the old toolkits
+      ansible.builtin.apt:
+        name: "{{ to_remove }}"
+        state: absent
+        purge: true
+
+    - name: Remove leftover toolkit directories
+      ansible.builtin.file:
+        path: "/usr/local/cuda-{{ item | regex_replace('-', '.') }}"
+        state: absent
+      loop: "{{ cuda_remove }}"
+      diff: false   # the tree is thousands of files; the diff would drown the output
+
+    - name: Refresh the linker cache
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode; nothing to preview)
+      ansible.builtin.command: ldconfig
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Verify the kept toolkit still works
+      ansible.builtin.shell: |
+        readlink -f /usr/local/cuda
+        /usr/local/cuda/bin/nvcc --version | tail -1
+        update-alternatives --display cuda | grep -E 'currently|^/usr/local/cuda-'
+        df -h / | tail -1
+      register: after
+      changed_when: false
+      check_mode: false
+
+    - name: Show the result
+      ansible.builtin.debug:
+        var: after.stdout_lines
