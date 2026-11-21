@@ -1,0 +1,117 @@
+---
+# Report the pending-package count of the 3 k8s nodes to Zabbix by push.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/os-update-status-push.yml            # dry run
+#   scripts/run-working-tree.sh --apply playbooks/os-update-status-push.yml
+#
+# Why a push: the 3 nodes run the Zabbix agent as a DaemonSet pod with no apt, so the polled
+# UserParameter used elsewhere cannot count packages there (details in
+# playbooks/os-update-status-monitor.yml). An hourly systemd timer on the host runs
+# scripts/os-update-push.sh, which sends the count as a trapper value.
+#
+# The server-side half (trapper items on these hosts, same key and name as the other 11 hosts so the
+# existing "Patch / Update Status" dashboard picks them up) is playbooks/os-update-status-zabbix-setup.yml.
+# Run both, or the values are accepted by nothing and discarded.
+#
+# Where it sends: k8s-master is monitored through the Zabbix proxy, and the server refuses trapper
+# data for a proxy-monitored host, so master sends to the proxy's in-cluster address
+# (oom_zabbix_server in host_vars/k8s-master.home.lan.yml, reachable from the node through
+# kube-proxy). The workers send to the server. Same mechanism and variable as oom-kill-monitor.yml.
+# Moving master off the proxy was checked on 2026-11-20 and is not possible without exposing
+# kube-state-metrics outside the cluster (the Zabbix server cannot reach pod IPs).
+
+- name: Deploy the pending-updates push on the k8s nodes
+  hosts: k8s
+  become: true
+
+  vars:
+    update_push_server: "{{ oom_zabbix_server | default('10.0.5.9') }}"
+
+  handlers:
+    - name: systemd_daemon_reload
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  tasks:
+    - name: Ensure zabbix_sender is installed
+      ansible.builtin.apt:
+        name: zabbix-sender
+        state: present
+        cache_valid_time: 3600
+
+    - name: Install the push script
+      ansible.builtin.copy:
+        src: ../scripts/os-update-push.sh
+        dest: /usr/local/bin/os-update-push
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Install the service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Push the pending-package count to Zabbix
+
+          [Service]
+          Type=oneshot
+          Environment="ZABBIX_SERVER={{ update_push_server }}"
+          Environment="ZABBIX_PORT=10051"
+          Environment="ZABBIX_HOST={{ inventory_hostname }}"
+          ExecStart=/usr/local/bin/os-update-push
+          StandardOutput=journal
+          StandardError=journal
+        dest: /etc/systemd/system/os-update-push.service
+        mode: "0644"
+        owner: root
+        group: root
+      notify: systemd_daemon_reload
+
+    - name: Install the timer
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Hourly pending-package count for Zabbix
+
+          [Timer]
+          OnBootSec=5min
+          OnUnitActiveSec=1h
+          RandomizedDelaySec=2min
+
+          [Install]
+          WantedBy=timers.target
+        dest: /etc/systemd/system/os-update-push.timer
+        mode: "0644"
+        owner: root
+        group: root
+      notify: systemd_daemon_reload
+
+    # Skipped under --check: the unit files are not written yet, so the enable would fail on a new host.
+    - name: Enable and start the timer
+      ansible.builtin.systemd_service:
+        name: os-update-push.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: not ansible_check_mode
+
+    # Not run during the dry run, and only after the Zabbix items exist (otherwise the first push is
+    # discarded and the script exits 1, which is the point: it says so).
+    - name: Run one push now
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode; the script is not installed yet in a dry run)
+      ansible.builtin.command: /usr/local/bin/os-update-push
+      # Run directly, not through systemd, so the unit's Environment= lines do not apply: pass them here.
+      environment:
+        ZABBIX_SERVER: "{{ update_push_server }}"
+        ZABBIX_PORT: "10051"
+        ZABBIX_HOST: "{{ inventory_hostname }}"
+      register: push_now
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Show the first push
+      ansible.builtin.debug:
+        msg: "{{ (push_now.stdout_lines | default([])) + (push_now.stderr_lines | default([])) }}"
+      when: not ansible_check_mode

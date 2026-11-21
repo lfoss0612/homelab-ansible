@@ -45,7 +45,8 @@
     reboot_item_name: "OS updates: reboot required"
 
     # No apt/dpkg reachable from the DaemonSet agent pod on these -- see
-    # playbooks/os-update-status-monitor.yml for the full explanation.
+    # playbooks/os-update-status-monitor.yml for the full explanation. Not polled: they get a
+    # trapper item instead, fed by playbooks/os-update-status-push.yml.
     pending_excluded_hosts:
       - k8s-master.home.lan
       - k8s-worker.home.lan
@@ -262,6 +263,62 @@
       register: pending_item_create
       failed_when: pending_item_create.json is defined and pending_item_create.json.error is defined
       changed_when: pending_item_create.json.result is defined
+
+    # The 3 k8s nodes get the same item as a TRAPPER (type 2), fed by the host timer from
+    # playbooks/os-update-status-push.yml. Same key and name, so the dashboard column below is
+    # unchanged. A host monitored by a proxy (k8s-master) accepts it too: the sender targets the proxy.
+    - name: Look up existing pending-count items on the k8s nodes
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.get
+          params:
+            output: ["itemid", "hostid"]
+            hostids: >-
+              {{ hosts_lookup.json.result
+                 | selectattr('host', 'in', pending_excluded_hosts)
+                 | map(attribute='hostid') | list }}
+            filter:
+              key_: ["{{ pending_item_key }}"]
+          id: 1
+      register: pending_pushed_lookup
+      check_mode: false
+      failed_when: pending_pushed_lookup.json.error is defined
+
+    - name: Create the pending-count trapper item on any k8s node that is missing it
+      ansible.builtin.uri:
+        url: "{{ zabbix_url }}/api_jsonrpc.php"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ zabbix_api_token }}"
+        body:
+          jsonrpc: "2.0"
+          method: item.create
+          params:
+            hostid: "{{ item.hostid }}"
+            name: "{{ pending_item_name }}"
+            key_: "{{ pending_item_key }}"
+            type: 2          # Zabbix trapper
+            value_type: 3
+            trapper_hosts: ""
+            description: >-
+              Count of packages `apt-get -s dist-upgrade` would install, pushed hourly by
+              os-update-push.timer on the node (playbooks/os-update-status-push.yml). A trapper
+              because the Zabbix agent here is a DaemonSet pod with no apt access. No data means
+              the timer has stopped, not that the node is patched.
+          id: 1
+      loop: >-
+        {{ hosts_lookup.json.result | selectattr('host', 'in', pending_excluded_hosts) | list }}
+      when: item.hostid not in (pending_pushed_lookup.json.result | map(attribute='hostid') | list)
+      register: pending_pushed_create
+      failed_when: pending_pushed_create.json is defined and pending_pushed_create.json.error is defined
+      changed_when: pending_pushed_create.json.result is defined
 
     - name: Look for an existing dashboard
       ansible.builtin.uri:
