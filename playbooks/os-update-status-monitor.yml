@@ -40,11 +40,12 @@
 #     a plain file read through the existing read-only /hostfs/root mount --
 #     no chroot/nsenter needed.
 #
-# Net result: os.update.reboot.required is genuinely fleet-wide (14 hosts).
-# os.update.pending.count is 11 of 14 -- everything except k8s-master,
-# k8s-worker, k8s-worker-2. The dashboard playbook only builds a pending-count
-# column for the 11; those 3 rows show "No data" there rather than a
-# misleading 0.
+# Net result: os.update.reboot.required is polled fleet-wide (14 hosts).
+# os.update.pending.count is polled on 11 of 14 -- everything except k8s-master,
+# k8s-worker, k8s-worker-2. Those 3 report the same key by PUSH instead (an
+# hourly timer on the node, playbooks/os-update-status-push.yml, with a trapper
+# item created by os-update-status-zabbix-setup.yml), so the dashboard column
+# covers all 14. A node whose timer stops shows "No data", never a made-up 0.
 #
 # Same script (scripts/os-update-status.sh, subcommands pending/reboot) is
 # used both ways -- only the UserParameter line invoking it differs.
