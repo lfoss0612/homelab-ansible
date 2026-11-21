@@ -12,7 +12,9 @@
 #                 upgrade (a renamed NIC, enp6s18 to ens18, leaves the static network config orphaned)
 #   dns           the host resolves a name and a local one
 #   repos         third-party apt repositories still naming the OLD release, and .distUpgrade/.disabled/.save
-#                 files the release tool left (Zabbix and NodeSource are the usual ones to re-enable)
+#                 files the release tool left (Zabbix and NodeSource are the usual ones to re-enable).
+#                 A leftover with a working repo file beside it is only a note ("safe to delete"), not a
+#                 problem; one with nothing beside it may be a repo nobody re-enabled, and fails the host.
 #   dkms          every dkms module is built for the RUNNING kernel (the NVIDIA driver on k8s-worker-2)
 #   needrestart   services still running old libraries (only when needrestart is installed)
 #   units         failed systemd units
@@ -36,7 +38,19 @@
           echo "interfaces=$(ls /sys/class/net | sort | paste -sd, -)"
           echo "dns_public=$(getent hosts deb.debian.org >/dev/null 2>&1 && echo yes || echo NO)"
           echo "dns_local=$(getent hosts cockpit.home.lan >/dev/null 2>&1 && echo yes || echo NO)"
-          echo "stale_repo_files=$(ls /etc/apt/sources.list.d/ 2>/dev/null | grep -E '\.(distUpgrade|disabled|save|dpkg-old)$' | paste -sd, -)"
+          # A leftover with an active twin (foo.list.disabled next to a working foo.list or foo.sources) is
+          # harmless clutter; one without may be a repo nobody re-enabled. Report them separately.
+          stale_orphan=""; stale_covered=""
+          for f in $(ls /etc/apt/sources.list.d/ 2>/dev/null | grep -E '\.(distUpgrade|disabled|save|dpkg-old)$'); do
+            base="${f%.*}"; stem="${base%.*}"
+            if [ -e "/etc/apt/sources.list.d/$base" ] || [ -e "/etc/apt/sources.list.d/$stem.list" ] || [ -e "/etc/apt/sources.list.d/$stem.sources" ]; then
+              stale_covered="$stale_covered,$f"
+            else
+              stale_orphan="$stale_orphan,$f"
+            fi
+          done
+          echo "stale_repo_files=${stale_orphan#,}"
+          echo "stale_repo_covered=${stale_covered#,}"
           echo "repo_lines=$(grep -rhE '^(deb |Suites:|URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | paste -sd'|' -)"
           if command -v dkms >/dev/null && [ -n "$(dkms status 2>/dev/null)" ]; then
             echo "dkms_bad=$(dkms status 2>/dev/null | grep -v "$(uname -r)" | grep -c . || true)"
@@ -71,7 +85,7 @@
               (['interfaces changed from ' ~ post_info.base_interfaces ~ ' to ' ~ post_info.interfaces ~ ': fix the network config'] if post_info.base_interfaces is defined and post_info.base_interfaces != post_info.interfaces else []) +
               (['DNS does not resolve a public name'] if post_info.dns_public != 'yes' else []) +
               (['DNS does not resolve a local name'] if post_info.dns_local != 'yes' else []) +
-              (['apt files left by the release tool: ' ~ post_info.stale_repo_files ~ ' (re-enable the repo for the new suite)'] if post_info.stale_repo_files | length > 0 else []) +
+              (['apt files left by the release tool with no active repo file beside them: ' ~ post_info.stale_repo_files ~ ' (re-enable the repo for the new suite, or delete the file if that repo is no longer wanted)'] if post_info.stale_repo_files | length > 0 else []) +
               (['apt repo lines still name the old release ' ~ post_info.base_codename] if post_info.base_codename is defined and post_info.base_codename != post_info.codename and (post_info.repo_lines | regex_search('\b' ~ post_info.base_codename ~ '\b')) else []) +
               (['dkms modules exist for another kernel but not all are built for ' ~ post_info.kernel ~ ': run dkms autoinstall'] if post_info.dkms_bad not in ['n/a', '0'] and post_info.dkms_running | int == 0 else []) +
               (['needrestart lists ' ~ post_info.needrestart ~ ' service(s) on old libraries: restart them'] if post_info.needrestart not in ['n/a', '0'] else []) +
@@ -85,6 +99,7 @@
         msg: >-
           {{ inventory_hostname }} ({{ post_info.codename }}, kernel {{ post_info.kernel }}):
           {{ 'ok' if post_problems | length == 0 else 'PROBLEM: ' ~ (post_problems | join('; ')) }}
+          {{ ' [note: stale repo file(s) ' ~ post_info.stale_repo_covered ~ ' sit beside a working repo file: safe to delete (fix-apt-repos.yml does it)]' if post_info.stale_repo_covered | default('') | length > 0 else '' }}
 
     - name: Fail the host when there are problems (so a run over many hosts ends red)
       ansible.builtin.assert:
