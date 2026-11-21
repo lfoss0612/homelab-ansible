@@ -42,6 +42,7 @@
       failed_when: false
 
     - name: Verify dpkg is clean
+      # lint-check-mode: ignore (verifies the repair this play performs; a dry run has not repaired anything)
       ansible.builtin.command: dpkg --audit
       register: dpkg_audit
       changed_when: false

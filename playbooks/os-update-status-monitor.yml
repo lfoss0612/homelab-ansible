@@ -84,6 +84,7 @@
       ansible.builtin.meta: flush_handlers
 
     - name: Run an initial check
+      # lint-check-mode: ignore (needs the script on disk, which a dry run does not write; guarded by when)
       # Depends on the script actually being on disk, which --check only
       # simulates -- the copy task above never really writes it in a dry run,
       # so this can't run for real either without producing a false failure.
@@ -159,6 +160,7 @@
       changed_when: "'restarted' in os_update_status_rollout.stdout"
 
     - name: Wait for the rollout to finish
+      # lint-check-mode: ignore (waits on a rollout this play triggers; a dry run triggers none)
       ansible.builtin.shell: |
         export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
         kubectl rollout status daemonset/zabbix-agent -n cattle-monitoring-system --timeout=120s

@@ -79,6 +79,7 @@
       check_mode: false
 
     - name: Pin the target kernel
+      # lint-check-mode: ignore (a real change (pins the boot kernel); skipped in a dry run)
       ansible.builtin.command: "proxmox-boot-tool kernel pin {{ pve_ai_target_kernel }}"
       when: pve_ai_pin_before.stdout | trim != pve_ai_target_kernel
       register: pve_ai_pin_result

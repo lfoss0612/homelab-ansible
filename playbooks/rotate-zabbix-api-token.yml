@@ -106,6 +106,7 @@
       register: vault_tmp
 
     - name: Encrypt the new token for the repo's vault (stdin param -- never templated into command/script text or shown in invocation logs)
+      # lint-check-mode: ignore (handles the new secret via stdin and writes a temp file; never for a dry run)
       ansible.builtin.shell:
         cmd: "ansible-vault encrypt_string --vault-password-file {{ vault_password_file }} --stdin-name zabbix_api_token > {{ vault_tmp.path }}"
         executable: /bin/bash

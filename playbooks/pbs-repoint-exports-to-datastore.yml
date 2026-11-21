@@ -98,6 +98,7 @@
         label: "{{ item.new_path }}"
       register: new_path_mount
       changed_when: false
+      check_mode: false
       failed_when: >-
         new_path_mount.rc != 0
         or 'zfs' not in new_path_mount.stdout

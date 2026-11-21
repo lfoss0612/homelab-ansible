@@ -64,6 +64,7 @@
     # cheap. What matters for "did this work" is verified separately below (an
     # actual sensors reading), not sensors-detect's own exit chatter.
     - name: Run sensors-detect to load the right kernel modules
+      # lint-check-mode: ignore (loads kernel modules (sensors-detect); a real change)
       ansible.builtin.shell: timeout 120 sensors-detect --auto < /dev/null
       register: cpu_sensors_detect
       changed_when: false
@@ -98,6 +99,7 @@
       ansible.builtin.include_tasks: tasks/cpu-temp-monitor-setup.yml
 
     - name: Run an initial CPU temperature check
+      # lint-check-mode: ignore (runs the monitor, which pushes a value to Zabbix; not for a dry run)
       ansible.builtin.command: /usr/local/bin/cpu-temp-monitor
       register: cputemp_check_result
       changed_when: false

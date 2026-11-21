@@ -97,6 +97,7 @@
       check_mode: false
 
     - name: Create the swap zvol
+      # lint-check-mode: ignore (a real change (creates the zvol); skipped in a dry run, later tasks use 'is changed')
       ansible.builtin.command: >
         zfs create -V {{ pve_zfs_swap_size }}
         -b {{ pve_zfs_swap_pagesize.stdout | trim }}
@@ -124,6 +125,7 @@
       when: pve_zfs_swap_zvol_check.rc == 0
 
     - name: Format the zvol as swap
+      # lint-check-mode: ignore (a real change (mkswap); skipped in a dry run, later tasks use 'is changed')
       ansible.builtin.command: "mkswap /dev/zvol/{{ pve_zfs_swap_dataset }}"
       when: >
         pve_zfs_swap_zvol_create is changed
@@ -157,6 +159,7 @@
         state: present
 
     - name: Activate swap
+      # lint-check-mode: ignore (a real change (swapon); skipped in a dry run)
       ansible.builtin.command: swapon -a
       when: >
         pve_zfs_swap_realdev.stdout is not defined
@@ -167,6 +170,7 @@
       when: not ansible_check_mode
       block:
         - name: Read swapon output
+          # lint-check-mode: ignore (reads swap state after this play activated it; a dry run has not changed it)
           ansible.builtin.command: swapon --show
           register: pve_zfs_swap_active_after
           changed_when: false

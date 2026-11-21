@@ -26,6 +26,7 @@
         cmd: mysql -N -e "SELECT COUNT(*) FROM mysql.user WHERE user='{{ zbx_mysql_user }}' AND host='localhost'"
       register: zbx_user_check
       changed_when: false
+      check_mode: false
 
     - name: Create zbx_monitor MySQL user and grant monitoring privileges
       ansible.builtin.shell: |

@@ -109,6 +109,7 @@
       tags: [audit, timer, systemd]
 
     - name: Check timer status
+      # lint-check-mode: ignore (reports the timer this play just enabled; a dry run has not)
       shell: |
         systemctl status "{{ timer_name }}.timer" || true
       register: timer_status
@@ -116,6 +117,7 @@
       tags: [audit, timer, status]
 
     - name: Check next scheduled run
+      # lint-check-mode: ignore (reports the timer this play just enabled; a dry run has not)
       shell: |
         systemctl list-timers "{{ timer_name }}.timer" --no-pager || true
       register: next_run

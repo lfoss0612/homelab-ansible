@@ -67,6 +67,7 @@
       ansible.builtin.command: findmnt --noheadings --output SOURCE,FSTYPE --target "{{ longhorn_dataset_path }}"
       register: dataset_mount
       changed_when: false
+      check_mode: false
       failed_when: >-
         dataset_mount.rc != 0
         or 'zfs' not in dataset_mount.stdout

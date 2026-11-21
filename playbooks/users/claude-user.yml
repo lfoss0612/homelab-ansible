@@ -136,6 +136,7 @@
     # Absolute paths throughout: runuser gives a minimal PATH, and the sudoers rule
     # matches on the resolved binary path.
     - name: Verify claude can escalate to the ansible user
+      # lint-check-mode: ignore (verifies the sudo rule this play just wrote; a dry run has not written it)
       ansible.builtin.command: >-
         runuser -u {{ claude_user }} --
         /usr/bin/sudo -n -H -u ansible

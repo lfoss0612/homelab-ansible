@@ -134,6 +134,7 @@
       when: hostname_set.changed and not ansible_check_mode
 
     - name: Wait for the API server to report ready
+      # lint-check-mode: ignore (waits on an API server restart this play performs; guarded by when)
       ansible.builtin.command: "{{ rke2_kubectl }} get --raw /readyz"
       environment:
         KUBECONFIG: "{{ rke2_kubeconfig }}"

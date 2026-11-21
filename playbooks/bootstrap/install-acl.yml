@@ -12,6 +12,7 @@
       ansible.builtin.include_tasks: ../tasks/confirm-pve-router.yml
 
     - name: Repair broken apt packages if needed
+      # lint-check-mode: ignore (repairs packages (apt-get -f install); a real change)
       ansible.builtin.command:
         cmd: apt-get -f install -y
       changed_when: false
@@ -35,11 +36,13 @@
         mode: "0700"
 
     - name: Verify setfacl exists
+      # lint-check-mode: ignore (verifies the package this play installs; absent in a dry run)
       ansible.builtin.command: which setfacl
       register: setfacl_check
       changed_when: false
 
     - name: Verify getfacl exists
+      # lint-check-mode: ignore (verifies the package this play installs; absent in a dry run)
       ansible.builtin.command: which getfacl
       register: getfacl_check
       changed_when: false

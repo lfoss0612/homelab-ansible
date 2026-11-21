@@ -113,6 +113,7 @@
         fi
       register: claude_ssh_keys
       changed_when: false
+      check_mode: false
       tags: [audit, claude, ssh]
 
     - name: Validate SSH key restrictions
@@ -145,6 +146,7 @@
         fi
       register: claude_sudoers
       changed_when: false
+      check_mode: false
       tags: [audit, claude, sudoers]
 
     - name: Validate sudoers rules (detect blanket/unrestricted escalation)

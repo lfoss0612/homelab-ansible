@@ -101,6 +101,7 @@
     # when this task kept reporting the old default server address right
     # after the unit file had already been correctly updated to the new one.
     - name: Run an initial OOM-kill check
+      # lint-check-mode: ignore (runs the monitor, which pushes a value to Zabbix; not for a dry run)
       ansible.builtin.command: /usr/local/bin/oom-kill-monitor
       environment:
         ZABBIX_SERVER: "{{ oom_zabbix_server | default('10.0.5.9') }}"

@@ -145,6 +145,7 @@
         executable: /bin/bash
       register: holders
       changed_when: false
+      check_mode: false
       when: unmount_all is failed
 
     - name: Fail with the holder list
@@ -187,6 +188,7 @@
       changed_when: zfs_mount.rc == 0
 
     - name: Read back sizes and mountpoints after the remount
+      # lint-check-mode: ignore (reads back the state after a remount a dry run does not perform)
       ansible.builtin.command: "zfs list -H -o name,used,mountpoint -r {{ zfs_pool }}"
       register: after_sizes
       changed_when: false
@@ -273,6 +275,7 @@
       until: pbs_ping.status in [200, 401]
 
     - name: Read back the datastore list
+      # lint-check-mode: ignore (reads back the state after changes a dry run does not perform)
       ansible.builtin.command: proxmox-backup-manager datastore list
       register: ds_list
       changed_when: false

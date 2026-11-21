@@ -54,6 +54,7 @@
       ansible.builtin.command: "zfs list -H -o available backup10tb/longhorn_backups"
       register: dst_free
       changed_when: false
+      check_mode: false
 
     - name: Show the plan
       ansible.builtin.debug:
@@ -65,6 +66,7 @@
       ansible.builtin.command: "systemctl is-active {{ copy_unit }}.service"
       register: unit_active
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Report an in-flight copy and stop

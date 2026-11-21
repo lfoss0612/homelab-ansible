@@ -61,6 +61,7 @@
       ansible.builtin.include_tasks: tasks/k8s-etcd-backup-setup.yml
 
     - name: Run an initial backup now, rather than waiting up to an hour
+      # lint-check-mode: ignore (runs a real backup; not for a dry run)
       ansible.builtin.command: "{{ backup_script_dest }}"
       environment:
         NFS_SERVER: "{{ k8s_backup_nfs_server }}"

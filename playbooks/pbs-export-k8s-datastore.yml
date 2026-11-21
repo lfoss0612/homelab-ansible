@@ -93,6 +93,7 @@
     # filesystem's directory instead - same check as the longhorn export,
     # same reason: it would put this backup on the wrong volume with no error.
     - name: Confirm it is actually a ZFS mountpoint, not just a directory
+      # lint-check-mode: ignore (checks the dataset this play creates; absent in a dry run)
       ansible.builtin.command: findmnt --noheadings --output SOURCE,FSTYPE --target "{{ k8s_backups_path }}"
       register: dataset_mount
       changed_when: false

@@ -87,6 +87,7 @@
       ansible.builtin.include_tasks: tasks/smart-monitor-setup.yml
 
     - name: Run an initial SMART check
+      # lint-check-mode: ignore (runs the monitor, which pushes a value to Zabbix; not for a dry run)
       ansible.builtin.command: /usr/local/bin/smart-monitor
       register: smart_check_result
       changed_when: false

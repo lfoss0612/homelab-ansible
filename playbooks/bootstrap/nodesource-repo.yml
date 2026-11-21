@@ -100,6 +100,7 @@
       when: nodesource_repo.changed
 
     - name: Read the nodejs candidate version
+      # lint-check-mode: ignore (reads the candidate after this play writes the repo; a dry run has not written it)
       ansible.builtin.command: apt-cache policy nodejs
       register: nodesource_policy
       changed_when: false

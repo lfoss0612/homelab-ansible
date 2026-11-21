@@ -45,6 +45,7 @@
     # it a real check — the old form only proved escalation itself worked.
     # Absolute path: runuser resets PATH to login.defs ENV_SUPATH.
     - name: Validate the lfoss account is usable
+      # lint-check-mode: ignore (validates the account this play creates; absent in a dry run)
       ansible.builtin.command: runuser -u lfoss -- /usr/bin/whoami
       changed_when: false
       register: lfoss_whoami

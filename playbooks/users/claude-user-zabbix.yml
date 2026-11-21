@@ -93,6 +93,7 @@
         state: absent
 
     - name: Verify claude can read the server log via group membership
+      # lint-check-mode: ignore (verifies access this play just granted; a dry run has not granted it)
       ansible.builtin.command: >-
         runuser -u {{ claude_user }} -- tail -n1 /var/log/zabbix/zabbix_server.log
       changed_when: false
@@ -110,6 +111,7 @@
     # wording of sudo's denial message varies by version/distro, so this only
     # asserts on exit status, not stderr text.
     - name: Verify claude cannot escalate to root (or anyone else) at all
+      # lint-check-mode: ignore (verifies access this play just set up; a dry run has not set it up)
       ansible.builtin.command: >-
         runuser -u {{ claude_user }} -- sudo -n -l
       changed_when: false
