@@ -76,6 +76,11 @@ Back up the database and `zabbix_server.conf` first; upgrade the server, then th
 (`deploy-zabbix-agent.yml`, `upgrade-to-zabbix-agent2.yml`); then `zabbix-audit.yml` and, for a dashboard
 you want fresh now, `zabbix-execute-now.yml`. Verify: audit PASS, agent versions match the server
 major.minor, config cache below the warning level.
+After ANY change to the Zabbix packages or a release upgrade of the Zabbix VM, run
+`playbooks/zabbix-web-check.yml` (dry run, then `--apply`): the Apache config shipped by
+`zabbix-apache-conf` can change what modules it needs (2026-11-15: PHP-FPM, so `proxy` and `proxy_fcgi`), and a
+running apache keeps its OLD config in memory, so nothing looks wrong until the next restart (2026-11-22: the
+VM restarted, apache failed, and the web UI and API were down for 45 minutes while the server kept collecting).
 
 ## 5. Argo CD / Helm applications, riskiest last
 

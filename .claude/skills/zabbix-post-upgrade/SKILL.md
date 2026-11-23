@@ -10,6 +10,10 @@ via `pre-change-snapshot.yml`) and `/etc/zabbix/zabbix_server.conf`. Read the up
 time and any removed items. Upgrade the server first, then agents: agents may be older than the server by a major
 within the supported window, not newer.
 
+After any server or `zabbix-apache-conf` package change: `playbooks/zabbix-web-check.yml` (dry run, then `--apply`).
+A running apache holds its old config in memory, so a config the new package made invalid (missing `proxy` and
+`proxy_fcgi` for the PHP-FPM flavour, 2026-11-22) only shows up at the next restart, as a dead web UI and API.
+
 Agents: the repo suite and major per host come from `zabbix_agent_repo_major` in group_vars/all.yml, and
 `fleet-versions` flags a host whose Zabbix repo differs or whose suite does not match its release (a `noble`
 suite left on a `resolute` host). Fix repos with `fix-apt-repos.yml`, then `deploy-zabbix-agent.yml` or

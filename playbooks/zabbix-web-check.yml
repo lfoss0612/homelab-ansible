@@ -1,0 +1,107 @@
+---
+# Make sure the Zabbix web frontend can actually start and answer, and fix the one thing that broke it.
+#
+# Usage:
+#   scripts/run-working-tree.sh playbooks/zabbix-web-check.yml           # dry run: reports what is wrong
+#   scripts/run-working-tree.sh --apply playbooks/zabbix-web-check.yml   # enable missing modules, start apache
+#
+# Why this exists (2026-11-22): the zabbix-apache-conf package shipped with the Ubuntu 26.04 build (7.4.16-2,
+# installed 2026-11-15) serves PHP through PHP-FPM: its /etc/zabbix/apache.conf uses ProxyTimeout and
+# SetHandler "proxy:unix:...|fcgi://", which need mod_proxy and mod_proxy_fcgi. The VM had only the older
+# mod_php setup enabled, so the new config was invalid. Apache kept running on its OLD config in memory for a
+# week (a reload that fails leaves the old process in place), and the first restart, when the VM was
+# restarted on 2026-11-22 06:30, left it failed: no web UI and no API, with the Zabbix server itself fine.
+# The lesson is general: after any package that changes Apache config, run `apachectl configtest`, because a
+# running apache proves nothing about the config on disk. This play does that, and is safe to run any time.
+#
+# What it checks, in order: PHP-FPM is running; the modules the shipped config needs are enabled (enabled by
+# a2enmod, which is idempotent); `apachectl configtest` passes; apache is started and enabled; the frontend
+# and the API answer on localhost. A failing configtest stops the play before anything is restarted.
+
+- name: Check the Zabbix web frontend
+  hosts: zabbix.home.lan
+  become: true
+
+  vars:
+    apache_zabbix_conf: /etc/zabbix/apache.conf
+    # Modules needed by the PHP-FPM flavour of the shipped config. Taken from the config's own directives below,
+    # so a config that no longer needs them does not force them on.
+    fpm_modules: [proxy, proxy_fcgi]
+
+  handlers:
+    - name: restart_apache
+      ansible.builtin.systemd_service:
+        name: apache2
+        state: restarted
+
+  tasks:
+    - name: Read which handler the shipped config uses
+      ansible.builtin.slurp:
+        src: "{{ apache_zabbix_conf }}"
+      register: zconf
+
+    - name: Work out whether it needs the proxy modules
+      ansible.builtin.set_fact:
+        needs_fpm_modules: "{{ (zconf.content | b64decode) is search('ProxyTimeout|proxy:unix|fcgi://') }}"
+
+    - name: PHP-FPM is running (the shipped config hands PHP to it)
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: "{{ ['php8.5-fpm'] if needs_fpm_modules else [] }}"
+      failed_when: false
+      register: fpm_state
+
+    - name: Enable the modules the shipped config needs
+      # creates= makes this idempotent and gives a correct dry run (no change when the symlink is already there)
+      ansible.builtin.command:
+        cmd: "a2enmod {{ item }}"
+        creates: "/etc/apache2/mods-enabled/{{ item }}.load"
+      loop: "{{ fpm_modules if needs_fpm_modules else [] }}"
+      notify: restart_apache
+
+    - name: Test the apache configuration
+      ansible.builtin.command: apachectl configtest
+      register: configtest
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Stop here if the configuration is invalid
+      ansible.builtin.assert:
+        that: configtest.rc == 0 or ansible_check_mode
+        fail_msg: >-
+          apachectl configtest fails: {{ configtest.stderr | default('') | trim }}.
+          Nothing was restarted. (In a dry run this is reported, not fatal, because a module the apply would
+          enable is still missing.)
+
+    - name: Report a configuration problem found in a dry run
+      ansible.builtin.debug:
+        msg: "configtest rc={{ configtest.rc }}: {{ configtest.stderr | default('') | trim }}"
+      when: configtest.rc != 0
+
+    - name: Apply a pending restart now, before checking that apache is up
+      ansible.builtin.meta: flush_handlers
+
+    - name: Apache is started and enabled
+      ansible.builtin.systemd_service:
+        name: apache2
+        state: started
+        enabled: true
+
+    - name: The frontend and the API answer
+      ansible.builtin.uri:
+        url: "http://localhost/zabbix/{{ item }}"
+        method: "{{ 'POST' if item == 'api_jsonrpc.php' else 'GET' }}"
+        body_format: json
+        body: "{{ {'jsonrpc': '2.0', 'method': 'apiinfo.version', 'id': 1} if item == 'api_jsonrpc.php' else omit }}"
+        status_code: 200
+      loop: [index.php, api_jsonrpc.php]
+      check_mode: false
+      changed_when: false
+      register: web_answer
+      until: web_answer.status == 200
+      retries: 5
+      delay: 3
+      when: not ansible_check_mode or configtest.rc == 0
