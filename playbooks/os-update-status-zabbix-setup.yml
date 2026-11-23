@@ -401,10 +401,14 @@
                   - {type: 1, name: "columns.2.highlights.1.color", value: "9E9E9E"}
 
                   - {type: 0, name: "column", value: "1"}
-                  # Default host limit is 10, which would silently truncate
-                  # this 14-host fleet -- see zabbix-fleet-dashboard.yml's
-                  # identical note.
-                  - {type: 0, name: "count", value: "50"}
+                  # Default host limit is 10, which silently truncates this
+                  # 14-host fleet. The field is `show_lines` ("Host limit",
+                  # WidgetForm.php of the tophosts widget in 7.4). It was
+                  # written as `count` here for months, which Zabbix ignores
+                  # without any error: the dashboard showed the 10 hosts with
+                  # the MOST pending updates and dropped the rest, so the
+                  # healthiest hosts were the ones missing (found 2026-11-22).
+                  - {type: 0, name: "show_lines", value: "50"}
                   - {type: 1, name: "reference", value: "PTCHST"}
 
     - name: Create the dashboard

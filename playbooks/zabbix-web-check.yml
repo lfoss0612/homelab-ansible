@@ -61,6 +61,31 @@
       loop: "{{ fpm_modules if needs_fpm_modules else [] }}"
       notify: restart_apache
 
+    # With PHP behind mod_proxy_fcgi, apache does not hand the Authorization header to PHP, so every API call
+    # that authenticates with a Bearer token (all of this repo's playbooks and timers) is answered "Not
+    # authorized" while the unauthenticated apiinfo.version still works, which hides the fault from a simple
+    # health check. mod_php passed the header itself, so this only appears once the FPM config is in use
+    # (found 2026-11-22, right after the modules above were enabled). A separate file, not an edit of the
+    # package's /etc/zabbix/apache.conf, so a package upgrade cannot overwrite it.
+    - name: Pass the Authorization header through to PHP-FPM
+      ansible.builtin.copy:
+        content: |
+          # Managed by playbooks/zabbix-web-check.yml. Needed for Zabbix API tokens when PHP runs under FPM.
+          SetEnvIfNoCase ^Authorization$ "(.+)" HTTP_AUTHORIZATION=$1
+        dest: /etc/apache2/conf-available/zabbix-api-auth.conf
+        mode: "0644"
+        owner: root
+        group: root
+      when: needs_fpm_modules | bool
+      notify: restart_apache
+
+    - name: Enable that config
+      ansible.builtin.command:
+        cmd: a2enconf zabbix-api-auth
+        creates: /etc/apache2/conf-enabled/zabbix-api-auth.conf
+      when: needs_fpm_modules | bool
+      notify: restart_apache
+
     - name: Test the apache configuration
       ansible.builtin.command: apachectl configtest
       register: configtest
