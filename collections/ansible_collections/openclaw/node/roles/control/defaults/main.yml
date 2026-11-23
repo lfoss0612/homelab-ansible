@@ -62,6 +62,16 @@ openclaw_control_notify_zabbix_key: openclaw.fleet.update
 # openclaw_optional host being powered off does not read as a failure.
 openclaw_control_notify_zabbix_host_key: openclaw.fleet.host
 
+# Fleet hosts whose per-host value is NOT sent. The Zabbix server refuses trapper data for a host that
+# a Zabbix proxy monitors ("host is monitored by a proxy or proxy group"), so for such a host the
+# value is always discarded, and the script's "discarded some per-host values" WARNING then fires every
+# week for a known reason and hides a real one. Listing the host here replaces that with one plain note.
+# This only removes the noise: the host still has no per-host result in Zabbix (the control node
+# cannot reach the proxy), and the aggregate openclaw.fleet.update still covers the whole run.
+# The list can go stale: if a host leaves the proxy, take it out so its value is sent again.
+# Set per site in host_vars of the control node. Empty means send every host.
+openclaw_control_notify_zabbix_skip_hosts: []
+
 # 1 when npm has an OpenClaw newer than the pin, 0 when not; pushed after a successful run
 # only. Informational: the timer never bumps the pin. Item and trigger are created by
 # playbooks/zabbix-fleet-newer-release-item.yml.

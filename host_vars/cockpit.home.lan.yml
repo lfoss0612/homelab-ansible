@@ -10,3 +10,12 @@
 # cockpit is this repo's own control node and the host granting this
 # identity's own SSH access -- treat any future change here with extra care.
 openclaw_networkd_standardize: true
+
+# k8s-master is monitored through the Zabbix proxy ("rke2-proxy"), and the server refuses trapper
+# values for a proxy-monitored host, so its per-host openclaw.fleet.host value is always discarded.
+# Not sent, with one plain note in the journal instead of a weekly WARNING. Checked 2026-11-20: the
+# proxy's trapper port is ClusterIP only, so this node cannot send to it, and moving master off the
+# proxy would break the kube-state-metrics items (the server cannot reach pod IPs). Remove the entry
+# if master ever leaves the proxy.
+openclaw_control_notify_zabbix_skip_hosts:
+  - k8s-master.home.lan

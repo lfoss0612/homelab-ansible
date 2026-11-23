@@ -189,7 +189,15 @@ else
     # can address hosts other than this one in a single connection.
     hosts_input=$(mktemp) || hosts_input=
     if [ -n "$hosts_input" ]; then
-      awk -v k="$hosts_key" 'NF == 2 { print $1, k, $2 }' "$hosts_file" > "$hosts_input"
+      # Hosts the Zabbix server would refuse a trapper value for (monitored through a proxy)
+      # are left out and named in one plain note, so the WARNING below fires only for a
+      # discard nobody expected. See openclaw_control_notify_zabbix_skip_hosts.
+      skip_hosts="{{ openclaw_control_notify_zabbix_skip_hosts | join(' ') }}"
+      skipped=$(awk -v skip="$skip_hosts" 'BEGIN { n = split(skip, a, " "); for (i = 1; i <= n; i++) s[a[i]] = 1 } NF == 2 && ($1 in s) { print $1 }' "$hosts_file")
+      awk -v k="$hosts_key" -v skip="$skip_hosts" 'BEGIN { n = split(skip, a, " "); for (i = 1; i <= n; i++) s[a[i]] = 1 } NF == 2 && !($1 in s) { print $1, k, $2 }' "$hosts_file" > "$hosts_input"
+      if [ -n "$skipped" ]; then
+        log "per-host value not sent for: $(echo $skipped) (monitored through the Zabbix proxy, which the server refuses trapper values for)"
+      fi
       if [ -s "$hosts_input" ]; then
         hosts_out=$(zabbix_sender -c "$zabbix_conf" -i "$hosts_input" 2>&1)
         log "zabbix_sender($hosts_key, $(wc -l < "$hosts_input") hosts): $hosts_out"
