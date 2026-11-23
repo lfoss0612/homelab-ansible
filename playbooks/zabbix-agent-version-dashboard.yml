@@ -179,7 +179,7 @@
                   # Default host limit is 10, which would silently truncate
                   # this 15-host fleet - see zabbix-fleet-dashboard.yml's
                   # identical note.
-                  - {type: 0, name: "count", value: "50"}
+                  - {type: 0, name: "show_lines", value: "50"}
                   - {type: 1, name: "reference", value: "AVERT"}
 
     - name: Create the dashboard

@@ -234,7 +234,7 @@
                   # 14-host fleet - pbs and all three k8s nodes simply were not
                   # in the table, with nothing on screen to say rows were
                   # missing. Set well above the fleet size.
-                  - {type: 0, name: "count", value: "50"}
+                  - {type: 0, name: "show_lines", value: "50"}
                   - {type: 1, name: "reference", value: "FLTTH"}
 
               - type: svggraph

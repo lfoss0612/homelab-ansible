@@ -146,7 +146,7 @@
                   - {type: 0, name: "column", value: "1"}
                   # Default host limit is 10, which would silently truncate
                   # this 14-host fleet.
-                  - {type: 0, name: "count", value: "50"}
+                  - {type: 0, name: "show_lines", value: "50"}
                   - {type: 1, name: "reference", value: "STORCAP"}
 
     - name: Create the dashboard
