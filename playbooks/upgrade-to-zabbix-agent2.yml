@@ -17,7 +17,7 @@
 # argocd/cattle-monitoring-system/zabbix-proxy-agent.yaml). It uses
 # hostNetwork: true and binds the same node IP:10050 - re-running this
 # playbook against them would just recreate the port conflict that
-# playbooks/once-remove-agent-from-k8s-nodes.yml was written to fix.
+# playbooks/remove-agent-from-k8s-nodes.yml (deleted after it ran; see git history) was written to fix.
 #
 # Usage:
 #   ansible-playbook playbooks/upgrade-to-zabbix-agent2.yml --check --diff

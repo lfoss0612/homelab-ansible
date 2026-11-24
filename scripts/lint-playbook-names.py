@@ -8,13 +8,13 @@ comment line:
 
     ---
     # Single-run: pending - <what it will do>
-    # Single-run: completed 2026-11-19 - <what it did, and that a re-run is a no-op>
 
+Once it has been applied and recorded in the vault it is deleted (git history keeps it).
 Rules (standard library only):
 
   N1  A file named once-*.yml has no `# Single-run:` marker in its first 5 lines.
   N2  A file with a `# Single-run:` marker is not named once-*.yml.
-  N3  The marker's status is not `pending` or `completed`.
+  N3  The marker's status is not `pending` (a finished playbook is deleted, not marked).
 
 A playbook that is meant to be re-run (standing automation, or a fix that applies again after
 every release upgrade) is NOT single-run and keeps its descriptive name.
@@ -31,7 +31,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MARKER = re.compile(r"^#\s*Single-run:\s*(\S+)", re.IGNORECASE)
-STATUSES = {"pending", "completed"}
+STATUSES = {"pending"}
 
 
 def check(path: Path) -> list[str]:
@@ -45,11 +45,11 @@ def check(path: Path) -> list[str]:
     once_named = path.name.startswith("once-")
     problems = []
     if once_named and status is None:
-        problems.append("N1 named once-* but has no '# Single-run: pending|completed' line in its first 5 lines")
+        problems.append("N1 named once-* but has no '# Single-run: pending' line in its first 5 lines")
     if status is not None and not once_named:
         problems.append("N2 has a '# Single-run:' marker but is not named once-<what>.yml")
     if status is not None and status not in STATUSES:
-        problems.append(f"N3 marker status '{status}' must be 'pending' or 'completed'")
+        problems.append(f"N3 marker status '{status}' must be 'pending'; delete a finished playbook")
     return problems
 
 

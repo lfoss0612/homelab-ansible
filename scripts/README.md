@@ -107,15 +107,15 @@ scripts/lint-check-mode.py --strict              # warnings fail the run too
 ## lint-playbook-names.py
 
 Enforces the single-run naming rule (see CLAUDE.md): a playbook named `once-<what>.yml` carries a
-`# Single-run: pending|completed` marker in its first 5 lines, and a playbook with the marker is named
-`once-<what>.yml`. Standard library only.
+`# Single-run: pending` marker in its first 5 lines, and a playbook with the marker is named
+`once-<what>.yml`. A finished one is deleted, not marked. Standard library only.
 
 ```bash
 scripts/lint-playbook-names.py                   # everything under playbooks/
 ```
 
 - `N1`: named `once-*` but no marker. `N2`: marker but not named `once-*`. `N3`: status is not
-  `pending` or `completed`.
+  `pending` (a `completed` one should be deleted).
 
 ## ansible-on-cockpit.sh and probes/
 

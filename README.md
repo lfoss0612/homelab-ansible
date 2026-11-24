@@ -131,10 +131,10 @@ root-equivalent sudo on all 12 hosts, how the roles revoke it, and the unattende
 
 ## Playbooks
 
-Playbooks named `once-<what>.yml` are single-run (a migration, cleanup or one-time repair) and are kept
-as the record of what was changed; each carries a `# Single-run: pending|completed` marker, and a
-completed one ends cleanly if run again. Everything else is meant to be re-run. The rule and its lint
-(`scripts/lint-playbook-names.py`) are in CLAUDE.md.
+Playbooks named `once-<what>.yml` are single-run (a migration, cleanup or one-time repair) and carry a
+`# Single-run: pending` marker. They are deleted once applied and recorded in the vault; git history keeps
+them. Everything else is meant to be re-run. The rule and its lint (`scripts/lint-playbook-names.py`) are
+in CLAUDE.md.
 
 | File | Purpose |
 |---|---|
@@ -175,7 +175,7 @@ completed one ends cleanly if run again. Everything else is meant to be re-run. 
 | `playbooks/oom-kill-monitor.yml` | Installs `/usr/local/bin/oom-kill-monitor`, its service and 5-minute timer on `[oom_monitored]` (`pbs`, `pve`, `pve-ai`, `pve-router` — same members as `[smart_monitored]` today, but a separate group since VMs are the likely next addition). Tails the kernel journal incrementally via a stored cursor and reports any `Out of memory: Killed process` line, pairing it with the preceding `task_memcg=` line so a killed `kvm` process resolves to a VMID. Built 2026-08-27 after the kernel killed VM 105 (`k8s-worker`) on `pve.home.lan` with zero alerting anywhere. |
 | `playbooks/oom-kill-monitor-zabbix-setup.yml` | Server-side counterpart: a trapper count item, a text item for the most recent kill, and per-host triggers — including `nodata(system.oom.count,1h)`, the same "a dead monitor looks like no problem" gap that let the 2026-08-24 kill go unnoticed. Idempotent; derives its targets from `[oom_monitored]`. **Run both halves.** |
 | `playbooks/claude-remote-control.yml` | Installs the `claude-remote-control` systemd unit on `[claude_remote_control]` (`desktop` alone) — `~lfoss/.local/bin/claude remote-control`, `Type=simple`, `Restart=always`/`RestartSec=10`, `WorkingDirectory=/home/lfoss/projects`. The only service in this repo that runs as an interactive user off a binary in that user's home instead of as root off `/usr/local/bin`, so the play asserts the binary and the working directory exist rather than installing them: Claude Code is installed per-user by its own installer, and writing the unit without either one leaves systemd retrying a `203/EXEC` or `200/CHDIR` failure every 10 seconds forever. Explicit-invocation-only — deliberately not in the weekly convergence timer, so `desktop` being powered off is a visible failure here rather than a red timer. Adopted 2026-08-28 from a unit created by hand on the host.
-| `playbooks/once-pbs-export-k8s-datastore.yml` | Creates and exports `backup10tb/k8s_backups` on the ZFS mirror, alongside `host_backups`/`photo_backups`/`vm_backups`/`longhorn_backups`. Locked to `0700` — it will hold cluster CA private keys and Secret-encryption keys, the same sensitivity class as OPNsense's internal CA key. Run before `k8s-etcd-backup.yml`. |
+| `pbs-export-k8s-datastore.yml` (a single-run playbook, deleted after it ran; see git history) | Creates and exports `backup10tb/k8s_backups` on the ZFS mirror, alongside `host_backups`/`photo_backups`/`vm_backups`/`longhorn_backups`. Locked to `0700` — it will hold cluster CA private keys and Secret-encryption keys, the same sensitivity class as OPNsense's internal CA key. Run before `k8s-etcd-backup.yml`. |
 | `playbooks/k8s-etcd-backup.yml` | Installs an hourly timer on `[k8s_master]` that copies RKE2's etcd snapshots and its `server/` directory (minus the live `db/`) to that export — the off-node half of etcd disaster recovery that RKE2's own snapshot job doesn't provide on a single-control-plane cluster. Deliberately backs up the whole `server/` tree rather than a hand-picked file list: `cred/encryption-*.json` (without which a restored snapshot's Secrets are permanently unreadable) is easy to miss if you only think to grab `tls/`. |
 
 The `nodes status --json` and `doctor --lint --json` schemas used by

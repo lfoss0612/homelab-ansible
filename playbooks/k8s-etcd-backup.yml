@@ -8,7 +8,7 @@
 # would just fail the initial directory check in the script, harmlessly, but
 # there is no reason to try.
 #
-# Depends on playbooks/once-pbs-export-k8s-datastore.yml having created and
+# Depends on playbooks/pbs-export-k8s-datastore.yml (deleted after it ran; see git history) having created and
 # exported the k8s_backups dataset first - run that one before this one.
 #
 # Usage:
