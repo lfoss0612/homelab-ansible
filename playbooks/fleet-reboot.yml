@@ -314,8 +314,8 @@
           delay: 15
           changed_when: false
           check_mode: false
-      # lint-check-mode: ignore (the drain is skipped in a dry run, so waiting for detach would only time out)
-      when: not ansible_check_mode
+          # lint-check-mode: ignore (the drain is skipped in a dry run, so waiting for detach would only time out)
+          when: not ansible_check_mode
 
     # ---------------------------------------------------------------- the reboot
     - name: Require the go-ahead
@@ -368,7 +368,8 @@
         fail_msg: >-
           Expected {{ reboot_expected_kernel }}, got
           {{ reboot_after.stdout_lines | select('match', '^kernel=') | first }}. Check the boot pin and the ESP.
-      when: not (reboot_verify_only | default(false) | bool)
+      # A dry run skips the reboot, so the host is still on the old kernel and this would always fail.
+      when: not (reboot_verify_only | default(false) | bool) and not ansible_check_mode
 
     - name: Proxmox host post-checks
       when: reboot_is_pve | bool
