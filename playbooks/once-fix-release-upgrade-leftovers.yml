@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - release upgrade leftovers cleaned up on 2026-11-19
+#
 # Clean up two kinds of leftovers a release upgrade left on 2026-11-15, both of which show up as failed
 # systemd units (found 2026-11-19 by post-release-upgrade-check.yml):
 #   * pcp is "removed, config remains" (state rc): its old init scripts /etc/init.d/pm* are conffiles that
@@ -9,8 +11,8 @@
 # Also reports, without touching them, every other package left in rc state and every other obsolete
 # conffile, so they can be judged.
 #
-#   scripts/run-working-tree.sh playbooks/fix-release-upgrade-leftovers.yml -e leftovers_hosts=vscode.home.lan   dry run
-#   scripts/run-working-tree.sh --apply playbooks/fix-release-upgrade-leftovers.yml -e leftovers_hosts=...
+#   scripts/run-working-tree.sh playbooks/once-fix-release-upgrade-leftovers.yml -e leftovers_hosts=vscode.home.lan   dry run
+#   scripts/run-working-tree.sh --apply playbooks/once-fix-release-upgrade-leftovers.yml -e leftovers_hosts=...
 - name: Clean release-upgrade leftovers
   hosts: "{{ leftovers_hosts | default('localhost') }}"
   become: true

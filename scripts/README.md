@@ -104,6 +104,19 @@ scripts/lint-check-mode.py --strict              # warnings fail the run too
   skipped under `--check`; mark it with a `# lint-check-mode: ignore` comment instead.
 - `W1`: registers output but sets neither `check_mode` nor `changed_when`.
 
+## lint-playbook-names.py
+
+Enforces the single-run naming rule (see CLAUDE.md): a playbook named `once-<what>.yml` carries a
+`# Single-run: pending|completed` marker in its first 5 lines, and a playbook with the marker is named
+`once-<what>.yml`. Standard library only.
+
+```bash
+scripts/lint-playbook-names.py                   # everything under playbooks/
+```
+
+- `N1`: named `once-*` but no marker. `N2`: marker but not named `once-*`. `N3`: status is not
+  `pending` or `completed`.
+
 ## ansible-on-cockpit.sh and probes/
 
 Runs ad-hoc Ansible, inventory queries, committed-checkout playbooks and read-only probes through

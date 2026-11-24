@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - datastores now sit directly under /mnt/datastore
+#
 # Flatten the ZFS pool's mountpoint so PBS datastores sit directly under
 # /mnt/datastore instead of one level deeper.
 #
@@ -35,8 +37,8 @@
 # mounted beneath it, so unmounting the pool with them still mounted fails busy.
 #
 # Usage - PBS is stopped and restarted, so run it outside a backup window:
-#   ansible-playbook playbooks/pbs-flatten-datastore-mountpoint.yml --check --diff
-#   ansible-playbook playbooks/pbs-flatten-datastore-mountpoint.yml
+#   ansible-playbook playbooks/once-pbs-flatten-datastore-mountpoint.yml --check --diff
+#   ansible-playbook playbooks/once-pbs-flatten-datastore-mountpoint.yml
 
 - name: Flatten the PBS datastore mountpoint
   hosts: pbs.home.lan

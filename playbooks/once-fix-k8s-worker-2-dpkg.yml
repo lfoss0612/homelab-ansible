@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - wedged dpkg on k8s-worker-2 unblocked
+#
 # Unblock dpkg on k8s-worker-2.home.lan
 #
 # An automatic kernel update pulled in linux-image-7.0.0-28-generic, but
@@ -17,7 +19,7 @@
 # reinstalled later once nvidia-dkms supports it.
 #
 # Usage:
-#   ansible-playbook playbooks/fix-k8s-worker-2-dpkg.yml
+#   ansible-playbook playbooks/once-fix-k8s-worker-2-dpkg.yml
 
 - name: Unblock dpkg on k8s-worker-2
   hosts: k8s-worker-2.home.lan

@@ -1,9 +1,11 @@
 ---
+# Single-run: completed - failed units from the 2026-11-15 release upgrade cleared on 2026-11-19
+#
 # Fix the failed systemd units found on 2026-11-19 by post-release-upgrade-check.yml, each decided with
 # the owner. Hosts not named below are untouched.
 #
-#   scripts/run-working-tree.sh playbooks/fix-failed-units.yml -e units_hosts=pve-ai.home.lan,pve-router.home.lan,omv.home.lan,cockpit.home.lan
-#   scripts/run-working-tree.sh --apply playbooks/fix-failed-units.yml -e units_hosts=...
+#   scripts/run-working-tree.sh playbooks/once-fix-failed-units.yml -e units_hosts=pve-ai.home.lan,pve-router.home.lan,omv.home.lan,cockpit.home.lan
+#   scripts/run-working-tree.sh --apply playbooks/once-fix-failed-units.yml -e units_hosts=...
 #
 #   pve-ai       dead NFS entry 192.168.0.100:/srv/nfs/backups in /etc/fstab (old subnet, failing since Nov 9)
 #   pve-router   stale NFS entry 10.0.5.5:/mnt/backups/scripts in /etc/fstab (PBS denies it since Sep 27)

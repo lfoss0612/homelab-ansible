@@ -67,6 +67,9 @@
               host: ["{{ target_host }}"]
           id: 1
       register: zabbix_host_lookup
+      # A read-only lookup, so it runs in a dry run too. Without this the POST is skipped under --check,
+      # the next task indexes an empty result, and its no_log hides the error.
+      check_mode: false
 
     - name: Link Linux + MySQL templates and set MySQL macros
       ansible.builtin.uri:
@@ -97,4 +100,7 @@
 
     - name: Show result
       ansible.builtin.debug:
-        msg: "{{ 'MySQL template linked to ' + target_host if template_link_result.json.result is defined else 'FAILED: ' + (template_link_result.json.error.data | default('unknown error')) }}"
+        msg: >-
+          {{ 'Dry run: the host.update call is skipped, so nothing was linked.' if ansible_check_mode
+             else ('MySQL template linked to ' + target_host if template_link_result.json.result is defined
+                   else 'FAILED: ' + (template_link_result.json.error.data | default('unknown error'))) }}

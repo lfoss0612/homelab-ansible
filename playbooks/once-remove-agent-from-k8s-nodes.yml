@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - host-level zabbix-agent2 removed from the k8s nodes
+#
 # Remove the host-level zabbix-agent2 from the 3 k8s nodes - they're now
 # monitored by the in-cluster zabbix-agent DaemonSet instead (deployed via
 # homelab-gitops: argocd/cattle-monitoring-system/zabbix-proxy-agent.yaml,
@@ -13,7 +15,7 @@
 # ("bind: address already in use" in the DaemonSet pods' crash logs).
 #
 # Usage:
-#   ansible-playbook playbooks/remove-agent-from-k8s-nodes.yml
+#   ansible-playbook playbooks/once-remove-agent-from-k8s-nodes.yml
 
 - name: Remove host-level zabbix-agent2 from k8s nodes
   hosts: k8s

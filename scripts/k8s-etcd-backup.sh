@@ -16,7 +16,7 @@
 # Secret-encryption keys (cred/encryption-*.json - without these a restored
 # snapshot's Secrets are permanently unreadable), and the join token. An etcd
 # snapshot alone cannot rebuild a cluster without this. See
-# playbooks/pbs-export-k8s-datastore.yml for the fuller reasoning.
+# playbooks/once-pbs-export-k8s-datastore.yml for the fuller reasoning.
 #
 # ---------------------------------------------------------------------------
 # The NFS mount is on-demand, not persistent (no fstab entry).

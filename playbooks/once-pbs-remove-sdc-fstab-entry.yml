@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - stale /mnt/backups fstab entry removed
+#
 # Remove the stale /mnt/backups fstab entry on pbs, left behind after the
 # AmazonBasics/VL711 enclosure (sdc, WD Blue SA510 2 TB) was retired.
 #
@@ -23,8 +25,8 @@
 # Nothing to change there.
 #
 # Usage:
-#   ansible-playbook playbooks/pbs-remove-sdc-fstab-entry.yml --check --diff
-#   ansible-playbook playbooks/pbs-remove-sdc-fstab-entry.yml
+#   ansible-playbook playbooks/once-pbs-remove-sdc-fstab-entry.yml --check --diff
+#   ansible-playbook playbooks/once-pbs-remove-sdc-fstab-entry.yml
 
 - name: Remove the retired sdc /mnt/backups fstab entry on pbs
   hosts: pbs.home.lan

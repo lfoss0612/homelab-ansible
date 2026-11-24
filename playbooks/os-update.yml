@@ -23,7 +23,7 @@
 #     metapackage: parts of the stack (libnvidia-cfg1, nvidia-persistenced,
 #     nvidia-settings) move to the 610 branch while nvidia-driver-580-open
 #     stays on 580. This is the same host whose nvidia-dkms build already
-#     wedged dpkg once — see playbooks/fix-k8s-worker-2-dpkg.yml. Resolve the
+#     wedged dpkg once — see playbooks/once-fix-k8s-worker-2-dpkg.yml. Resolve the
 #     driver-branch split first, then run this against it explicitly.
 #
 # Override with -e os_update_hosts=... to target any of them deliberately.

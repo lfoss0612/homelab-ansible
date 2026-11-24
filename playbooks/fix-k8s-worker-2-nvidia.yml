@@ -21,7 +21,7 @@
 #      Its build against 7.0.0-30 fails on removed/changed kernel APIs --
 #      `in_irq` implicit declaration, `vm_flags` now read-only, `vm_fault_t`
 #      type conflict. Same class of failure as the 7.0.0-28 breakage in
-#      playbooks/fix-k8s-worker-2-dpkg.yml.
+#      playbooks/once-fix-k8s-worker-2-dpkg.yml.
 #
 # The 580 BRANCH does support this kernel -- Ubuntu ships a prebuilt
 # linux-modules-nvidia-580-open-7.0.0-30-generic. That prebuilt package cannot

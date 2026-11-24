@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - k8s-master hostname aligned with its node name
+#
 # Align k8s-master's OS hostname with its Kubernetes node name.
 #
 # WHY: k8s-master is the only node whose /etc/hostname (k8s-master) disagrees
@@ -52,8 +54,8 @@
 # but for roughly a minute there is no scheduling, no kubectl and no Argo CD.
 #
 # Usage:
-#   ansible-playbook playbooks/fix-k8s-master-hostname.yml --check --diff
-#   ansible-playbook playbooks/fix-k8s-master-hostname.yml
+#   ansible-playbook playbooks/once-fix-k8s-master-hostname.yml --check --diff
+#   ansible-playbook playbooks/once-fix-k8s-master-hostname.yml
 
 - name: Align k8s-master's OS hostname with its Kubernetes node name
   hosts: k8s-master.home.lan

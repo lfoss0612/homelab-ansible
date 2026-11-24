@@ -56,6 +56,26 @@ ssh claude@cockpit 'cd /opt/ansible && sudo -n -H -u ansible /usr/bin/ansible-pl
   left 335 root-owned paths and 52 non-group-writable ones in one run. If you hit it,
   `playbooks/openclaw-automation.yml` repairs it.
 
+## Naming rule: single-run playbooks are `once-<what>.yml`
+
+A playbook that does a job once (a migration, a cleanup, a one-time repair) and is pointless to
+re-run is named `once-<what>.yml` and starts with a marker line right after `---`:
+
+```yaml
+---
+# Single-run: pending - <what it will do>
+# Single-run: completed 2026-11-19 - <what it did; a re-run is a no-op>
+```
+
+- Create it as `pending`; flip it to `completed` once it has been applied and verified. Do not delete or
+  move it: it is the record of what was changed.
+- A completed one must end cleanly on a re-run (a task that detects the finished state, says so, and
+  uses `meta: end_host`), never fail a guard because the work is already done.
+- A playbook meant to be re-run (standing automation, or a fix needed again after every release
+  upgrade, like `fix-apt-repos.yml`) is not single-run and keeps a descriptive name.
+- `scripts/lint-playbook-names.py` enforces the pairing: a `once-` name needs the marker and the marker
+  needs the name. Run it before committing a new playbook.
+
 ## Gotchas that have already cost time
 
 - **`ansible.cfg`'s key is `collections_path` (singular).** ansible-core 2.19.4 silently

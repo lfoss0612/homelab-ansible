@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - k8s_backups dataset created and exported; k8s-etcd-backup.yml depends on its result
+#
 # Create and export the k8s_backups dataset on the ZFS mirror, so k8s-master's
 # etcd snapshots and RKE2 server credential material have an off-node copy.
 #
@@ -44,7 +46,7 @@
 # same tradeoff already accepted for the other exports.
 #
 # ADDITIVE, NOT TEMPLATED - deliberately, matching
-# pbs-export-longhorn-datastore.yml. /etc/exports is not otherwise
+# once-pbs-export-longhorn-datastore.yml. /etc/exports is not otherwise
 # Ansible-managed and already carries exports three Proxmox hypervisors
 # depend on; lineinfile adds one line and cannot disturb the others.
 #
@@ -54,8 +56,8 @@
 # fsid=6 is the next free value. Existing real exports use 1-5 and 11-14.
 #
 # Usage:
-#   ansible-playbook playbooks/pbs-export-k8s-datastore.yml --check --diff
-#   ansible-playbook playbooks/pbs-export-k8s-datastore.yml
+#   ansible-playbook playbooks/once-pbs-export-k8s-datastore.yml --check --diff
+#   ansible-playbook playbooks/once-pbs-export-k8s-datastore.yml
 
 - name: Create and export the k8s_backups dataset from pbs
   hosts: pbs.home.lan
@@ -122,7 +124,7 @@
         group: root
         mode: "0644"
         # No `validate:` - exportfs has no file-syntax check mode. See the
-        # identical note in pbs-export-longhorn-datastore.yml; same trap,
+        # identical note in once-pbs-export-longhorn-datastore.yml; same trap,
         # same reason it is not repeated here.
       notify: reload nfs exports
 

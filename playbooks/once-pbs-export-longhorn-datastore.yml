@@ -1,6 +1,12 @@
 ---
+# Single-run: completed 2026-08-25 (export is live at /mnt/datastore/longhorn_backups; a re-run is a no-op)
+#
 # Export the ZFS mirror's longhorn_backups dataset over NFS, so Longhorn can be
 # repointed at it.
+#
+# NOTE: the paths below describe the layout at the time. The mountpoint was flattened afterwards
+# (once-pbs-flatten-datastore-mountpoint.yml), so the dataset now sits at /mnt/datastore/longhorn_backups
+# and that is what longhorn_dataset_path points at.
 #
 # Longhorn's BackupTarget currently reads
 # nfs://10.0.5.5:/mnt/backups/longhorn - a directory on the 1.8 TB ext4 volume
@@ -41,18 +47,33 @@
 # decision: after the target moves, Longhorn no longer sees that history.
 #
 # Usage:
-#   ansible-playbook playbooks/pbs-export-longhorn-datastore.yml --check --diff
-#   ansible-playbook playbooks/pbs-export-longhorn-datastore.yml
+#   ansible-playbook playbooks/once-pbs-export-longhorn-datastore.yml --check --diff
+#   ansible-playbook playbooks/once-pbs-export-longhorn-datastore.yml
 
 - name: Export the longhorn_backups dataset from pbs
   hosts: pbs.home.lan
   become: true
 
   vars:
-    longhorn_dataset_path: /mnt/datastore/backup10tb/longhorn_backups
+    longhorn_dataset_path: /mnt/datastore/longhorn_backups
     longhorn_export_clients: "10.2.5.0/24(fsid=5,rw,sync,no_root_squash)"
 
   tasks:
+    - name: Read the active exports
+      ansible.builtin.command: exportfs -v
+      register: exports_now
+      changed_when: false
+      check_mode: false
+
+    - name: Already done - the export is live, nothing to do
+      ansible.builtin.debug:
+        msg: "{{ longhorn_dataset_path }} is already exported. This single-run playbook is complete; nothing changed."
+      when: longhorn_dataset_path in exports_now.stdout
+
+    - name: Stop here when it is already done
+      ansible.builtin.meta: end_host
+      when: longhorn_dataset_path in exports_now.stdout
+
     - name: Assert the dataset exists before exporting it
       ansible.builtin.stat:
         path: "{{ longhorn_dataset_path }}"

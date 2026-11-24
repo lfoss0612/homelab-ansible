@@ -1,4 +1,6 @@
 ---
+# Single-run: completed 2026-09-27 (unit disabled and cleared; a re-run is a no-op)
+#
 # Remove the stale zfs-import@pbs_storage.service unit on pbs.
 #
 # `pbs_storage` was an earlier pool name, since replaced by `backup10tb` (the
@@ -27,8 +29,8 @@
 # unexpected if the host's state has changed since this was written.
 #
 # Usage:
-#   ansible-playbook playbooks/pbs-remove-pbs-storage-zfs-import.yml --check --diff
-#   ansible-playbook playbooks/pbs-remove-pbs-storage-zfs-import.yml
+#   ansible-playbook playbooks/once-pbs-remove-pbs-storage-zfs-import.yml --check --diff
+#   ansible-playbook playbooks/once-pbs-remove-pbs-storage-zfs-import.yml
 
 - name: Remove the stale pbs_storage zfs-import unit on pbs
   hosts: pbs.home.lan
@@ -51,6 +53,16 @@
       register: unit_state
       changed_when: false
       check_mode: false
+
+    # Once the job has run the unit is neither failed nor enabled, which is the finished state, not a surprise.
+    - name: Already done - the unit is neither failed nor enabled
+      ansible.builtin.debug:
+        msg: "{{ stale_unit }} is already removed ({{ unit_state.stdout | replace('\n', ', ') }}). This single-run playbook is complete; nothing changed."
+      when: "'ActiveState=failed' not in unit_state.stdout and 'UnitFileState=enabled' not in unit_state.stdout"
+
+    - name: Stop here when it is already done
+      ansible.builtin.meta: end_host
+      when: "'ActiveState=failed' not in unit_state.stdout and 'UnitFileState=enabled' not in unit_state.stdout"
 
     - name: Confirm the unit is in the expected stale/failed state before touching it
       ansible.builtin.assert:

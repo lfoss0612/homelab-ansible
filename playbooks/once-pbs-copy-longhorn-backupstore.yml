@@ -1,4 +1,6 @@
 ---
+# Single-run: completed 2026-08-26 (store copied to /mnt/datastore/longhorn_backups; the source volume is gone, a re-run is a no-op)
+#
 # Copy Longhorn's backup store off the full ext4 volume onto the ZFS mirror,
 # ahead of repointing Longhorn's BackupTarget at the new location.
 #
@@ -30,7 +32,7 @@
 # Reclaiming that space is a separate, later decision.
 #
 # Usage:
-#   ansible-playbook playbooks/pbs-copy-longhorn-backupstore.yml
+#   ansible-playbook playbooks/once-pbs-copy-longhorn-backupstore.yml
 #   # then watch:
 #   ssh pbs journalctl -u longhorn-store-copy -f
 #
@@ -44,11 +46,31 @@
     copy_unit: longhorn-store-copy
 
   tasks:
-    - name: Confirm the source store exists
+    - name: Look for the source store
       ansible.builtin.stat:
         path: "{{ src_store }}/volumes"
       register: src_stat
-      failed_when: not (src_stat.stat.isdir | default(false))
+
+    - name: Look for the copy at the destination
+      ansible.builtin.stat:
+        path: "{{ dst_store }}/volumes"
+      register: dst_stat
+
+    # The source volume (/mnt/backups) was retired after the copy was verified, so a missing source with
+    # the destination present means the job is finished, not that something is wrong.
+    - name: Already done - the source is gone and the copy is in place
+      ansible.builtin.debug:
+        msg: "{{ src_store }} no longer exists and {{ dst_store }}/volumes does. This single-run playbook is complete; nothing changed."
+      when: not (src_stat.stat.isdir | default(false)) and (dst_stat.stat.isdir | default(false))
+
+    - name: Stop here when it is already done
+      ansible.builtin.meta: end_host
+      when: not (src_stat.stat.isdir | default(false)) and (dst_stat.stat.isdir | default(false))
+
+    - name: Confirm the source store exists
+      ansible.builtin.assert:
+        that: src_stat.stat.isdir | default(false)
+        fail_msg: "{{ src_store }}/volumes is missing and there is no copy at {{ dst_store }} either - nothing to copy."
 
     - name: Read free space on the destination
       ansible.builtin.command: "zfs list -H -o available backup10tb/longhorn_backups"

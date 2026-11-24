@@ -27,7 +27,7 @@
 # appliance. The k8s exclusion is not cosmetic - those three are monitored by
 # the in-cluster zabbix-agent DaemonSet using hostNetwork on the same
 # node IP:10050, and installing a host agent there recreates the port conflict
-# that remove-agent-from-k8s-nodes.yml exists to fix. They are Ubuntu anyway, so
+# that once-remove-agent-from-k8s-nodes.yml exists to fix. They are Ubuntu anyway, so
 # the bookworm guard would also skip them; the host pattern is belt and braces.
 #
 # The agent restart is a brief monitoring gap on that host, nothing more.

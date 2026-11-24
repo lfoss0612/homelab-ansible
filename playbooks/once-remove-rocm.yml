@@ -1,11 +1,13 @@
 ---
+# Single-run: completed - unused AMD ROCm stack removed from k8s-master on 2026-11-19
+#
 # Remove the AMD ROCm/HIP stack from a host that has no AMD GPU. Found on k8s-master 2026-11-19: 18 GB
 # under /opt/rocm-6.4.3, installed from repos the Ubuntu release upgrade then disabled, so it would
 # never update again. Verified unused there: no process maps it, no /dev/kfd, no pod asks for an AMD
 # resource or mounts it, no config references it.
 #
-#   scripts/run-working-tree.sh playbooks/remove-rocm.yml -e rocm_host=k8s-master.home.lan          dry run
-#   scripts/run-working-tree.sh --apply playbooks/remove-rocm.yml -e rocm_host=k8s-master.home.lan  removes
+#   scripts/run-working-tree.sh playbooks/once-remove-rocm.yml -e rocm_host=k8s-master.home.lan          dry run
+#   scripts/run-working-tree.sh --apply playbooks/once-remove-rocm.yml -e rocm_host=k8s-master.home.lan  removes
 #
 # Safety: it refuses when /dev/kfd exists (an AMD compute GPU is present), simulates the purge first
 # and refuses if the simulation would remove anything outside the ROCm family or the apt-installed

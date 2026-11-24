@@ -1,4 +1,6 @@
 ---
+# Single-run: completed - hostname -f on k8s-worker-2 returns the FQDN
+#
 # Fix k8s-worker-2's `hostname -f` returning the short name instead of the FQDN.
 #
 # WHY, and it's worse than just ordering: /etc/hosts on this host has
@@ -25,7 +27,7 @@
 # silently discarded forever - the exact failure mode this whole section's
 # scripts already warn about repeatedly.
 #
-# THIS IS NOT fix-k8s-master-hostname.yml's situation - much smaller in
+# THIS IS NOT once-fix-k8s-master-hostname.yml's situation - much smaller in
 # scope. That playbook changed the actual OS hostname (`hostname` itself)
 # to match the Kubernetes node name, which required restarting rke2-server
 # because RKE2's cloud provider stamps status.addresses[Hostname] from the
@@ -37,8 +39,8 @@
 # canonicalization.
 #
 # Usage:
-#   ansible-playbook playbooks/fix-k8s-worker-2-etc-hosts-fqdn.yml --check --diff
-#   ansible-playbook playbooks/fix-k8s-worker-2-etc-hosts-fqdn.yml
+#   ansible-playbook playbooks/once-fix-k8s-worker-2-etc-hosts-fqdn.yml --check --diff
+#   ansible-playbook playbooks/once-fix-k8s-worker-2-etc-hosts-fqdn.yml
 
 - name: Fix k8s-worker-2's /etc/hosts FQDN ordering
   hosts: k8s-worker-2.home.lan
@@ -63,7 +65,7 @@
           `hostname` returned "{{ os_hostname.stdout | trim }}", not
           "{{ target_fqdn }}". This playbook only reorders /etc/hosts - a
           wrong OS hostname is a different, bigger problem (see
-          fix-k8s-master-hostname.yml for that class of fix). Refusing.
+          once-fix-k8s-master-hostname.yml for that class of fix). Refusing.
         success_msg: "OS hostname confirmed correct ({{ target_fqdn }})."
 
     - name: Remove the stale line mapping this host's names to a different host's IP

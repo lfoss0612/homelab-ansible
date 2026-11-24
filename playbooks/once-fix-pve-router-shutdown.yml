@@ -1,9 +1,11 @@
 ---
+# Single-run: completed - pvestatd no longer stalls pve-router's shutdown
+#
 # Stop pvestatd from stalling pve-router's shutdown for 90 seconds.
 #
 # Usage:
-#   ansible-playbook playbooks/fix-pve-router-shutdown.yml --check --diff
-#   ansible-playbook playbooks/fix-pve-router-shutdown.yml
+#   ansible-playbook playbooks/once-fix-pve-router-shutdown.yml --check --diff
+#   ansible-playbook playbooks/once-fix-pve-router-shutdown.yml
 #
 # Background (2026-09-26 journal review of 30 boots on pve-router): a normal
 # shutdown takes 35-45s, but on 3 boots (2026-04-13, 2026-09-16, 2026-09-26
@@ -74,7 +76,7 @@
         group: root
         mode: "0644"
         content: |
-          # Managed by Ansible (playbooks/fix-pve-router-shutdown.yml)
+          # Managed by Ansible (playbooks/once-fix-pve-router-shutdown.yml)
           [Service]
           TimeoutStopSec={{ pvestatd_stop_timeout }}
       notify: Reload systemd
@@ -86,7 +88,7 @@
         group: root
         mode: "0644"
         content: |
-          # Managed by Ansible (playbooks/fix-pve-router-shutdown.yml)
+          # Managed by Ansible (playbooks/once-fix-pve-router-shutdown.yml)
           [Unit]
           Description=Stop pvestatd before guests (and the gateway VM) go down
           After=pve-guests.service pvestatd.service
