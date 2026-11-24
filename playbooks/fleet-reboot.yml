@@ -350,7 +350,7 @@
       ansible.builtin.shell:
         cmd: |
           echo "kernel=$(uname -r)"
-          echo "failed_units=$(systemctl list-units --state=failed --no-legend | awk '{print $1}' | paste -sd, -)"
+          echo "failed_units=$(systemctl list-units --state=failed --no-legend --plain | awk '{print $1}' | paste -sd, -)"
           systemctl is-active zabbix-agent2 2>/dev/null | sed 's/^/zabbix_agent2=/' || true
           [ -f /var/run/reboot-required ] && echo reboot_still_required=yes || echo reboot_still_required=no
         executable: /bin/bash
