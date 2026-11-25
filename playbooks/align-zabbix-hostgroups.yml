@@ -60,6 +60,7 @@
               name: ["Virtual machines"]
           id: 1
       register: vm_group_lookup
+      check_mode: false
       failed_when: vm_group_lookup.json.result | length == 0
 
     - name: Get LXC Containers group ID
@@ -78,6 +79,7 @@
               name: ["LXC Containers"]
           id: 1
       register: lxc_group_lookup
+      check_mode: false
       failed_when: lxc_group_lookup.json.result | length == 0
 
     - name: Get Zabbix host IDs for qemu_vms hosts
@@ -96,6 +98,7 @@
               host: "{{ qemu_vm_hosts }}"
           id: 1
       register: qemu_vm_host_ids
+      check_mode: false
 
     - name: Get Zabbix host IDs for lxc hosts
       ansible.builtin.uri:
@@ -113,6 +116,7 @@
               host: "{{ lxc_hosts }}"
           id: 1
       register: lxc_host_ids
+      check_mode: false
 
     - name: Move qemu_vms hosts into Virtual machines group
       ansible.builtin.uri:

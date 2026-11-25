@@ -39,6 +39,7 @@
               host: ["{{ target_host }}"]
           id: 1
       register: zabbix_host_lookup
+      check_mode: false
       delegate_to: localhost
 
     - name: Link Linux + Kubernetes nodes templates and set Kubernetes macros

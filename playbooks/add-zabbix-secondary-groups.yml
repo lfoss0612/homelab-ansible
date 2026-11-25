@@ -80,6 +80,7 @@
               name: "{{ secondary_group_assignments.keys() | list }}"
           id: 1
       register: target_groups
+      check_mode: false
 
     - name: Build group name-to-id mapping
       ansible.builtin.set_fact:
@@ -113,6 +114,7 @@
               host: "{{ host_group_pairs | map(attribute='host') | unique | list }}"
           id: 1
       register: current_host_groups
+      check_mode: false
 
     - name: Initialize per-host full groups list from current state
       ansible.builtin.set_fact:

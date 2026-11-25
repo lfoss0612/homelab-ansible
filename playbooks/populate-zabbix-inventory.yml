@@ -172,6 +172,7 @@
             output: ["hostid", "host"]
           id: 1
       register: zabbix_hosts
+      check_mode: false
 
     - name: Build host ID mapping
       set_fact:

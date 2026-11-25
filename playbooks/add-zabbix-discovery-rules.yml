@@ -48,6 +48,7 @@
               name: "{{ discovery_rules | map(attribute='name') | list }}"
           id: 1
       register: existing_rules
+      check_mode: false
 
     - name: Create discovery rule for each uncovered subnet
       ansible.builtin.uri:

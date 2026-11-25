@@ -49,6 +49,7 @@
               host: ["{{ inventory_hostname }}"]
           id: 1
       register: zabbix_host_lookup
+      check_mode: false
       delegate_to: localhost
 
     - name: Skip hosts not present in Zabbix
@@ -98,6 +99,7 @@
               macro: "{$NET.IFACE}"
           id: 1
       register: existing_macro
+      check_mode: false
       delegate_to: localhost
 
     - name: Create NET.IFACE macro with this host's primary interface

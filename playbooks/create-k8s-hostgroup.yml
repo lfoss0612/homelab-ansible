@@ -38,6 +38,7 @@
               name: ["{{ k8s_hostgroup_name }}"]
           id: 1
       register: existing_group
+      check_mode: false
 
     - name: Create Kubernetes Nodes host group
       ansible.builtin.uri:
@@ -75,6 +76,7 @@
               host: "{{ k8s_hosts }}"
           id: 1
       register: zabbix_hosts
+      check_mode: false
 
     - name: Move hosts into Kubernetes Nodes group
       ansible.builtin.uri:

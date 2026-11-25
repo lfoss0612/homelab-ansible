@@ -46,6 +46,7 @@
               name: ["{{ rule_name }}"]
           id: 1
       register: existing_rule
+      check_mode: false
 
     - name: Create ICMP-only discovery rule for MetalLB range
       ansible.builtin.uri:

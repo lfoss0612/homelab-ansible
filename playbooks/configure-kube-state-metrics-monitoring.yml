@@ -59,6 +59,7 @@
               host: ["{{ target_host }}"]
           id: 1
       register: host_lookup
+      check_mode: false
 
     - name: Build combined template objects list (dropping nodes-by-HTTP, adding cluster state)
       ansible.builtin.set_fact:
@@ -102,6 +103,7 @@
               macro: "{$KUBE.STATE.ENDPOINT.NAME}"
           id: 1
       register: existing_macro
+      check_mode: false
 
     - name: Set kube-state-metrics endpoint name macro
       ansible.builtin.uri:

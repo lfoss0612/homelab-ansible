@@ -96,6 +96,7 @@
           params: {}
           id: 1
       register: verify_check
+      check_mode: false
       no_log: true
       failed_when: verify_check.json.error is defined
 

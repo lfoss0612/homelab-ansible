@@ -213,6 +213,7 @@
     url: "http://127.0.0.1:{{ openclaw_gateway_port }}/health"
     return_content: true
   register: openclaw_gateway_health
+  check_mode: false
   until: openclaw_gateway_health.status == 200 and (openclaw_gateway_health.json.ok | default(false))
   retries: "{{ openclaw_gateway_health_retries }}"
   delay: 5

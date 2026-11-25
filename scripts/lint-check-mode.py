@@ -18,6 +18,13 @@ Rules (standard library only, so it runs without PyYAML):
   W1  command/shell/raw/script task that has `register:` but neither `check_mode:` nor
       `changed_when:`. If the registered value is used by later tasks it will be empty in
       a dry run; decide whether the task is a read-only probe or a real change.
+  E2  `uri` task that only reads (an HTTP GET/HEAD, or a Zabbix JSON-RPC call whose method
+      is `*.get`, `*.login`, `apiinfo.version`) and has `register:` but no `check_mode:`.
+      `uri` is skipped under --check like `command`, so the registered value is empty in a
+      dry run. A write (POST/PUT/PATCH/DELETE, or an RPC `*.create/update/delete/...`) is
+      correctly skipped and is not flagged.
+  W2  `uri` task with `register:`, no `check_mode:`, and a method the lint cannot classify
+      as a read or a write (a templated `method:`). Decide which it is.
 
 A task can opt out with a `# lint-check-mode: ignore` comment inside it.
 
@@ -37,6 +44,9 @@ DEFAULT_PATHS = ["playbooks", "collections/ansible_collections/openclaw", "roles
 MODULES = r"(?:ansible\.builtin\.)?(?:command|shell|raw|script)"
 TASK_START = re.compile(r"^(\s*)-\s+(?:name:|%s:|block:|ansible\.)" % MODULES)
 MODULE_KEY = re.compile(r"^\s*(?:-\s+)?%s:" % MODULES)
+URI_KEY = re.compile(r"^\s*(?:-\s+)?(?:ansible\.builtin\.)?uri:")
+READ_RPC = re.compile(r"^(?:[a-z]+\.(?:get|login|checkAuthentication|logout)|apiinfo\.version)$")
+WRITE_HTTP = {"POST", "PUT", "PATCH", "DELETE"}
 IGNORE = "lint-check-mode: ignore"
 
 
@@ -71,6 +81,32 @@ def own_lines(block, indent):
     return out[:cut]
 
 
+def classify_uri(text):
+    """Return 'read', 'write' or 'unknown' for a uri task's text."""
+    http = None
+    rpc = []
+    for m in re.finditer(r"^\s*method:\s*[\"']?([^\"'\s#]+)[\"']?", text, re.M):
+        v = m.group(1)
+        if "." in v or "{{" in v and "." in v:
+            rpc.append(v)
+        else:
+            http = v
+    if "{{" in (http or ""):
+        return "unknown"
+    http = (http or "GET").upper()
+    if http in ("GET", "HEAD"):
+        return "read"
+    if http in WRITE_HTTP:
+        if rpc:
+            kinds = {("read" if READ_RPC.match(r) else "unknown" if "{{" in r else "write") for r in rpc}
+            if kinds == {"read"}:
+                return "read"
+            if "unknown" in kinds:
+                return "unknown"
+        return "write"
+    return "unknown"
+
+
 def lint_file(path):
     problems = []
     try:
@@ -82,13 +118,26 @@ def lint_file(path):
         text = "\n".join(mine)
         if IGNORE in text:
             continue
-        if not any(MODULE_KEY.match(l) for l in mine):
+        if re.search(r"^\s*when:.*ansible_check_mode", text, re.M):
+            continue  # deliberately gated on check mode, nothing to decide
+        is_uri = any(URI_KEY.match(l) for l in mine)
+        if not is_uri and not any(MODULE_KEY.match(l) for l in mine):
             continue
         name = next((re.sub(r"^\s*-?\s*name:\s*", "", l).strip("\"' ") for l in mine if "name:" in l), "(unnamed)")
         has_check = re.search(r"^\s*check_mode:", text, re.M) is not None
         ro = re.search(r"^\s*changed_when:\s*(false|no)\s*$", text, re.M) is not None
         has_changed = re.search(r"^\s*changed_when:", text, re.M) is not None
         has_register = re.search(r"^\s*register:", text, re.M) is not None
+        if is_uri:
+            if has_register and not has_check:
+                kind = classify_uri(text)
+                if kind == "read":
+                    problems.append(("E2", path, lineno, name,
+                                     "uri read with register: but no check_mode: false (skipped under --check)"))
+                elif kind == "unknown":
+                    problems.append(("W2", path, lineno, name,
+                                     "uri with register: and no check_mode:, cannot tell a read from a write"))
+            continue
         if ro and not has_check:
             problems.append(("E1", path, lineno, name,
                              "changed_when: false but no check_mode: false (skipped under --check)"))
