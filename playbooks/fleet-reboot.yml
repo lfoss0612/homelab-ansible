@@ -17,7 +17,11 @@
 #                      reboot, wait for the node and for Longhorn to be Ready, uncordon.
 #                      The control-plane node needs -e reboot_allow_control_plane=true (API is down).
 #                      A failed graceful drain needs -e reboot_force_drain=true (an outage for what
-#                      the PDBs protect).
+#                      the PDBs protect). YugabyteDB (one master, one tserver, PDBs allow 0 disruptions)
+#                      is scaled to 0 before the drain when its pods are on the node, and back up after
+#                      the uncordon, so no forcing is needed for it: -e reboot_yb_scale=false opts out.
+#                      If a run dies in between, restore it with
+#                      kubectl -n yugabytedb scale sts/yb-master sts/yb-tserver --replicas=1
 #   proxmox_hosts      corosync quorum must hold with this node gone, before and after. Lists the
 #                      guests that go down with it. The pinned boot kernel is compared with the
 #                      newest installed one, because a pin makes the reboot land on the OLD kernel.
@@ -270,6 +274,70 @@
           check_mode: false
           failed_when: reboot_lh_degraded.stdout | trim != '0'
 
+        # YugabyteDB runs as one yb-master and one yb-tserver whose PDBs allow 0 disruptions, so a graceful
+        # drain of the node holding them can never succeed. Instead of forcing it, stop them cleanly first
+        # (tserver, then master) and start them again after the node is back. Argo CD must ignore their
+        # replica counts (ignoreDifferences on the `yugabyte` Application), or selfHeal scales them back up.
+        - name: YugabyteDB pods on this node
+          ansible.builtin.shell: >-
+            {{ reboot_kubectl }} -n yugabytedb get pods -o json
+            | python3 -c "import json,sys;n=sys.argv[1];print(' '.join(p['metadata']['name'] for p in json.load(sys.stdin)['items'] if p['spec'].get('nodeName')==n and p['metadata']['name'].startswith(('yb-master-','yb-tserver-'))))" {{ inventory_hostname }}
+          environment: "{{ reboot_kubectl_env }}"
+          delegate_to: "{{ reboot_control_plane }}"
+          register: reboot_yb_here
+          changed_when: false
+          check_mode: false
+
+        - name: Stop YugabyteDB cleanly before the drain
+          when: reboot_yb_here.stdout | trim | length > 0 and (reboot_yb_scale | default(true) | bool)
+          block:
+            - name: The Argo CD application must ignore the replica counts
+              ansible.builtin.command: >-
+                {{ reboot_kubectl }} -n argocd get application yugabyte -o jsonpath='{.spec.ignoreDifferences[*].name}'
+              environment: "{{ reboot_kubectl_env }}"
+              delegate_to: "{{ reboot_control_plane }}"
+              register: reboot_yb_argo
+              changed_when: false
+              check_mode: false
+              failed_when: "'yb-master' not in reboot_yb_argo.stdout or 'yb-tserver' not in reboot_yb_argo.stdout"
+
+            - name: Read the replica counts
+              ansible.builtin.shell: >-
+                {{ reboot_kubectl }} -n yugabytedb get sts yb-master yb-tserver
+                -o jsonpath='{range .items[*]}{.metadata.name}={.spec.replicas}{"\n"}{end}'
+              environment: "{{ reboot_kubectl_env }}"
+              delegate_to: "{{ reboot_control_plane }}"
+              register: reboot_yb_counts
+              changed_when: false
+              check_mode: false
+
+            - name: Remember them (at least 1, in case an earlier run left them at 0)
+              ansible.builtin.set_fact:
+                reboot_yb_replicas:
+                  master: "{{ [(reboot_yb_counts.stdout_lines | select('match', '^yb-master=') | first | regex_replace('^.*=', '')) | int, 1] | max }}"
+                  tserver: "{{ [(reboot_yb_counts.stdout_lines | select('match', '^yb-tserver=') | first | regex_replace('^.*=', '')) | int, 1] | max }}"
+
+            - name: Scale yb-tserver, then yb-master, to 0
+              ansible.builtin.command: "{{ reboot_kubectl }} -n yugabytedb scale sts/{{ item }} --replicas=0"
+              environment: "{{ reboot_kubectl_env }}"
+              delegate_to: "{{ reboot_control_plane }}"
+              loop: [yb-tserver, yb-master]
+              changed_when: true
+
+            - name: Wait until the YugabyteDB pods are gone
+              ansible.builtin.shell: >-
+                {{ reboot_kubectl }} -n yugabytedb get pods --no-headers | grep -cE '^yb-(master|tserver)-' || true
+              environment: "{{ reboot_kubectl_env }}"
+              delegate_to: "{{ reboot_control_plane }}"
+              register: reboot_yb_gone
+              until: reboot_yb_gone.stdout | trim == '0'
+              retries: 30
+              delay: 10
+              changed_when: false
+              check_mode: false
+              # lint-check-mode: ignore (the scale-down is skipped in a dry run, so waiting would only time out)
+              when: not ansible_check_mode
+
         - name: Cordon
           ansible.builtin.command: "{{ reboot_kubectl }} cordon {{ inventory_hostname }}"
           environment: "{{ reboot_kubectl_env }}"
@@ -323,7 +391,7 @@
         that: reboot_go | default(false) | bool
         fail_msg: >-
           Pre-checks passed for {{ inventory_hostname }}. Confirm the window and pass -e reboot_go=true to
-          reboot it{{ ' (drained already: uncordon with kubectl if you stop here)' if reboot_is_k8s | bool else '' }}.
+          reboot it{{ ' (drained already: uncordon with kubectl if you stop here, and scale YugabyteDB back up if it was stopped: kubectl -n yugabytedb scale sts/yb-master sts/yb-tserver --replicas=1)' if reboot_is_k8s | bool else '' }}.
       when: not (reboot_verify_only | default(false) | bool)
 
     - name: Reboot, detached because this run depends on the host (control node)
@@ -419,6 +487,28 @@
           environment: "{{ reboot_kubectl_env }}"
           delegate_to: "{{ reboot_control_plane }}"
           changed_when: true
+
+        - name: Start YugabyteDB again (yb-master, then yb-tserver)
+          when: reboot_yb_replicas is defined and not ansible_check_mode
+          block:
+            - name: Scale back up
+              ansible.builtin.command: >-
+                {{ reboot_kubectl }} -n yugabytedb scale sts/{{ item.name }} --replicas={{ item.replicas }}
+              environment: "{{ reboot_kubectl_env }}"
+              delegate_to: "{{ reboot_control_plane }}"
+              loop:
+                - {name: yb-master, replicas: "{{ reboot_yb_replicas.master }}"}
+                - {name: yb-tserver, replicas: "{{ reboot_yb_replicas.tserver }}"}
+              changed_when: true
+
+            - name: Wait until both are rolled out and Ready
+              ansible.builtin.command: >-
+                {{ reboot_kubectl }} -n yugabytedb rollout status sts/{{ item }} --timeout=600s
+              environment: "{{ reboot_kubectl_env }}"
+              delegate_to: "{{ reboot_control_plane }}"
+              loop: [yb-master, yb-tserver]
+              changed_when: false
+              check_mode: false
 
         - name: Wait for every Longhorn volume to be healthy again
           ansible.builtin.shell: >-
