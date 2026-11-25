@@ -1,0 +1,44 @@
+---
+# Raise the inotify limits on every RKE2 node to what k8s-master already had by hand.
+#
+# Why: the default fs.inotify.max_user_instances is 128. When a node's pods all restart at once (a
+# reboot, a drain) controller-runtime pods (the metallb statuscleaner, fleet, cert-manager) run out of
+# instances and crash-loop with "too many open files" until the load settles. Seen on 2026-11-24
+# after the k8s-master and pve-ai reboots; k8s-master had 8192 from a hand-made file, the workers 128.
+#
+# Idempotent and safe to re-run; changes a sysctl only, no restart.
+#   scripts/run-working-tree.sh playbooks/k8s-inotify-sysctl.yml            # dry run
+#   scripts/run-working-tree.sh --apply playbooks/k8s-inotify-sysctl.yml
+- name: Raise the inotify limits on the Kubernetes nodes
+  hosts: k8s
+  become: true
+  gather_facts: false
+  vars:
+    inotify_max_user_watches: 1048576
+    inotify_max_user_instances: 8192
+  tasks:
+    - name: Write the sysctl drop-in
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-inotify.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          fs.inotify.max_user_watches={{ inotify_max_user_watches }}
+          fs.inotify.max_user_instances={{ inotify_max_user_instances }}
+      register: inotify_file
+
+    - name: Apply it now
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/99-inotify.conf
+      when: inotify_file is changed
+      changed_when: true
+
+    - name: Read the live values
+      ansible.builtin.command: sysctl -n fs.inotify.max_user_watches fs.inotify.max_user_instances
+      register: inotify_live
+      changed_when: false
+      check_mode: false
+
+    - name: Show them
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: watches/instances = {{ inotify_live.stdout_lines | join(' / ') }}"
