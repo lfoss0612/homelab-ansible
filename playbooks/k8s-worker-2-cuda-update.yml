@@ -9,7 +9,7 @@
 #   scripts/run-working-tree.sh --apply playbooks/k8s-worker-2-cuda-update.yml   writes the repo file, refreshes the keyring if needed
 #
 # Replaces the one-off 2026-08 bump playbooks for the repository part; those two
-# (fix-k8s-worker-2-nvidia.yml, k8s-worker-2-nvidia-latest.yml) remain as history for the driver moves.
+# (fix-k8s-worker-2-nvidia.yml; k8s-worker-2-nvidia-latest.yml was deleted after it ran, see git history).
 - name: CUDA repository and package status on k8s-worker-2
   hosts: k8s-worker-2.home.lan
   become: true

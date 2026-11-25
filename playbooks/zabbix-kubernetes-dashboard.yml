@@ -26,7 +26,7 @@
 #
 # These items only became possible on 2026-08-25. Pod discovery had produced
 # zero working items since the template was linked, because of the {#POD}
-# orphan-prototype defect - see zabbix-remove-orphan-pod-prototypes.yml. The
+# orphan-prototype defect - see zabbix-remove-orphan-pod-prototypes.yml (deleted after it ran; see git history). The
 # TODO asking for this dashboard predates that fix and could not have been
 # built before it.
 #

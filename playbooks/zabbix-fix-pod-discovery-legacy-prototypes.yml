@@ -7,7 +7,7 @@
 # kube.pod.phase.running[{#NAMESPACE}/{#NAME}]) - see
 # zabbix-kubernetes-dashboard.yml. A dead first generation
 # (73257, 73281-73287) keys on {#NAMESPACE}/{#POD} and {#NODE}, both of which
-# zabbix-remove-orphan-pod-prototypes.yml deliberately removed from the rule's
+# zabbix-remove-orphan-pod-prototypes.yml (deleted after it ran; see git history) deliberately removed from the rule's
 # LLD macro paths weeks ago - {#POD} was a temporary shim for a different bug,
 # {#NODE} was never re-added. Those 8 prototypes were disabled (status=1) at
 # the time, which stops the ITEMS they'd create from collecting data, but does
@@ -25,7 +25,7 @@
 # the rule's error field on the next cycle. item.delete/itemprototype.delete
 # are refused to the automation token, so "stop discovering" is the terminal
 # state here, same policy as the orphaned Kubernetes prototypes in
-# zabbix-remove-orphan-pod-prototypes.yml.
+# zabbix-remove-orphan-pod-prototypes.yml (deleted after it ran; see git history).
 #
 # Usage:
 #   ansible-playbook playbooks/zabbix-fix-pod-discovery-legacy-prototypes.yml --check --diff
