@@ -117,6 +117,14 @@ scripts/lint-playbook-names.py                   # everything under playbooks/
 - `N1`: named `once-*` but no marker. `N2`: marker but not named `once-*`. `N3`: status is not
   `pending` (a `completed` one should be deleted).
 
+## run-lints.sh
+
+Runs `lint-check-mode.py`, `lint-playbook-names.py` and `lint-variable-scope.py` and exits 1
+if any fails. The local `.git/hooks/pre-commit` calls it whenever a staged file is under
+`playbooks/`, `roles/`, `collections/` or `scripts/`, and blocks the commit on a failure.
+The hook lives in `.git/hooks` (not tracked), so a fresh clone needs the call re-added: see the
+"Repo lints" block in the existing hook. There is no CI.
+
 ## ansible-on-cockpit.sh and probes/
 
 Runs ad-hoc Ansible, inventory queries, committed-checkout playbooks and read-only probes through
