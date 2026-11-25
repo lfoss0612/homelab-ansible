@@ -1,0 +1,142 @@
+---
+# Cordon and drain ONE Kubernetes node before its (or its hypervisor's) reboot. Included by fleet-reboot.yml.
+# Input: k8s_node (inventory name). Runs on the play's host; every kubectl call is delegated to the control
+# plane. Reboot flags are read from the play: reboot_allow_control_plane, reboot_force_drain, reboot_yb_scale.
+- name: Refuse the control-plane node unless allowed
+  ansible.builtin.assert:
+    that: k8s_node != reboot_control_plane or (reboot_allow_control_plane | default(false) | bool)
+    fail_msg: >-
+      {{ k8s_node }} is the only control-plane and etcd node; the API is down while it
+      reboots. Pass -e reboot_allow_control_plane=true.
+
+- name: Every node must be Ready before one is taken away
+  ansible.builtin.shell: >-
+    {{ reboot_kubectl }} get nodes --no-headers | awk '$2!="Ready"{print}'
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  register: reboot_notready
+  changed_when: false
+  check_mode: false
+  failed_when: reboot_notready.stdout | trim | length > 0
+
+- name: Every Longhorn volume must be healthy (a degraded one would lose a replica)
+  ansible.builtin.shell: >-
+    {{ reboot_kubectl }} get volumes.longhorn.io -n longhorn-system -o json
+    | python3 -c "import json,sys;print(sum(1 for v in json.load(sys.stdin)['items'] if v['status'].get('state')=='attached' and v['status'].get('robustness')!='healthy'))"
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  register: reboot_lh_degraded
+  changed_when: false
+  check_mode: false
+  failed_when: reboot_lh_degraded.stdout | trim != '0'
+
+# YugabyteDB runs as one yb-master and one yb-tserver whose PDBs allow 0 disruptions, so a graceful
+# drain of the node holding them can never succeed. Instead of forcing it, stop them cleanly first
+# (tserver, then master) and start them again after the node is back. Argo CD must ignore their
+# replica counts (ignoreDifferences on the `yugabyte` Application), or selfHeal scales them back up.
+- name: YugabyteDB pods on this node
+  ansible.builtin.shell: >-
+    {{ reboot_kubectl }} -n yugabytedb get pods -o json
+    | python3 -c "import json,sys;n=sys.argv[1];print(' '.join(p['metadata']['name'] for p in json.load(sys.stdin)['items'] if p['spec'].get('nodeName')==n and p['metadata']['name'].startswith(('yb-master-','yb-tserver-'))))" {{ k8s_node }}
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  register: reboot_yb_here
+  changed_when: false
+  check_mode: false
+
+- name: Stop YugabyteDB cleanly before the drain
+  when: reboot_yb_here.stdout | trim | length > 0 and (reboot_yb_scale | default(true) | bool)
+  block:
+    - name: The Argo CD application must ignore the replica counts
+      ansible.builtin.command: >-
+        {{ reboot_kubectl }} -n argocd get application yugabyte -o jsonpath='{.spec.ignoreDifferences[*].name}'
+      environment: "{{ reboot_kubectl_env }}"
+      delegate_to: "{{ reboot_control_plane }}"
+      register: reboot_yb_argo
+      changed_when: false
+      check_mode: false
+      failed_when: "'yb-master' not in reboot_yb_argo.stdout or 'yb-tserver' not in reboot_yb_argo.stdout"
+
+    - name: Read the replica counts
+      ansible.builtin.shell: >-
+        {{ reboot_kubectl }} -n yugabytedb get sts yb-master yb-tserver
+        -o jsonpath='{range .items[*]}{.metadata.name}={.spec.replicas}{"\n"}{end}'
+      environment: "{{ reboot_kubectl_env }}"
+      delegate_to: "{{ reboot_control_plane }}"
+      register: reboot_yb_counts
+      changed_when: false
+      check_mode: false
+
+    - name: Remember them (at least 1, in case an earlier run left them at 0)
+      ansible.builtin.set_fact:
+        reboot_yb_replicas:
+          master: "{{ [(reboot_yb_counts.stdout_lines | select('match', '^yb-master=') | first | regex_replace('^.*=', '')) | int, 1] | max }}"
+          tserver: "{{ [(reboot_yb_counts.stdout_lines | select('match', '^yb-tserver=') | first | regex_replace('^.*=', '')) | int, 1] | max }}"
+
+    - name: Scale yb-tserver, then yb-master, to 0
+      ansible.builtin.command: "{{ reboot_kubectl }} -n yugabytedb scale sts/{{ item }} --replicas=0"
+      environment: "{{ reboot_kubectl_env }}"
+      delegate_to: "{{ reboot_control_plane }}"
+      loop: [yb-tserver, yb-master]
+      changed_when: true
+
+    - name: Wait until the YugabyteDB pods are gone
+      ansible.builtin.shell: >-
+        {{ reboot_kubectl }} -n yugabytedb get pods --no-headers | grep -cE '^yb-(master|tserver)-' || true
+      environment: "{{ reboot_kubectl_env }}"
+      delegate_to: "{{ reboot_control_plane }}"
+      register: reboot_yb_gone
+      until: reboot_yb_gone.stdout | trim == '0'
+      retries: 30
+      delay: 10
+      changed_when: false
+      check_mode: false
+      # lint-check-mode: ignore (the scale-down is skipped in a dry run, so waiting would only time out)
+      when: not ansible_check_mode
+
+- name: Cordon
+  ansible.builtin.command: "{{ reboot_kubectl }} cordon {{ k8s_node }}"
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  changed_when: true
+
+- name: Graceful drain (Longhorn instance managers excluded)
+  ansible.builtin.command: >-
+    {{ reboot_kubectl }} drain {{ k8s_node }} --ignore-daemonsets --delete-emptydir-data
+    --pod-selector={{ reboot_drain_selector }} --timeout=300s
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  register: reboot_drain
+  failed_when: false
+  changed_when: true
+
+- name: Forced drain of what the PDBs blocked (gated)
+  ansible.builtin.command: >-
+    {{ reboot_kubectl }} drain {{ k8s_node }} --ignore-daemonsets --delete-emptydir-data
+    --force --disable-eviction --pod-selector={{ reboot_drain_selector }} --timeout=300s
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  when: reboot_drain.rc != 0 and (reboot_force_drain | default(false) | bool)
+  changed_when: true
+
+- name: Stop if the drain failed and forcing was not authorised
+  ansible.builtin.fail:
+    msg: >-
+      Graceful drain failed ({{ reboot_drain.stderr | default('') | truncate(300) }}). The node is
+      cordoned; uncordon it or pass -e reboot_force_drain=true.
+  when: reboot_drain.rc != 0 and not (reboot_force_drain | default(false) | bool)
+
+- name: Wait until no Longhorn volume is attached to this node
+  ansible.builtin.shell: >-
+    {{ reboot_kubectl }} get volumeattachments.longhorn.io -n longhorn-system -o json
+    | python3 -c "import json,sys;n=sys.argv[1];print(sum(1 for v in json.load(sys.stdin)['items'] if any(t.get('nodeID')==n and t.get('type')!='snapshot-controller' for t in (v['spec'].get('attachmentTickets') or {}).values())))" {{ k8s_node }}
+  environment: "{{ reboot_kubectl_env }}"
+  delegate_to: "{{ reboot_control_plane }}"
+  register: reboot_attached
+  until: reboot_attached.stdout | trim == '0'
+  retries: 40
+  delay: 15
+  changed_when: false
+  check_mode: false
+  # lint-check-mode: ignore (the drain is skipped in a dry run, so waiting for detach would only time out)
+  when: not ansible_check_mode
