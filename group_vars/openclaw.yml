@@ -5,7 +5,7 @@ openclaw_group: openclaw
 openclaw_install_dir: /opt/openclaw
 
 # npm package version to install (`npm install -g openclaw@{{ openclaw_version }}`).
-openclaw_version: "2026.11.5"
+openclaw_version: "2026.11.10"
 
 # Releases to pass through on the way to openclaw_version, oldest first (max 3), when a state
 # migration refuses to jump, e.g. ["2026.9.7"]. update-openclaw.yml walks them, running doctor at
