@@ -42,7 +42,7 @@ kubectl get nodes -o custom-columns=N:.metadata.name,P:.status.allocatable.pods,
 
 ## Order
 
-1. Backups, then Rancher (chart-upgrade skill) if its notes require it first.
+1. Backups, then Rancher (chart-upgrade skill) if its notes require it first. `rancher-webhook` follows Rancher and is no longer listed by `chart-outdated.py`: in the same change set `targetRevision` in homelab-gitops `argocd/cattle-system/rancher-webhook.yaml` to the webhook chart the new Rancher ships (check `helm list -n cattle-system` after the Rancher sync).
 2. RKE2 on the control plane: `rke2-node-upgrade.yml -e rke2_node=k8s-master.home.lan -e rke2_target=... -e rke2_allow_control_plane=true`.
 3. RKE2 on each worker, one at a time. A worker whose Longhorn volume has only one in-sync replica leaves
    that volume unavailable until it is back; the playbook's health gate refuses while a volume is degraded.
