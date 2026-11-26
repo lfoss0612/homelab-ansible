@@ -122,6 +122,10 @@
           {{ os_update_pending | length }} package(s) upgraded;
           reboot {{ os_update_reboot.stdout | trim }}
 
+    - name: Remember this host for the Zabbix refresh at the end
+      ansible.builtin.group_by:
+        key: os_update_patched
+
 # cockpit is the Ansible control node — it is running this playbook against
 # itself over SSH. Kept in its own trailing play so that if an upgrade here
 # does disturb sshd or systemd, it happens after every other host is already
@@ -170,3 +174,32 @@
     - name: Report per-host outcome
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: reboot {{ os_update_reboot_control.stdout | trim }}"
+
+    - name: Remember this host for the Zabbix refresh at the end
+      ansible.builtin.group_by:
+        key: os_update_patched
+
+# Last step: ask Zabbix to poll the os.update items on every host this run patched, so the Patch / Update
+# Status dashboard shows the new numbers now instead of at the next hourly poll. It never fails the run: a
+# Zabbix problem only prints a warning. -e os_update_zabbix_refresh=false skips it.
+- name: Refresh the Zabbix patch dashboard
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+    zbx_key_prefix: os.update
+    zbx_pollable_types: [0, 3, 5, 10, 12, 13, 14, 15, 16, 17, 19, 21]
+    zbx_hosts: "{{ groups['os_update_patched'] | default([]) | sort }}"
+  tasks:
+    - name: Queue "Execute now" for the patched hosts
+      when: (os_update_zabbix_refresh | default(true) | bool) and zbx_hosts | length > 0
+      block:
+        - name: Queue the polls
+          ansible.builtin.include_tasks: tasks/zabbix-execute-now.yml
+      rescue:
+        - name: Zabbix refresh failed, the dashboard will update at its next poll
+          ansible.builtin.debug:
+            msg: "Could not queue the Zabbix polls (the patching itself succeeded): {{ ansible_failed_result.msg | default('unknown error') }}"

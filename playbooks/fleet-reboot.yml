@@ -381,3 +381,30 @@
         k8s_node: "{{ reboot_pve_k8s_guests[0] }}"
         # the guest boots with hot-plugged memory and RKE2 waits for it: allow about 20 minutes
         k8s_ready_retries: 80
+
+# Last step for a single-host run: ask Zabbix to poll the os.update items on the host that was just
+# rebooted, so the Patch / Update Status dashboard (reboot required, pending) is fresh now. It never fails
+# the run. Skipped for -e reboot_verify_only=true runs and with -e reboot_zabbix_refresh=false.
+- name: Refresh the Zabbix patch dashboard
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    zabbix_url: "http://10.0.5.9/zabbix"
+    zabbix_api_token: "{{ hostvars['zabbix.home.lan'].zabbix_api_token }}"
+    zbx_key_prefix: os.update
+    zbx_pollable_types: [0, 3, 5, 10, 12, 13, 14, 15, 16, 17, 19, 21]
+    zbx_hosts: ["{{ reboot_host | default('') }}"]
+  tasks:
+    - name: Queue "Execute now" for the rebooted host
+      when: >-
+        reboot_host is defined and (reboot_zabbix_refresh | default(true) | bool)
+        and not (reboot_verify_only | default(false) | bool)
+      block:
+        - name: Queue the polls
+          ansible.builtin.include_tasks: tasks/zabbix-execute-now.yml
+      rescue:
+        - name: Zabbix refresh failed, the dashboard will update at its next poll
+          ansible.builtin.debug:
+            msg: "Could not queue the Zabbix polls (the reboot itself succeeded): {{ ansible_failed_result.msg | default('unknown error') }}"
