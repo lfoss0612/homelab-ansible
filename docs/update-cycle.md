@@ -50,7 +50,7 @@ Longhorn detach, Ready, uncordon), Proxmox (quorum survives, boot pin versus new
 running tasks), omv (no NFS clients), dkms built for the kernel that will boot. Order: guests, workers,
 control plane, PBS, then the hypervisors, pve-router last.
 Verify after each: kernel is the expected one, no new failed units, `post-release-upgrade-check.yml`.
-`os-update.yml` and a single-host `fleet-reboot.yml` finish by queueing Zabbix "Execute now" for the `os.update.*` items on the hosts they touched, so the Patch / Update Status dashboard is current at once (never fails the run; `-e os_update_zabbix_refresh=false` / `-e reboot_zabbix_refresh=false` skip it). Hand-run updates (for example k8s-worker-2) still need `zabbix-execute-now.yml`.
+`os-update.yml` and a single-host `fleet-reboot.yml` finish by queueing Zabbix "Execute now" for the `os.update.*` items on the hosts they touched, so the Patch / Update Status dashboard is current at once (never fails the run; `-e os_update_zabbix_refresh=false` / `-e reboot_zabbix_refresh=false` skip it). The three k8s nodes cannot be polled for the pending count (their agent is a pod without apt; a host timer pushes it hourly), so both playbooks also start `os-update-push.service` on them. Hand-run updates (for example k8s-worker-2) need `zabbix-execute-now.yml` and, on a k8s node, `systemctl start os-update-push.service`.
 Before a kernel or CUDA update on k8s-worker-2 run `k8s-worker-2-cuda-update.yml`: it makes the CUDA apt repo
 trusted for the release (refreshing NVIDIA's keyring after a release upgrade, verified before install), and
 reports upgradable NVIDIA/CUDA packages and whether DKMS covers the kernel that will boot.

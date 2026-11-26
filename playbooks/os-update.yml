@@ -122,6 +122,16 @@
           {{ os_update_pending | length }} package(s) upgraded;
           reboot {{ os_update_reboot.stdout | trim }}
 
+    # The three k8s nodes cannot be polled for the pending count (their Zabbix agent is a pod with no apt):
+    # a host timer pushes it hourly, and "Execute now" does not reach a pushed item. Run the push now.
+    - name: Push the pending-package count to Zabbix now (k8s nodes)
+      ansible.builtin.command: systemctl start os-update-push.service
+      changed_when: true
+      failed_when: false
+      when: >-
+        inventory_hostname in groups['k8s'] and not ansible_check_mode
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode)
+
     - name: Remember this host for the Zabbix refresh at the end
       ansible.builtin.group_by:
         key: os_update_patched

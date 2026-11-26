@@ -374,6 +374,16 @@
       vars:
         k8s_node: "{{ inventory_hostname }}"
 
+    # The three k8s nodes cannot be polled for the pending count (their Zabbix agent is a pod with no apt):
+    # a host timer pushes it hourly, and "Execute now" does not reach a pushed item. Run the push now.
+    - name: Push the pending-package count to Zabbix now (k8s nodes)
+      ansible.builtin.command: systemctl start os-update-push.service
+      changed_when: true
+      failed_when: false
+      when: >-
+        reboot_is_k8s | bool and not ansible_check_mode and not (reboot_verify_only | default(false) | bool)
+      # lint-check-mode: ignore (guarded by when: not ansible_check_mode)
+
     - name: Kubernetes guest of this hypervisor, bring it back
       when: reboot_is_pve | bool and reboot_pve_k8s_guests | length == 1 and not (reboot_verify_only | default(false) | bool)
       ansible.builtin.include_tasks: tasks/fleet-k8s-restore.yml
