@@ -33,6 +33,7 @@
 #                      is then cut off by the reboot, so it only schedules the reboot and you run
 #                      -e reboot_verify_only=true from cockpit once it is back.
 #   pbs                refuses while a backup, verify, prune or GC task is running.
+#   any VM            -e reboot_via_hypervisor=true restarts it with `qm reboot`, so pending memory/CPU config applies (a guest reboot keeps the old QEMU).
 #   omv                refuses while NFS clients are connected (-e reboot_ignore_nfs=true to override).
 #   everything else    plain reboot and wait.
 # Every kind: refuses unless the running kernel is not the newest (or reboot-required is set),
@@ -300,11 +301,30 @@
         not (reboot_verify_only | default(false) | bool)
         and reboot_is_pve | bool and (reboot_allow_control_node | default(false) | bool)
 
+    # -e reboot_via_hypervisor=true: restart the VM through Proxmox (qm reboot = clean ACPI shutdown, then a
+    # fresh QEMU start). A reboot from inside the guest keeps the old QEMU process, so pending hardware
+    # changes (memory, balloon, cpu) are only applied this way.
+    - name: Reboot through the hypervisor (applies pending VM config), then wait for it
+      when: >-
+        not (reboot_verify_only | default(false) | bool)
+        and (reboot_via_hypervisor | default(false) | bool) and not reboot_is_pve | bool
+      block:
+        - name: qm reboot
+          ansible.builtin.command: "qm reboot {{ pve_vmid }} --timeout 300"
+          delegate_to: "{{ pve_hypervisor }}"
+          changed_when: true
+        - name: Wait for the guest to go down and come back
+          ansible.builtin.wait_for_connection:
+            delay: 40
+            timeout: 900
+
     - name: Reboot and wait for it to come back
       ansible.builtin.reboot:
         reboot_timeout: "{{ 1800 if reboot_is_pve | bool else 900 }}"
         msg: "fleet-reboot.yml"
-      when: not (reboot_verify_only | default(false) | bool)
+      when: >-
+        not (reboot_verify_only | default(false) | bool)
+        and not ((reboot_via_hypervisor | default(false) | bool) and not reboot_is_pve | bool)
 
     # ---------------------------------------------------------------- post-checks
     - name: Post-boot kernel and state
